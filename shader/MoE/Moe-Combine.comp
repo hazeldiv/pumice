@@ -1,0 +1,27 @@
+#version 450
+#define TS 256
+
+layout(local_size_x = TS, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint N;
+    uint slots;
+} dims;
+
+layout(set = 0, binding = 0) readonly restrict buffer Partials { float p[]; };
+layout(set = 0, binding = 1) readonly restrict buffer Weights { float weights[]; };
+layout(set = 0, binding = 2) readonly restrict buffer SharedW { float sharedW[]; };
+layout(set = 0, binding = 3) writeonly restrict buffer Y { float y[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= dims.M * dims.N) return;
+    uint m = i / dims.N;
+    uint c = i % dims.N;
+    float acc = sharedW[m] * p[(m * dims.slots + dims.slots - 1) * dims.N + c];
+    for (uint s = 0; s < dims.slots - 1; s++) {
+        acc += weights[m * dims.slots + s] * p[(m * dims.slots + s) * dims.N + c];
+    }
+    y[i] = acc;
+}

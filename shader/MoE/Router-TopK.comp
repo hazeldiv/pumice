@@ -1,0 +1,75 @@
+#version 450
+#define TS 256
+#define TOPK 8
+
+layout(local_size_x = TS, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint N;
+    uint K;
+    uint slots;
+} dims;
+
+layout(set = 0, binding = 0) readonly restrict buffer Act { vec4 x[]; };
+layout(set = 0, binding = 1) readonly restrict buffer RouterW { uvec4 w[]; };
+layout(set = 0, binding = 2) readonly restrict buffer SharedGateW { uvec4 sgw[]; };
+layout(set = 0, binding = 3) writeonly restrict buffer Ids { uint ids[]; };
+layout(set = 0, binding = 4) writeonly restrict buffer Weights { float weights[]; };
+layout(set = 0, binding = 5) writeonly restrict buffer SharedW { float sharedW[]; };
+
+shared vec4 xCache[512];
+shared float probs[256];
+shared float sgPart[256];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint e = gl_LocalInvocationID.x;
+
+    for (uint i = e; i < dims.K / 4; i += TS) xCache[i] = x[m * (dims.K / 4) + i];
+    barrier();
+
+    if (e < dims.N) {
+        float acc = 0.0;
+        uint base = e;
+        for (uint g = 0; g < dims.K / 8; g++) {
+            uvec4 raw = w[base];
+            acc += dot(xCache[g * 2], vec4(unpackHalf2x16(raw.x), unpackHalf2x16(raw.y)));
+            acc += dot(xCache[g * 2 + 1], vec4(unpackHalf2x16(raw.z), unpackHalf2x16(raw.w)));
+            base += dims.N;
+        }
+        probs[e] = acc;
+    }
+
+    sgPart[e] = 0.0;
+    for (uint g = e; g < dims.K / 8; g += TS) {
+        uvec4 raw = sgw[g];
+        sgPart[e] += dot(xCache[g * 2], vec4(unpackHalf2x16(raw.x), unpackHalf2x16(raw.y)));
+        sgPart[e] += dot(xCache[g * 2 + 1], vec4(unpackHalf2x16(raw.z), unpackHalf2x16(raw.w)));
+    }
+    barrier();
+
+    if (e == 0) {
+        float mx = probs[0];
+        for (uint i = 1; i < dims.N; i++) if (probs[i] > mx) mx = probs[i];
+        for (uint i = 0; i < dims.N; i++) probs[i] = exp(probs[i] - mx);
+        float selProb[TOPK];
+        uint selIdx[TOPK];
+        float selSum = 0.0;
+        for (uint s = 0; s < TOPK; s++) {
+            uint best = 0;
+            for (uint i = 1; i < dims.N; i++) if (probs[i] > probs[best]) best = i;
+            selIdx[s] = best;
+            selProb[s] = probs[best];
+            selSum += probs[best];
+            probs[best] = -1.0;
+        }
+        for (uint s = 0; s < TOPK; s++) {
+            ids[m * dims.slots + s] = selIdx[s];
+            weights[m * dims.slots + s] = selProb[s] / selSum;
+        }
+        float sg = 0.0;
+        for (uint i = 0; i < TS; i++) sg += sgPart[i];
+        sharedW[m] = 1.0 / (1.0 + exp(-sg));
+    }
+}

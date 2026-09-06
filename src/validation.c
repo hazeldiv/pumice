@@ -5503,6 +5503,482 @@ void validateGateSigmoid(session s, int count, float* g, float* o) {
 }
 
 
+#define MOE_E 16
+#define MOE_POOL 17
+#define MOE_TOPK 8
+#define MOE_SLOTS 9
+#define MOE_K 2048
+#define MOE_I 512
+#define MOE_N 2048
+
+static float moe_dq_int4(const QuantizedData* q, int k, int j) {
+    uint8_t b = q->data[k * (q->N / 2) + j / 2];
+    int nib = (j & 1) ? (b & 0x0F) : (b >> 4);
+    int bj = j / q->group_size;
+    return (float)nib * q->scale[bj * q->M + k] - q->z[bj * q->M + k];
+}
+
+static void moe_dequant_int4(const QuantizedData* q, float* out) {
+    for (int j = 0; j < q->N; j++)
+        for (int k = 0; k < q->M; k++)
+            out[(size_t)j * q->M + k] = moe_dq_int4(q, k, j);
+}
+
+static void moe_router_ref(const float* x, const uint16_t* w, const uint16_t* sgw, int M, int K, int E, int slots,
+                           uint32_t* ids, float* weights, float* sharedW) {
+    for (int m = 0; m < M; m++) {
+        float logits[256];
+        for (int e = 0; e < E; e++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++) acc += x[m * K + k] * fp16_to_float(w[k * E + e]);
+            logits[e] = acc;
+        }
+        float mx = logits[0];
+        for (int e = 1; e < E; e++) if (logits[e] > mx) mx = logits[e];
+        float probs[256];
+        for (int e = 0; e < E; e++) probs[e] = expf(logits[e] - mx);
+        float selProb[MOE_TOPK];
+        uint32_t selIdx[MOE_TOPK];
+        float selSum = 0.0f;
+        for (int s = 0; s < MOE_TOPK; s++) {
+            int best = 0;
+            for (int e = 1; e < E; e++) if (probs[e] > probs[best]) best = e;
+            selIdx[s] = (uint32_t)best;
+            selProb[s] = probs[best];
+            selSum += probs[best];
+            probs[best] = -1.0f;
+        }
+        for (int s = 0; s < MOE_TOPK; s++) {
+            ids[m * slots + s] = selIdx[s];
+            weights[m * slots + s] = selProb[s] / selSum;
+        }
+        float sg = 0.0f;
+        for (int k = 0; k < K; k++) sg += x[m * K + k] * fp16_to_float(sgw[k]);
+        sharedW[m] = 1.0f / (1.0f + expf(-sg));
+    }
+}
+
+static void moe_swiglu_ref(const float* x, float** guF, const uint32_t* ids, int M, int slots, int K, int N, float* h) {
+    for (int g = 0; g < M * slots; g++) {
+        int e = (int)ids[g];
+        const float* gf = guF[e];
+        const float* uf = guF[e] + (size_t)N * K;
+        const float* xg = x + (size_t)(g / slots) * K;
+        for (int j = 0; j < N; j++) {
+            const float* gr = gf + (size_t)j * K;
+            const float* ur = uf + (size_t)j * K;
+            float gate = 0.0f;
+            float up = 0.0f;
+            for (int k = 0; k < K; k++) {
+                gate += xg[k] * gr[k];
+                up += xg[k] * ur[k];
+            }
+            gate = gate / (1.0f + exp2f(-gate * 1.44269504f));
+            h[g * N + j] = gate * up;
+        }
+    }
+}
+
+static void moe_down_ref(const float* h, float** dnF, const uint32_t* ids, int M, int slots, int K, int N, float* p) {
+    for (int g = 0; g < M * slots; g++) {
+        int e = (int)ids[g];
+        const float* df = dnF[e];
+        const float* hg = h + (size_t)g * K;
+        for (int j = 0; j < N; j++) {
+            const float* dr = df + (size_t)j * K;
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++) acc += hg[k] * dr[k];
+            p[g * N + j] = acc;
+        }
+    }
+}
+
+static void moe_combine_ref(const float* p, const float* weights, const float* sharedW, int M, int slots, int N, float* y) {
+    for (int m = 0; m < M; m++) {
+        for (int c = 0; c < N; c++) {
+            float acc = sharedW[m] * p[(size_t)(m * slots + slots - 1) * N + c];
+            for (int s = 0; s < slots - 1; s++) {
+                acc += weights[m * slots + s] * p[(size_t)(m * slots + s) * N + c];
+            }
+            y[m * N + c] = acc;
+        }
+    }
+}
+
+typedef struct {
+    uint8_t* data;
+    float* scale;
+    float* zero;
+} moe_pool;
+
+static moe_pool moe_build_pool(QuantizedData* q, int experts, int rows, int cols) {
+    moe_pool pool;
+    size_t dataStride = (size_t)rows * cols / 2;
+    size_t scaleCount = (size_t)(cols / 256) * rows;
+    pool.data = (uint8_t*)malloc(dataStride * experts);
+    pool.scale = (float*)malloc(sizeof(float) * scaleCount * experts);
+    pool.zero = (float*)malloc(sizeof(float) * scaleCount * experts);
+    for (int e = 0; e < experts; e++) {
+        transpose_block16(q[e].data, pool.data + e * dataStride, rows, cols, QUANT_INT4);
+        memcpy(pool.scale + e * scaleCount, q[e].scale, sizeof(float) * scaleCount);
+        memcpy(pool.zero + e * scaleCount, q[e].z, sizeof(float) * scaleCount);
+    }
+    return pool;
+}
+
+static void moe_free_pool(moe_pool pool) {
+    free(pool.data);
+    free(pool.scale);
+    free(pool.zero);
+}
+
+void validateRouterTopK(session s, int M) {
+    int E = MOE_E;
+    int K = MOE_K;
+    int slots = MOE_TOPK;
+
+    float* x = getData(9001, M, K);
+    uint16_t* w = getDataFP16(9002, K, E);
+    uint16_t* sgw = getDataFP16(9003, K, 1);
+    uint16_t* wT = (uint16_t*)malloc(sizeof(uint16_t) * K * E);
+    uint16_t* sgT = (uint16_t*)malloc(sizeof(uint16_t) * K);
+    transpose_block16((uint8_t*)w, (uint8_t*)wT, K, E, QUANT_FP16);
+    transpose_block16((uint8_t*)sgw, (uint8_t*)sgT, K, 1, QUANT_FP16);
+
+    uint32_t* refIds = (uint32_t*)calloc(M * slots, sizeof(uint32_t));
+    float* refW = (float*)calloc(M * slots, sizeof(float));
+    float* refSw = (float*)calloc(M, sizeof(float));
+    moe_router_ref(x, w, sgw, M, K, E, slots, refIds, refW, refSw);
+
+    uint32_t* outIds = (uint32_t*)calloc(M * slots, sizeof(uint32_t));
+    float* outW = (float*)calloc(M * slots, sizeof(float));
+    float* outSw = (float*)calloc(M, sizeof(float));
+
+    buffer xB = createBuffer(s.dev.device, s.dev.physicalDevice, x, sizeof(float) * M * K, MEMORY_RAM);
+    buffer wB = createBuffer(s.dev.device, s.dev.physicalDevice, wT, sizeof(uint16_t) * K * E, MEMORY_RAM);
+    buffer sgB = createBuffer(s.dev.device, s.dev.physicalDevice, sgT, sizeof(uint16_t) * K, MEMORY_RAM);
+    buffer idsB = createBuffer(s.dev.device, s.dev.physicalDevice, outIds, sizeof(uint32_t) * M * slots, MEMORY_RAM);
+    buffer wtsB = createBuffer(s.dev.device, s.dev.physicalDevice, outW, sizeof(float) * M * slots, MEMORY_RAM);
+    buffer swB = createBuffer(s.dev.device, s.dev.physicalDevice, outSw, sizeof(float) * M, MEMORY_RAM);
+    buffer bufs[] = {xB, wB, sgB, idsB, wtsB, swB};
+    createTransferAndCopy(s.dev.device, s.dev.queue, bufs, 6);
+
+    operation op = {.shader = "Router-TopK.spv", .buffers = {xB, wB, sgB, idsB, wtsB, swB}, .bufferCount = 6,
+                    .pushConstants = {M, E, K, slots}, .pushConstantCount = 4,
+                    .dispatchX = M, .dispatchY = 1, .dispatchZ = 1};
+    double ms = run_ops(s, &op, 1);
+
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, idsB, outIds);
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, wtsB, outW);
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, swB, outSw);
+
+    int mism = 0;
+    for (int i = 0; i < M * slots; i++) if (outIds[i] != refIds[i]) mism++;
+    printf("Router-TopK ids: %d mismatches out of %d\n", mism, M * slots);
+    report("Router-TopK weights", 0, outW, refW, M * slots, ms);
+    report("Router-TopK sharedW", 0, outSw, refSw, M, ms);
+
+    destroy_buffers(s, bufs, 6);
+    free(x);
+    free(w);
+    free(sgw);
+    free(wT);
+    free(sgT);
+    free(refIds);
+    free(refW);
+    free(refSw);
+    free(outIds);
+    free(outW);
+    free(outSw);
+}
+
+void validateExpertSwigluINT4(session s, int M) {
+    int pool = 4;
+    int slots = MOE_TOPK;
+    int K = MOE_K;
+    int N = MOE_I;
+
+    float* x = getData(9101, M, K);
+    QuantizedData gu[4];
+    for (int e = 0; e < pool; e++) gu[e] = getDataINT4(9200 + e, K, 2 * N);
+    moe_pool poolGpu = moe_build_pool(gu, pool, K, 2 * N);
+
+    uint32_t* ids = (uint32_t*)malloc(sizeof(uint32_t) * M * slots);
+    for (int g = 0; g < M * slots; g++) ids[g] = (uint32_t)((g * 5 + 7) % pool);
+
+    float* guF[4];
+    for (int e = 0; e < pool; e++) {
+        guF[e] = (float*)malloc(sizeof(float) * (size_t)(2 * N) * K);
+        moe_dequant_int4(&gu[e], guF[e]);
+    }
+    float* refH = (float*)malloc(sizeof(float) * M * slots * N);
+    moe_swiglu_ref(x, guF, ids, M, slots, K, N, refH);
+
+    float* outH = (float*)calloc(M * slots * N, sizeof(float));
+    size_t scaleCount = (size_t)(2 * N / 256) * K * pool;
+
+    buffer xB = createBuffer(s.dev.device, s.dev.physicalDevice, x, sizeof(float) * M * K, MEMORY_RAM);
+    buffer idsB = createBuffer(s.dev.device, s.dev.physicalDevice, ids, sizeof(uint32_t) * M * slots, MEMORY_RAM);
+    buffer wB = createBuffer(s.dev.device, s.dev.physicalDevice, poolGpu.data, (int64_t)((size_t)K * 2 * N / 2 * pool), MEMORY_RAM);
+    buffer scaleB = createBuffer(s.dev.device, s.dev.physicalDevice, poolGpu.scale, sizeof(float) * scaleCount, MEMORY_RAM);
+    buffer zeroB = createBuffer(s.dev.device, s.dev.physicalDevice, poolGpu.zero, sizeof(float) * scaleCount, MEMORY_RAM);
+    buffer hB = createBuffer(s.dev.device, s.dev.physicalDevice, outH, sizeof(float) * M * slots * N, MEMORY_RAM);
+    buffer bufs[] = {xB, idsB, wB, scaleB, zeroB, hB};
+    createTransferAndCopy(s.dev.device, s.dev.queue, bufs, 6);
+
+    operation op = {.shader = "Expert-Swiglu-INT4.spv", .buffers = {xB, idsB, wB, scaleB, zeroB, hB}, .bufferCount = 6,
+                    .pushConstants = {K, N, slots}, .pushConstantCount = 3,
+                    .dispatchX = N / 256, .dispatchY = M * slots, .dispatchZ = 1};
+    double ms = run_ops(s, &op, 1);
+
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, hB, outH);
+    report("Expert-Swiglu-INT4", 100, outH, refH, M * slots * N, ms);
+
+    destroy_buffers(s, bufs, 6);
+    moe_free_pool(poolGpu);
+    for (int e = 0; e < pool; e++) {
+        free_quantized_data(gu[e]);
+        free(guF[e]);
+    }
+    free(x);
+    free(ids);
+    free(refH);
+    free(outH);
+}
+
+void validateExpertDownINT4(session s, int M) {
+    int pool = 4;
+    int slots = MOE_TOPK;
+    int K = MOE_I;
+    int N = MOE_N;
+
+    float* h = getData(9301, M * slots, K);
+    QuantizedData dn[4];
+    for (int e = 0; e < pool; e++) dn[e] = getDataINT4(9400 + e, K, N);
+    moe_pool poolGpu = moe_build_pool(dn, pool, K, N);
+
+    uint32_t* ids = (uint32_t*)malloc(sizeof(uint32_t) * M * slots);
+    for (int g = 0; g < M * slots; g++) ids[g] = (uint32_t)((g * 3 + 1) % pool);
+
+    float* dnF[4];
+    for (int e = 0; e < pool; e++) {
+        dnF[e] = (float*)malloc(sizeof(float) * (size_t)N * K);
+        moe_dequant_int4(&dn[e], dnF[e]);
+    }
+    float* refP = (float*)malloc(sizeof(float) * M * slots * N);
+    moe_down_ref(h, dnF, ids, M, slots, K, N, refP);
+
+    float* outP = (float*)calloc(M * slots * N, sizeof(float));
+    size_t scaleCount = (size_t)(N / 256) * K * pool;
+
+    buffer hB = createBuffer(s.dev.device, s.dev.physicalDevice, h, sizeof(float) * M * slots * K, MEMORY_RAM);
+    buffer idsB = createBuffer(s.dev.device, s.dev.physicalDevice, ids, sizeof(uint32_t) * M * slots, MEMORY_RAM);
+    buffer wB = createBuffer(s.dev.device, s.dev.physicalDevice, poolGpu.data, (int64_t)((size_t)K * N / 2 * pool), MEMORY_RAM);
+    buffer scaleB = createBuffer(s.dev.device, s.dev.physicalDevice, poolGpu.scale, sizeof(float) * scaleCount, MEMORY_RAM);
+    buffer zeroB = createBuffer(s.dev.device, s.dev.physicalDevice, poolGpu.zero, sizeof(float) * scaleCount, MEMORY_RAM);
+    buffer pB = createBuffer(s.dev.device, s.dev.physicalDevice, outP, sizeof(float) * M * slots * N, MEMORY_RAM);
+    buffer bufs[] = {hB, idsB, wB, scaleB, zeroB, pB};
+    createTransferAndCopy(s.dev.device, s.dev.queue, bufs, 6);
+
+    operation op = {.shader = "Expert-Down-INT4.spv", .buffers = {hB, idsB, wB, scaleB, zeroB, pB}, .bufferCount = 6,
+                    .pushConstants = {K, N, slots}, .pushConstantCount = 3,
+                    .dispatchX = N / 256, .dispatchY = M * slots, .dispatchZ = 1};
+    double ms = run_ops(s, &op, 1);
+
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, pB, outP);
+    report("Expert-Down-INT4", 100, outP, refP, M * slots * N, ms);
+
+    destroy_buffers(s, bufs, 6);
+    moe_free_pool(poolGpu);
+    for (int e = 0; e < pool; e++) {
+        free_quantized_data(dn[e]);
+        free(dnF[e]);
+    }
+    free(h);
+    free(ids);
+    free(refP);
+    free(outP);
+}
+
+void validateMoeCombine(session s, int M) {
+    int slots = MOE_TOPK;
+    int N = MOE_N;
+
+    float* p = getData(9501, M * slots, N);
+    float* weights = getData(9502, M, slots);
+    float* sharedW = getData(9503, M, 1);
+
+    float* refY = (float*)malloc(sizeof(float) * M * N);
+    moe_combine_ref(p, weights, sharedW, M, slots, N, refY);
+
+    float* outY = (float*)calloc(M * N, sizeof(float));
+
+    buffer pB = createBuffer(s.dev.device, s.dev.physicalDevice, p, sizeof(float) * M * slots * N, MEMORY_RAM);
+    buffer wB = createBuffer(s.dev.device, s.dev.physicalDevice, weights, sizeof(float) * M * slots, MEMORY_RAM);
+    buffer swB = createBuffer(s.dev.device, s.dev.physicalDevice, sharedW, sizeof(float) * M, MEMORY_RAM);
+    buffer yB = createBuffer(s.dev.device, s.dev.physicalDevice, outY, sizeof(float) * M * N, MEMORY_RAM);
+    buffer bufs[] = {pB, wB, swB, yB};
+    createTransferAndCopy(s.dev.device, s.dev.queue, bufs, 4);
+
+    operation op = {.shader = "Moe-Combine.spv", .buffers = {pB, wB, swB, yB}, .bufferCount = 4,
+                    .pushConstants = {M, N, slots}, .pushConstantCount = 3,
+                    .dispatchX = (M * N + 255) / 256, .dispatchY = 1, .dispatchZ = 1};
+    double ms = run_ops(s, &op, 1);
+
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, yB, outY);
+    report("Moe-Combine", 100, outY, refY, M * N, ms);
+
+    destroy_buffers(s, bufs, 4);
+    free(p);
+    free(weights);
+    free(sharedW);
+    free(refY);
+    free(outY);
+}
+
+void validateMoeLayerINT4(session s, int M) {
+    int E = MOE_E;
+    int pool = MOE_POOL;
+    int slots = MOE_SLOTS;
+    int K = MOE_K;
+    int I = MOE_I;
+    int N = MOE_N;
+
+    float* x = getData(9601, M, K);
+    float* gamma = getData(9602, 1, K);
+    float* xn = (float*)malloc(sizeof(float) * M * K);
+    for (int m = 0; m < M; m++) rms_norm_apply(x + m * K, gamma, xn + m * K, K);
+
+    uint16_t* w = getDataFP16(9603, K, E);
+    uint16_t* sgw = getDataFP16(9604, K, 1);
+    uint16_t* wT = (uint16_t*)malloc(sizeof(uint16_t) * K * E);
+    uint16_t* sgT = (uint16_t*)malloc(sizeof(uint16_t) * K);
+    transpose_block16((uint8_t*)w, (uint8_t*)wT, K, E, QUANT_FP16);
+    transpose_block16((uint8_t*)sgw, (uint8_t*)sgT, K, 1, QUANT_FP16);
+
+    QuantizedData gu[MOE_POOL];
+    QuantizedData dn[MOE_POOL];
+    for (int e = 0; e < pool; e++) {
+        gu[e] = getDataINT4(9700 + e, K, 2 * I);
+        dn[e] = getDataINT4(9800 + e, I, N);
+    }
+    moe_pool guPool = moe_build_pool(gu, pool, K, 2 * I);
+    moe_pool dnPool = moe_build_pool(dn, pool, I, N);
+
+    uint32_t* refIds = (uint32_t*)calloc(M * slots, sizeof(uint32_t));
+    float* refW = (float*)calloc(M * slots, sizeof(float));
+    float* refSw = (float*)calloc(M, sizeof(float));
+    moe_router_ref(xn, w, sgw, M, K, E, slots, refIds, refW, refSw);
+    for (int m = 0; m < M; m++) refIds[m * slots + slots - 1] = MOE_POOL - 1;
+
+    float* guF[MOE_POOL];
+    float* dnF[MOE_POOL];
+    for (int e = 0; e < pool; e++) {
+        guF[e] = (float*)malloc(sizeof(float) * (size_t)(2 * I) * K);
+        moe_dequant_int4(&gu[e], guF[e]);
+        dnF[e] = (float*)malloc(sizeof(float) * (size_t)N * I);
+        moe_dequant_int4(&dn[e], dnF[e]);
+    }
+    float* refH = (float*)malloc(sizeof(float) * M * slots * I);
+    moe_swiglu_ref(xn, guF, refIds, M, slots, K, I, refH);
+    float* refP = (float*)malloc(sizeof(float) * M * slots * N);
+    moe_down_ref(refH, dnF, refIds, M, slots, I, N, refP);
+    float* refY = (float*)malloc(sizeof(float) * M * N);
+    moe_combine_ref(refP, refW, refSw, M, slots, N, refY);
+
+    uint32_t* idsH = (uint32_t*)calloc(M * slots, sizeof(uint32_t));
+    for (int m = 0; m < M; m++) idsH[m * slots + slots - 1] = MOE_POOL - 1;
+    uint32_t* outIds = (uint32_t*)calloc(M * slots, sizeof(uint32_t));
+    float* outW = (float*)calloc(M * slots, sizeof(float));
+    float* outSw = (float*)calloc(M, sizeof(float));
+    float* outH = (float*)calloc(M * slots * I, sizeof(float));
+    float* outP = (float*)calloc(M * slots * N, sizeof(float));
+    float* outY = (float*)calloc(M * N, sizeof(float));
+
+    buffer xnB = createBuffer(s.dev.device, s.dev.physicalDevice, xn, sizeof(float) * M * K, MEMORY_RAM);
+    buffer wB = createBuffer(s.dev.device, s.dev.physicalDevice, wT, sizeof(uint16_t) * K * E, MEMORY_RAM);
+    buffer sgB = createBuffer(s.dev.device, s.dev.physicalDevice, sgT, sizeof(uint16_t) * K, MEMORY_RAM);
+    buffer idsB = createBuffer(s.dev.device, s.dev.physicalDevice, idsH, sizeof(uint32_t) * M * slots, MEMORY_RAM);
+    buffer wtsB = createBuffer(s.dev.device, s.dev.physicalDevice, outW, sizeof(float) * M * slots, MEMORY_RAM);
+    buffer swB = createBuffer(s.dev.device, s.dev.physicalDevice, outSw, sizeof(float) * M, MEMORY_RAM);
+    buffer guWB = createBuffer(s.dev.device, s.dev.physicalDevice, guPool.data, (int64_t)((size_t)K * 2 * I / 2 * pool), MEMORY_RAM);
+    buffer guScaleB = createBuffer(s.dev.device, s.dev.physicalDevice, guPool.scale, sizeof(float) * (size_t)(2 * I / 256) * K * pool, MEMORY_RAM);
+    buffer guZeroB = createBuffer(s.dev.device, s.dev.physicalDevice, guPool.zero, sizeof(float) * (size_t)(2 * I / 256) * K * pool, MEMORY_RAM);
+    buffer dnWB = createBuffer(s.dev.device, s.dev.physicalDevice, dnPool.data, (int64_t)((size_t)I * N / 2 * pool), MEMORY_RAM);
+    buffer dnScaleB = createBuffer(s.dev.device, s.dev.physicalDevice, dnPool.scale, sizeof(float) * (size_t)(N / 256) * I * pool, MEMORY_RAM);
+    buffer dnZeroB = createBuffer(s.dev.device, s.dev.physicalDevice, dnPool.zero, sizeof(float) * (size_t)(N / 256) * I * pool, MEMORY_RAM);
+    buffer hB = createBuffer(s.dev.device, s.dev.physicalDevice, outH, sizeof(float) * M * slots * I, MEMORY_RAM);
+    buffer pB = createBuffer(s.dev.device, s.dev.physicalDevice, outP, sizeof(float) * M * slots * N, MEMORY_RAM);
+    buffer yB = createBuffer(s.dev.device, s.dev.physicalDevice, outY, sizeof(float) * M * N, MEMORY_RAM);
+    buffer bufs[] = {xnB, wB, sgB, idsB, wtsB, swB, guWB, guScaleB, guZeroB, dnWB, dnScaleB, dnZeroB, hB, pB, yB};
+    createTransferAndCopy(s.dev.device, s.dev.queue, bufs, 15);
+
+    operation routerOp = {.shader = "Router-TopK.spv", .buffers = {xnB, wB, sgB, idsB, wtsB, swB}, .bufferCount = 6,
+                          .pushConstants = {M, E, K, slots}, .pushConstantCount = 4,
+                          .dispatchX = M, .dispatchY = 1, .dispatchZ = 1};
+    operation swigluOp = {.shader = "Expert-Swiglu-INT4.spv", .buffers = {xnB, idsB, guWB, guScaleB, guZeroB, hB}, .bufferCount = 6,
+                          .pushConstants = {K, I, slots}, .pushConstantCount = 3,
+                          .dispatchX = I / 256, .dispatchY = M * slots, .dispatchZ = 1};
+    operation downOp = {.shader = "Expert-Down-INT4.spv", .buffers = {hB, idsB, dnWB, dnScaleB, dnZeroB, pB}, .bufferCount = 6,
+                        .pushConstants = {I, N, slots}, .pushConstantCount = 3,
+                        .dispatchX = N / 256, .dispatchY = M * slots, .dispatchZ = 1};
+    operation combineOp = {.shader = "Moe-Combine.spv", .buffers = {pB, wtsB, swB, yB}, .bufferCount = 4,
+                           .pushConstants = {M, N, slots}, .pushConstantCount = 3,
+                           .dispatchX = (M * N + 255) / 256, .dispatchY = 1, .dispatchZ = 1};
+
+    double ms1 = run_ops(s, &routerOp, 1);
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, idsB, outIds);
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, wtsB, outW);
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, swB, outSw);
+    int mism = 0;
+    for (int i = 0; i < M * slots; i++) if (outIds[i] != refIds[i]) mism++;
+    printf("Moe-Layer-INT4 ids: %d mismatches out of %d\n", mism, M * slots);
+    report("Moe-Layer router weights", 0, outW, refW, M * slots, ms1);
+    report("Moe-Layer sharedW", 0, outSw, refSw, M, ms1);
+
+    double ms2 = run_ops(s, &swigluOp, 1);
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, hB, outH);
+    report("Moe-Layer-INT4 h", 100, outH, refH, M * slots * I, ms2);
+
+    double ms3 = run_ops(s, &downOp, 1);
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, pB, outP);
+    report("Moe-Layer-INT4 partials", 100, outP, refP, M * slots * N, ms3);
+
+    double ms4 = run_ops(s, &combineOp, 1);
+    readBuffer(s.dev.device, s.dev.physicalDevice, s.dev.queue, yB, outY);
+    report("Moe-Layer-INT4 y", 100, outY, refY, M * N, ms4);
+
+    destroy_buffers(s, bufs, 15);
+    moe_free_pool(guPool);
+    moe_free_pool(dnPool);
+    for (int e = 0; e < pool; e++) {
+        free_quantized_data(gu[e]);
+        free_quantized_data(dn[e]);
+        free(guF[e]);
+        free(dnF[e]);
+    }
+    free(x);
+    free(gamma);
+    free(xn);
+    free(w);
+    free(sgw);
+    free(wT);
+    free(sgT);
+    free(refIds);
+    free(refW);
+    free(refSw);
+    free(refH);
+    free(refP);
+    free(refY);
+    free(idsH);
+    free(outIds);
+    free(outW);
+    free(outSw);
+    free(outH);
+    free(outP);
+    free(outY);
+}
+
 void validation(void) {
     session s = createSession();
 
@@ -5681,6 +6157,13 @@ void validation(void) {
     // validateGatedDeltaNetFP16(s, K, input, input2, gamma, w_inFP16, woFP16);
     validateGatedDeltaNetINT8(s, K, input, input2, gamma, w_inINT8, woINT8);
     validateGatedDeltaNetINT4(s, K, input, input2, gamma, w_inINT4, woINT4);
+
+    validateRouterTopK(s, 8);
+    validateExpertSwigluINT4(s, 8);
+    validateExpertDownINT4(s, 8);
+    validateMoeCombine(s, 8);
+    validateMoeLayerINT4(s, 1);
+    validateMoeLayerINT4(s, 8);
 
     free(input);
     free(input2);
