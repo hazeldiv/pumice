@@ -5,7 +5,7 @@
 
 #define MODEL_MAX_LAYERS 64
 #define MODEL_EOS 81896
-#define MODEL_MAX_OPS 1280
+#define MODEL_MAX_OPS 2048
 #define MAX_PENALTY_LEN 1024
 
 typedef enum {
@@ -21,7 +21,8 @@ typedef struct attention {
 
 typedef enum {
     FFN_NONE,
-    FFN_SWIGLU
+    FFN_SWIGLU,
+    FFN_MOE
 } ffn_type;
 
 typedef struct ffn {
@@ -60,6 +61,9 @@ typedef struct model_dims {
     int projBOff;
     int zqkvN;
     int convHist;
+    int experts;
+    int expertsPerTok;
+    int moeI;
     int maxCtx;
     int vocab;
     int eos;
@@ -76,6 +80,7 @@ typedef struct model_config {
     layer layers[MODEL_MAX_LAYERS];
     QuantType embedQ;
     QuantType lmHeadQ;
+    int expertsVram;
 } model_config;
 
 int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride, int pruned);

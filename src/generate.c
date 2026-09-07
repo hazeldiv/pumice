@@ -55,7 +55,7 @@ static void addGemvSplit(generator* g, operation* ops, int* n, int L, const tens
         bufs[b++] = wt->scale;
         bufs[b++] = wt->zero;
     }
-    int push[] = {1, d->K, d->K};
+    int push[] = {1, d->K, wt->rows};
     addOp(ops, n, model_shader("GEMV-SplitK", q), L, bufs, b, push, 3, d->K / 256, 4);
 
     buffer rBufs[3];
@@ -93,7 +93,7 @@ static void addGemmAdd(generator* g, operation* ops, int* n, int L, const tensor
         bufs[b++] = wt->zero;
     }
     bufs[b++] = residual;
-    int k = (input.buffer == g->st.act.buffer) ? d->ffnN : d->K;
+    int k = (input.buffer == g->st.act.buffer) ? d->ffnN : wt->rows;
     int tn = (q == QUANT_INT4) ? 64 : 32;
     int push[] = {m, d->K, k};
     addOp(ops, n, model_shader("GEMM-ADD2", q), L, bufs, b, push, 3, d->K / tn, (m + 15) / 16);
@@ -447,6 +447,63 @@ static void buildDelta(generator* g, operation* ops, int* n, int L, int gemm, in
     addGemmAdd(g, ops, n, L, &w->out[L], st->yGated, st->h, L == 0 ? st->embOut : st->h, q, m);
 }
 
+static void buildMoe(generator* g, operation* ops, int* n, int L, int m) {
+    model_state* st = &g->st;
+    model_weights* w = &g->w;
+    const model_dims* d = g->dims;
+    int slots = d->expertsPerTok + 1;
+
+    buffer rtBufs[8];
+    rtBufs[0] = st->h;
+    rtBufs[1] = w->gammaF[L];
+    rtBufs[2] = w->router[L];
+    rtBufs[3] = w->sharedGate[L];
+    rtBufs[4] = st->moeIds;
+    rtBufs[5] = st->moeWeights;
+    rtBufs[6] = st->moeSharedW;
+    rtBufs[7] = st->moeXn;
+    int pushR[] = {m, d->experts, d->K, slots};
+    addOp(ops, n, "Router-TopK.spv", L, rtBufs, 8, pushR, 4, m, 1);
+
+    buffer guBufs[9];
+    guBufs[0] = st->moeXn;
+    guBufs[1] = st->moeIds;
+    guBufs[2] = w->guPool[L].vramData;
+    guBufs[3] = w->guPool[L].vramScale;
+    guBufs[4] = w->guPool[L].vramZero;
+    guBufs[5] = st->moeH;
+    guBufs[6] = w->guPool[L].ramData;
+    guBufs[7] = w->guPool[L].ramScale;
+    guBufs[8] = w->guPool[L].ramZero;
+    int pushG[] = {d->K, d->moeI, slots, w->guPool[L].vramExperts, w->guPool[L].expertCount};
+    addOp(ops, n, "Expert-Swiglu-INT4.spv", L, guBufs, 9, pushG, 5,
+          d->moeI / 256, m * slots);
+
+    buffer dnBufs[9];
+    dnBufs[0] = st->moeH;
+    dnBufs[1] = st->moeIds;
+    dnBufs[2] = w->dnPool[L].vramData;
+    dnBufs[3] = w->dnPool[L].vramScale;
+    dnBufs[4] = w->dnPool[L].vramZero;
+    dnBufs[5] = st->moeP;
+    dnBufs[6] = w->dnPool[L].ramData;
+    dnBufs[7] = w->dnPool[L].ramScale;
+    dnBufs[8] = w->dnPool[L].ramZero;
+    int pushD[] = {d->moeI, d->K, slots, w->dnPool[L].vramExperts, w->dnPool[L].expertCount};
+    addOp(ops, n, "Expert-Down-INT4.spv", L, dnBufs, 9, pushD, 5,
+          d->K / 256, m * slots);
+
+    buffer cbBufs[5];
+    cbBufs[0] = st->moeP;
+    cbBufs[1] = st->moeWeights;
+    cbBufs[2] = st->moeSharedW;
+    cbBufs[3] = st->h;
+    cbBufs[4] = st->h;
+    int pushC[] = {m, d->K, slots};
+    addOp(ops, n, "Moe-Combine.spv", L, cbBufs, 5, pushC, 3,
+          (m * d->K + 255) / 256, 1);
+}
+
 static void buildLayer(generator* g, operation* ops, int* n, int L, int gemm, int m, int splitAttn, int ctx, int offset, int realM) {
     const layer* ly = &g->spec->layers[L];
     if (ly->attn.type == ATTENTION_FULL) {
@@ -456,6 +513,8 @@ static void buildLayer(generator* g, operation* ops, int* n, int L, int gemm, in
     }
     if (ly->ffn.type == FFN_SWIGLU) {
         buildFfn(g, ops, n, L, gemm, m);
+    } else if (ly->ffn.type == FFN_MOE) {
+        buildMoe(g, ops, n, L, m);
     }
 }
 
@@ -671,8 +730,25 @@ uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens) {
                 int nf = 0;
                 if (ly->ffn.type == FFN_SWIGLU) {
                     buildFfn(g, g->prefillOps, &nf, L, 1, padded);
+                } else if (ly->ffn.type == FFN_MOE) {
+                    buildMoe(g, g->prefillOps, &nf, L, padded);
                 }
                 executeChunked(g->s, g->prefillOps, nf, "prefill", (int)(g->nextPos + done));
+                if (ly->ffn.type == FFN_MOE && st->moeIds.buffer != VK_NULL_HANDLE) {
+                    int moeSlots = d->expertsPerTok + 1;
+                    snprintf(name, sizeof(name), "layer_%02d_moeXn", L + 1);
+                    dumpBuffer(g, st->moeXn, name, (int64_t)padded * d->K);
+                    snprintf(name, sizeof(name), "layer_%02d_moeIds", L + 1);
+                    dumpBuffer(g, st->moeIds, name, (int64_t)padded * moeSlots);
+                    snprintf(name, sizeof(name), "layer_%02d_moeW", L + 1);
+                    dumpBuffer(g, st->moeWeights, name, (int64_t)padded * moeSlots);
+                    snprintf(name, sizeof(name), "layer_%02d_moeSw", L + 1);
+                    dumpBuffer(g, st->moeSharedW, name, padded);
+                    snprintf(name, sizeof(name), "layer_%02d_moeH", L + 1);
+                    dumpBuffer(g, st->moeH, name, (int64_t)padded * moeSlots * d->moeI);
+                    snprintf(name, sizeof(name), "layer_%02d_moeP", L + 1);
+                    dumpBuffer(g, st->moeP, name, (int64_t)padded * moeSlots * d->K);
+                }
                 snprintf(name, sizeof(name), "layer_%02d_h", L + 1);
                 dumpBuffer(g, st->h, name, (int64_t)padded * d->K);
                 if (g->spec->layers[L].attn.type == ATTENTION_FULL) {

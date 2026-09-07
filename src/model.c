@@ -134,6 +134,10 @@ int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride,
     d->tied = json_get_bool(txt, "tie_word_embeddings", 0);
     double partial = json_get_num(txt, "partial_rotary_factor", 0.25);
     int hfVocab = json_get_int(txt, "vocab_size", MODEL_VOCAB);
+    d->experts = json_get_int(txt, "num_experts", 0);
+    d->expertsPerTok = json_get_int(txt, "num_experts_per_tok", 0);
+    d->moeI = json_get_int(txt, "moe_intermediate_size", 0);
+    if (d->ffnN <= 0 && d->moeI > 0) d->ffnN = d->moeI;
     json_value* rope = json_get(txt, "rope_parameters");
     if (rope != NULL) {
         d->ropeTheta = json_get_num(rope, "rope_theta", d->ropeTheta);
@@ -153,6 +157,9 @@ int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride,
     if (d->layerCount > MODEL_MAX_LAYERS) cfg_fatal("too many layers");
     if (layerTypes->count != d->layerCount) cfg_fatal("layer_types count mismatch");
     if (d->convHist < 1) cfg_fatal("invalid linear_conv_kernel_dim");
+    if (d->experts > 256) cfg_fatal("too many experts");
+    if (d->experts > 0 && d->expertsPerTok != 8) cfg_fatal("only top-8 routing supported");
+    if (d->experts > 0 && d->moeI <= 0) cfg_fatal("moe_intermediate_size missing");
 
     d->rotaryDim = (int)(d->headDim * partial);
     d->rotaryHalf = d->rotaryDim / 2;
@@ -207,7 +214,12 @@ int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride,
         json_value* ly = &layers->items[i];
         cfg->layers[i].attn.q = parse_quant(json_get_str(ly, "attn", "fp16"), QUANT_FP16);
         cfg->layers[i].ffn.q = parse_quant(json_get_str(ly, "ffn", "fp16"), QUANT_FP16);
-        cfg->layers[i].ffn.type = FFN_SWIGLU;
+        cfg->layers[i].ffn.type = d->experts > 0 ? FFN_MOE : FFN_SWIGLU;
+    }
+
+    cfg->expertsVram = json_get_int(qc, "experts_vram", d->experts);
+    if (cfg->expertsVram < 1 || (d->experts > 0 && cfg->expertsVram > d->experts)) {
+        cfg->expertsVram = d->experts;
     }
 
     snprintf(cfg->name, sizeof(cfg->name), "%s", json_get_str(qc, "name", "model"));

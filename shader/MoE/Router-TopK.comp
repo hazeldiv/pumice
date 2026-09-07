@@ -1,6 +1,8 @@
 #version 450
 #define TS 256
 #define TOPK 8
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
 
 layout(local_size_x = TS, local_size_y = 1, local_size_z = 1) in;
 
@@ -12,21 +14,50 @@ layout(push_constant) uniform Params {
 } dims;
 
 layout(set = 0, binding = 0) readonly restrict buffer Act { vec4 x[]; };
-layout(set = 0, binding = 1) readonly restrict buffer RouterW { uvec4 w[]; };
-layout(set = 0, binding = 2) readonly restrict buffer SharedGateW { uvec4 sgw[]; };
-layout(set = 0, binding = 3) writeonly restrict buffer Ids { uint ids[]; };
-layout(set = 0, binding = 4) writeonly restrict buffer Weights { float weights[]; };
-layout(set = 0, binding = 5) writeonly restrict buffer SharedW { float sharedW[]; };
+layout(set = 0, binding = 1) readonly restrict buffer Gamma { vec4 gamma[]; };
+layout(set = 0, binding = 2) readonly restrict buffer RouterW { uvec4 w[]; };
+layout(set = 0, binding = 3) readonly restrict buffer SharedGateW { uvec4 sgw[]; };
+layout(set = 0, binding = 4) writeonly restrict buffer Ids { uint ids[]; };
+layout(set = 0, binding = 5) writeonly restrict buffer Weights { float weights[]; };
+layout(set = 0, binding = 6) writeonly restrict buffer SharedW { float sharedW[]; };
+layout(set = 0, binding = 7) writeonly restrict buffer Xn { vec4 xn[]; };
+
+const float EPSILON = 1e-6;
 
 shared vec4 xCache[512];
 shared float probs[256];
 shared float sgPart[256];
+shared float subSums[8];
 
 void main() {
     uint m = gl_WorkGroupID.x;
     uint e = gl_LocalInvocationID.x;
+    uint kvec = dims.K / 4;
 
-    for (uint i = e; i < dims.K / 4; i += TS) xCache[i] = x[m * (dims.K / 4) + i];
+    float sumSq = 0.0;
+    for (uint i = e; i < kvec; i += TS) {
+        vec4 v = x[m * kvec + i];
+        xCache[i] = v;
+        sumSq += dot(v, v);
+    }
+    sumSq = subgroupAdd(sumSq);
+    if (subgroupElect()) subSums[gl_SubgroupID] = sumSq;
+    barrier();
+    float invRms;
+    if (e == 0) {
+        float total = 0.0;
+        uint groups = (TS + gl_SubgroupSize - 1) / gl_SubgroupSize;
+        for (uint i = 0; i < groups; i++) total += subSums[i];
+        subSums[0] = inversesqrt(total / float(dims.K) + EPSILON);
+    }
+    barrier();
+    invRms = subSums[0];
+
+    for (uint i = e; i < kvec; i += TS) {
+        vec4 nv = xCache[i] * gamma[i] * invRms;
+        xCache[i] = nv;
+        xn[m * kvec + i] = nv;
+    }
     barrier();
 
     if (e < dims.N) {

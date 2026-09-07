@@ -1,6 +1,6 @@
 # VK Compute — Complete Technical Summary
 
-A Vulkan-based GPU compute engine for running LLM inference — **multi-model** (any Qwen3.5-family checkpoint, currently **Qwen3.5 9B** and **Qwen3.5 2B**), all model dimensions **read at runtime from config files** (no per-model recompile) — with per-layer **hybrid quantization** (INT4, INT8, FP16) on AMD RDNA1-class GPUs (RX 580: 36 CUs, wave64). Three entry points, all gated by `main.exe`:
+A Vulkan-based GPU compute engine for running LLM inference — **multi-model** (any Qwen3.5/3.6-family checkpoint, currently **Qwen3.6-35B-A3B** (MoE), **Qwen3.5 9B**, and **Qwen3.5 2B**), all model dimensions **read at runtime from config files** (no per-model recompile) — with per-layer **hybrid quantization** (INT4, INT8, FP16) and **MoE expert offloading** (per-layer expert pools split between VRAM and host-visible RAM) on AMD RDNA1-class GPUs (RX 580: 36 CUs, wave64). Three entry points, all gated by `main.exe`:
 
 - **Server mode** (`main.exe`, default): a **persistent** inference daemon. It loads the real safetensors weights once (Â§4.7), then serves repeated "tokenize — generate" requests over a length-prefixed binary protocol on stdin/stdout (`[uint32 n][nÃ—uint32 ids]` in — a stream of `[uint32 id]` tokens terminated by a `0xFFFFFFFF` sentinel; `n == 0` shuts down). Tokens are emitted **one at a time** as they are generated. The Python frontend `vk_llm.py` (repo root, run under `.venv` via **uv**) tokenizes text, drives the daemon, and detokenizes output.
 - **Validation mode** (`main.exe val`): the original shader harness — randomized test data, weight transpose/quantize/upload, GPU dispatch, comparison against single-threaded CPU references.
@@ -8,7 +8,7 @@ A Vulkan-based GPU compute engine for running LLM inference — **multi-model** 
 
 Both the server and the harness share the same `operation` dispatch core (Â§3.3).
 
-> **Model status.** The engine runs the **text stack only** (the `mtp.*` and `model.visual.*` tensors are ignored) — and it runs it **perfectly** against the real Qwen3.5 weights, both 9B and 2B. The **gated delta-net** is HF-identical to the Qwen3.5 block (Â§7.3), and the full-attention / FFN layers match the reference, including the **runtime-generalized GQA head mapping** (`kvh = head / gqa`, `gqa = heads/kv_heads` — any ratio, not just 16/4), the attention `1/šhead_dim` scaling, partial RoPE (64/256), and the `Qwen3_5RMSNorm` `1+weight` convention. Prefill layers track the HF reference at 0.96  0.9999 cosine correlation, and the decode trajectory matches the pruned-vocab-constrained HF greedy exactly, token-for-token (Â§13). Both **thinking** and **non-thinking** modes produce coherent, correct output (see Â§13). The 2B additionally validated greedy token-for-token against HF through long-context decode (past the split-K threshold at ctx 256).
+> **Model status.** The engine runs the **text stack only** (the `mtp.*` and `model.visual.*` tensors are ignored) — and it runs it **perfectly** against the real Qwen3.5 weights, both 9B and 2B, and the **Qwen3.6-35B-A3B MoE** (40 layers: 30 gated delta-net + 10 full-attention, every FFN a 256-expert top-8 MoE with a shared expert — §7.8). The **gated delta-net** is HF-identical to the Qwen3.5 block (§7.3), and the full-attention / FFN layers match the reference, including the **runtime-generalized GQA head mapping** (`kvh = head / gqa`, `gqa = heads/kv_heads` — any ratio, not just 16/4), the attention `1/sqrt(head_dim)` scaling, partial RoPE (64/256), and the `Qwen3_5RMSNorm` `1+weight` convention. Prefill layers track the HF reference at 0.96–0.9999 cosine correlation, and the decode trajectory matches the pruned-vocab-constrained HF greedy exactly, token-for-token (§13). Both **thinking** and **non-thinking** modes produce coherent, correct output (see §13). The 2B additionally validated greedy token-for-token against HF through long-context decode (past the split-K threshold at ctx 256). The 35B-A3B runs with 32 experts/layer in VRAM + 224 in host RAM at ~10.7 tok/s decode (pruned vocab, gqa 8 verified layer-by-layer against a CPU safetensors reference: delta L0 corr 0.9999, attention L3 corr 0.998, all 9 MoE slots >= 0.986).
 
 ---
 
@@ -26,25 +26,27 @@ Both the server and the harness share the same `operation` dispatch core (Â§3.
 
 Every value below is a field of `model_dims` (include/model.h), filled by `loadModelConfig` from the model dir. Example values shown for the two supported models:
 
-| Field | 9B | 2B | Meaning / derivation |
-|---|---|---|---|
-| `K` | 4096 | 2048 | `hidden_size` — hidden size / reduction dim |
-| `layerCount` | 32 | 24 | `num_hidden_layers` (capacity `MODEL_MAX_LAYERS = 64`) |
-| `ffnN` | 12288 | 6144 | `intermediate_size` — FFN gate+up columns |
-| `heads` / `kvHeads` / `headDim` | 16 / 4 / 256 | 8 / 2 / 256 | `num_attention_heads` / `num_key_value_heads` / `head_dim` |
-| `gqa` (derived) | 4 | 4 | `heads / kvHeads` — GQA group size, pushed to shaders |
-| `qkvN` (derived) | 10240 | 5120 | q+g+k+v fused width = `(2Â·heads + 2Â·kvHeads)Â·headDim` |
-| `nQk` / `nV` / `dim` | 16 / 32 / 128 | 16 / 16 / 128 | `linear_num_key_heads` / `linear_num_value_heads` / `linear_value_head_dim` |
-| `projN` (derived) | 12352 | 8224 | delta in_proj width = `2Â·nQkÂ·dim + nVÂ·dim + 2Â·nV` (Q  K  V  Z  A  B) |
-| `zqkvN` (derived) | 8192 | 6144 | `2Â·nQkÂ·dim + nVÂ·dim` — conv+SiLU channel count |
-| `kvRows` (derived) | 1024 | 512 | `kvHeadsÂ·headDim` — KV cache row count |
-| `rotaryDim` | 64 | 64 | `headDim Â· partial_rotary_factor` (0.25) |
-| `ropeTheta` | 1e7 | 1e7 | `rope_parameters.rope_theta` |
-| `tied` | 0 | 1 | `tie_word_embeddings` (2B shares one embed matrix for embed+lm-head) |
-| `vocab` | 86016 / 248320 | 86016 / 248320 | mode-dependent: `--prune` → hardcoded `MODEL_VOCAB` 86016 (include/generated_vocab.h); no `--prune` → `config.json` `text_config.vocab_size` (the original HF vocab). The 248320 mode fits the 8 GB heap only on the 2B (~1 GB embed); the 9B's two FP16 heads (~4 GB) would OOM. |
-| `maxCtx` | 32768 | 32768 | `quant_config.json` `max_ctx`, overridable via `--max-ctx` |
-| `prefillChunk` | 512 | 512 | `quant_config.json` `prefill_chunk` |
-| `max_ops` | 1280 | 1280 | max `operation`s per op array (`MODEL_MAX_OPS`) |
+| Field | 35B-A3B | 9B | 2B | Meaning / derivation |
+|---|---|---|---|---|
+| `K` | 2048 | 4096 | 2048 | `hidden_size` — hidden size / reduction dim |
+| `layerCount` | 40 | 32 | 24 | `num_hidden_layers` (capacity `MODEL_MAX_LAYERS = 64`) |
+| `ffnN` | 512 | 12288 | 6144 | `intermediate_size` — FFN gate+up columns |
+| `heads` / `kvHeads` / `headDim` | 16 / 2 / 256 | 16 / 4 / 256 | 8 / 2 / 256 | `num_attention_heads` / `num_key_value_heads` / `head_dim` |
+| `gqa` (derived) | 8 | 4 | 4 | `heads / kvHeads` — GQA group size, pushed to shaders |
+| `qkvN` (derived) | 9216 | 10240 | 5120 | q+g+k+v fused width = `(2Â·heads + 2Â·kvHeads)Â·headDim` |
+| `nQk` / `nV` / `dim` | 16 / 32 / 128 | 16 / 32 / 128 | 16 / 16 / 128 | `linear_num_key_heads` / `linear_num_value_heads` / `linear_value_head_dim` |
+| `projN` (derived) | 12352 | 12352 | 8224 | delta in_proj width = `2Â·nQkÂ·dim + nVÂ·dim + 2Â·nV` (Q  K  V  Z  A  B) |
+| `zqkvN` (derived) | 8192 | 8192 | 6144 | `2Â·nQkÂ·dim + nVÂ·dim` — conv+SiLU channel count |
+| `kvRows` (derived) | 512 | 1024 | 512 | `kvHeadsÂ·headDim` — KV cache row count |
+| `rotaryDim` | 64 | 64 | 64 | `headDim Â· partial_rotary_factor` (0.25) |
+| `ropeTheta` | 1e7 | 1e7 | 1e7 | `rope_parameters.rope_theta` |
+| `tied` | 0 | 0 | 1 | `tie_word_embeddings` (2B shares one embed matrix for embed+lm-head) |
+| `vocab` | 86016 / 248320 | 86016 / 248320 | 86016 / 248320 | mode-dependent: `--prune` -> hardcoded `MODEL_VOCAB` 86016 (include/generated_vocab.h); no `--prune` -> `config.json` `text_config.vocab_size` (the original HF vocab). The 248320 mode fits the 8 GB heap only on the 2B (~1 GB embed); the 9B/35B run pruned. |
+| `maxCtx` | 8192 | 32768 | 32768 | `quant_config.json` `max_ctx`, overridable via `--max-ctx` |
+| `prefillChunk` | 512 | 512 | 512 | `quant_config.json` `prefill_chunk` |
+| `experts` / `expertsPerTok` / `moeI` | 256 / 8 / 512 | 0 / 0 / 0 | 0 / 0 / 0 | `num_experts` / `num_experts_per_tok` / `moe_intermediate_size` — nonzero experts switch every FFN to `FFN_MOE` (§7.8); `ffnN` falls back to `moeI` when `intermediate_size` is absent |
+| `expertsVram` (config) | 32 (default) | n/a | n/a | `quant_config.json` `experts_vram`, overridable `--experts-vram N` — routed experts 0..N-1 + the shared expert live in a VRAM pool, the rest in a host-visible RAM pool (§4.7) |
+| `max_ops` | 2048 | 2048 | 2048 | max `operation`s per op array (`MODEL_MAX_OPS`; raised 1280 -> 2048 for the 40-layer 35B decode group: ~370 ops/token x 4 + lm head) |
 
 The per-layer spec (attention type from `layer_types[]`, quant from `quant_config.json` `layers[]`) also comes from the configs — the old hardcoded 32-layer `model_config` in compute.c is gone.
 
@@ -288,6 +290,40 @@ Loading is **cache-first and lazy at every level, for every weight class** (matr
 **Disk cache** (`bin/weights/<model-name>/` — one directory per model, so two models never collide): quantized matrices as `<name>_<QUANT>.bin` (header `{magic, rows, cols, quant}` — a dim or quant change auto-invalidates), embeddings as `embed_<V>_FP16.bin` / `lmHead_<V>_FP16.bin`. The embed cache filename carries V, so the pruned (86016) and original (248320) vocab modes **coexist** in one cache dir without invalidation. **Gotcha: the cache keys on dims, not weight-file content — after re-gathering a vocab or editing quant_config.json, delete the model's cache directory or generation runs on stale tensors** (gotcha 37).
 
 **Tied vs untied embeddings**: `tie_word_embeddings: true` (2B) loads the single embedding matrix once and aliases `lmHead = embed`; `false` (9B) loads two separate matrices from the vocab folder (`embed_tokens.<V>.safetensors` / `lm_head.<V>.safetensors`, both required — they are genuinely different matrices, verified at the source). Vocab weights resolve cache-first — vocab-folder safetensors (opened lazily, V-exact match) — shard tensors. In original-vocab mode the shard tensors are the only source (the vocab folder holds pruned-size files only). `rope_theta`, `partial_rotary_factor`, and `rms_norm_eps = 1e-6` all come from config.
+
+**MoE expert pools (Qwen3.6-35B-A3B)** — when `config.json` has `num_experts > 0` (so every layer's
+FFN is `FFN_MOE`), the loader builds, per layer, two **expert pools** covering all 257 experts
+(256 routed + the shared expert at index 256):
+
+- `guPool_<L>_INT4.bin` — per expert the fused `[K][2*moeI]` gate|up matrix, INT4-quantized
+  (group 256) from the BF16 `mlp.experts.gate_up_proj[L][e]` (routed, HF chunks gate|up along dim 0)
+  and from `mlp.shared_expert.gate_proj` + `up_proj` (fused the same way);
+- `dnPool_<L>_INT4.bin` — per expert the `[moeI][K]` down matrix from
+  `mlp.experts.down_proj[L][e]` / `mlp.shared_expert.down_proj`;
+- `router_<L>.bin` / `sgGate_<L>.bin` — the FP16 `[K][experts]` router weight (`mlp.gate.weight`,
+  transposed to engine layout and block-transposed) and the `[K][1]` shared-expert gate.
+
+HF expert tensors are `[out][in]` and are transposed to engine `[in][out]` before quantization (the
+routed read is a direct `fseek` into the 3-D tensor — no full-tensor load; gotcha 43). The pool
+cache files carry a 5-int header `{magic, rows, cols, quant, experts}` and are **independent of
+`experts_vram`** — the split is applied at buffer-creation time (`expertPoolSplit`), not at
+quantization time, so changing `--experts-vram` never requantizes:
+
+- **VRAM pool** = routed experts `0..N-1` **plus the shared expert** (copied into slot N; the shader
+  remaps id `experts` -> slot `N`), as device-local buffers;
+- **RAM pool** = routed experts `N..255` as one host-visible (PCIe-read) buffer — the Expert-*
+  shaders take both pools as bindings and select per (token, slot) by comparing the id against
+  `vramExperts` (gotcha 44). This is the substrate for the planned LFRU expert swap: the pool is
+  expert-contiguous, so a future swap just re-copies one expert's block into the VRAM pool.
+
+The 35B also breaks the `nV*dim == K` coincidence of every earlier model: the delta `out_proj` is
+`[2048][4096]` (engine `[4096][2048]`), so `out` tensors, the `yGated` state buffer, and the decode
+out-projection GEMV/SplitK reduction dim are all `nV*dim`/`tensor.rows`-driven now, not hardcoded
+`K` (gotcha 45). Weight buffers are uploaded in batches of 12 with their staging memory freed
+immediately after each batch (`registerWeightBuffer` + `releaseStaging`) — the one-shot bulk copy
+kept every staging allocation alive until the end and blew the 16 GB host-visible heap when the RAM
+pools were also resident (gotcha 46).
+
 
 ---
 
@@ -1227,13 +1263,43 @@ The repetition-penalty ring `sampleHistory` is a device buffer of `MAX_PENALTY_L
 
 ---
 
+### 7.8 MoE — router + expert pools + combine (Qwen3.6-35B-A3B)
+
+Every layer's FFN is a 256-expert top-8 MoE with one shared expert, executed as **four ops**
+(`buildMoe` in generate.c) that replace the dense FFN chain; the same op sequence serves decode
+(m=1) and prefill (m=padded chunk) because the expert shaders key the slot id off
+`globalSlot = wgID.y` (dispatchY = m*(topk+1)):
+
+1. **`Router-TopK.spv`** — one workgroup per token (256 threads). Stages the raw residual `h`,
+   computes the RMSNorm **and writes the normed `xn` to a buffer** (the expert GEMVs read it —
+   norming once per token instead of once per expert), then each thread < E computes one router
+   logit (FP16 router weight, engine blocked layout), a cooperative dot reduces the shared-expert
+   gate logit, and thread 0 does softmax -> top-8 (lowest-index tie-break) -> **renormalized
+   weights** (`w = p_topk / sum(p_topk)` — the full softmax denominator cancels), writing
+   `ids[m*slots+s]`, `weights[m*slots+s]`, and `sharedW[m] = sigmoid(sharedGateLogit)`.
+   Push `{M, E, K, slots}`; E <= 256, K <= 2048 (shared-array sized).
+2. **`Expert-Swiglu-INT4.spv`** — one workgroup per (slot, 256-col tile): `dispatchX = moeI/256`,
+   `dispatchY = m*slots`. Looks up `ids[globalSlot]`, remaps it: `id == experts` (the shared
+   expert) -> VRAM slot `vramExperts-1`; `id >= vramExperts-1` -> RAM pool index
+   `id-(vramExperts-1)`; else VRAM `id`. Computes `silu(xn @ gate_e) * (xn @ up_e)` from the
+   INT4 pool (chunked gate|up layout: gate cols `j`, up cols `j+moeI`), writing
+   `h[globalSlot*moeI + j]`. Push `{K, moeI, slots, vramExperts, experts}`.
+3. **`Expert-Down-INT4.spv`** — same shape, `h -> partials[m*slots*K + j]` through the down pool.
+4. **`Moe-Combine.spv`** — elementwise: `y = h + sharedW*P[sharedSlot] + sum_{s<8} w_s*P[s]`
+   (residual add fused; the last slot index `slots-1` is the shared expert).
+
+Buffer layout notes: the pools bind as **six** buffers (VRAM data/scale/zero + RAM data/scale/zero);
+the id remap lives entirely in the shaders, so swapping an expert between pools requires no host
+bookkeeping beyond the pool contents. `moeIds` is initialized with `experts` in every token's slot
+`slots-1` at state creation (the router only writes slots 0..7 — gotcha 47).
+
 ## 8. Inference Engine (src/generate.c)
 
 The engine compiles the model into `operation` arrays at startup — all dimensions from `spec->dims` (runtime config) — and executes them with the split record/submit/wait API from Â§3.3 (`executeRecord` — `executeSubmitNow` — `executeWaitLast` — `logLastFrame`), which keeps per-op GPU timestamps and avoids the per-op fence stall of `execute()`.
 
 ### 8.1 Op compilation
 
-`addOp` appends a fully-formed `operation` (shader name, buffers, push constants, dispatch). The layer builders (`buildFfn`, `buildAttention`, `buildDelta`, `buildLinearProj`, `buildLmHead`) emit the op sequences from Â§7.6 — `buildDelta` inserts a `Conv-SiLU.spv` op between the input projection and `GatedDeltaNet*` for every delta layer. `createGenerator` sets the shader root + spec constant (`pipelineSetSpecInt(0, dims.K)`), loads weights (Â§4.7), allocates state, and pre-compiles four arrays:
+`addOp` appends a fully-formed `operation` (shader name, buffers, push constants, dispatch). The layer builders (`buildFfn`, `buildMoe`, `buildAttention`, `buildDelta`, `buildLinearProj`, `buildLmHead`) emit the op sequences from Â§7.6 — `buildDelta` inserts a `Conv-SiLU.spv` op between the input projection and `GatedDeltaNet*` for every delta layer. `createGenerator` sets the shader root + spec constant (`pipelineSetSpecInt(0, dims.K)`), loads weights (Â§4.7), allocates state, and pre-compiles four arrays:
 
 - **`groupOps` / `groupOpsShort`** — decode group: `DECODE_GROUP = 4` tokens Ã— (Embed-LinearProj — all layers — lm-head). The two variants differ only in attention: split-K (`Att-SplitK2`+`Reduce-Att2`) vs `Att-full`, selected by `ATT_SPLIT_THRESHOLD = 256` on the current context length.
 - **`prefillOps`** — one chunk of `maxM` tokens (`prefillChunk`): Embed-Gather — RmsNorm-Prologue — LinearProj-GEMM2-FP16 (over `st->embStaged`) — all layers — (no lm head).
@@ -1311,6 +1377,49 @@ A separate `--debug-sampling` flag (`generatorDumpSamplingDebug`) reads back the
 40. **Config JSON values must be read before `json_free`, and vocab-file candidates must match V exactly.** Two bugs from the original-vocab (no `--prune`) mode: (a) `vocab_size` was read from the `text_config` subtree *after* `json_free(hf)` — the dangling pointer returned garbage, the `json_get_int` lookup missed, and the engine silently fell back to 86016 while the Python side tokenized with original ids → every prompt token indexed out-of-range embed rows → pure `?` output; (b) `findVocabFile` globbed `embed_tokens.*.safetensors`, so a 248320 run picked up the 86016-row pruned file as a candidate and `loadEmbedLike` fataled on the shape mismatch instead of falling through to the full-size shard tensor. Fix: copy `vocab_size` into a local before freeing the tree (the same use-after-free trap gotcha 35 documents for the EOS name), and match vocab files by exact `<V>` in the filename (`embed_tokens.<V>.safetensors`) so wrong-size files are never candidates. Also note the original `vocab.json` contains no special tokens at all — `<|im_end|>` lives only in `tokenizer.json`'s `added_tokens` (id 248046), which is why `parseEos` has the `added_tokens` fallback for non-pruned mode.
 41. **A completeness probe must check the filenames the writer actually produces.** `cacheComplete` probed `embed_FP16.bin` — but `loadEmbedLike` has written the V-suffixed `embed_<V>_FP16.bin` since the dual-vocab change. The probe never found the embed cache, so `cacheComplete` was always false, and moving the safetensors away (a deliberate cache-only test) fataled with "no safetensors found and weight cache is incomplete" despite a perfect 255-file cache. Fix: probe the V-suffixed names (`embed_<V>_FP16.bin`, `lmHead_<V>_FP16.bin` when untied) with header validation — which also makes the probe vocab-mode-aware for free. The same session reworked the shard open to be genuinely lazy (`shardSource()` opens the shards only on the first cache miss; a fully-cached run never opens the model dir and reports `weights: resolved fully from cache`), and fixed `loadConv`, which checked shards *before* its own cache and rewrote `conv_<L>.bin` on every run.
 
+42. **Shard globs and file caps must match real HF names.** The old glob
+    `model.safetensors*.safetensors` matched nothing for Qwen3.6-35B-A3B, whose shards are
+    `model-00001-of-00026.safetensors` (and 26 > the 16-file caps in `safetensors.files[]`,
+    `findShards`, and prune's `findShardPaths`). Fix: glob `model*.safetensors` and raise the caps
+    to 32 (`SA_MAX_FILES`).
+43. **HF 3-D expert tensors are `[out][in]` per expert — transpose before quantizing.** The first
+    pool build quantized the raw `[cols][rows]` rows as if they were engine `[rows][cols]`
+    (the per-expert `fseek` read is fine; the orientation wasn't). Symptom: engine output was
+    fluent-looking garbage. The shared expert's gate/up are separate HF tensors and must be fused
+    gate-then-up to match the routed `gate_up_proj` chunk order.
+44. **`float*` pointer arithmetic with a byte stride.** `expertPoolSplit` computed
+    `vramScale + scaleStride*n` — the float pointer multiplied the byte stride by 4 and ran off the
+    allocation (0xC0000005). All byte-offset arithmetic on `float*` must cast through
+    `uint8_t*` first.
+45. **Never let a refactored loader drop its metadata writes.** The `createTensor` ->
+    `loadTensorInto` refactor (return-by-value -> out-parameter, needed so the weight-flush can
+    hold stable pointers) silently lost the `t->q/rows/cols` assignments; `wt->rows` then read 0
+    into push constants. Regression appeared on **all** models (the 2B answered whitespace) even
+    though the values "should have been identical" — found by dumping `wt->rows` at op-compile
+    time. Corollary: `addGemvSplit`/`addGemmAdd` must take the reduction dim from `wt->rows`, not
+    `d->K` — the 35B's delta `out_proj` reduces over `nV*dim = 4096 != K = 2048`, and the
+    hardcode produced a correct first (prefill) token followed by instant decode collapse
+    ("2!!!" repetition).
+46. **Vulkan host-visible memory is a hard ~16 GB heap and staging counts against it.** 40 layers
+    of RAM expert pools (~13.5 GB at experts_vram=32) plus every weight buffer's *retained*
+    staging allocation (~4 GB) exceeded `heap[1]` (16091 MB per `meminfo`). Fix: batch the weight
+    upload (12 buffers) and `releaseStaging` after each batch. Also note the host heap backs RAM
+    pools AND system commit charge — at experts_vram=32 the run needs ~16 GB free system RAM.
+47. **State buffers created with `createBufferNamed(VRAM)` are not uploaded until a
+    `createTransferAndCopy`.** The MoE state buffers (`moeIds`...) were created but never included
+    in the state transfer list, so the GPU-side `moeIds` stayed uninitialized — the shared-expert
+    slot ran expert 0 instead (ids 0 in slot 8). Symptom: first token correct ("2"), then instant
+    drift. Fix: transfer all state buffers once and release their staging. Related trap: writing
+    the init through `buffer.mappedMemory` crashes — VRAM buffers are not mapped; pass the init
+    array at creation.
+48. **A struct-returning loader must fill every metadata field, and header edits require a clean
+    rebuild.** Two distinct silent-corruption traps from this integration: (a) the dropped
+    `t->rows` writes (gotcha 45); (b) `model_weights` gained fields (`guPool`, `router`, ...) but
+    `weights.o` was compiled against the old header — the struct-copy into `generator.w` then read
+    garbage `vocab` (a 16-exabyte `maxValue` allocation). The Makefile has no header dependency
+    tracking, so **any** header change needs `make clean` (gotcha 12, now enforced by habit).
+
+
 ---
 
 ## 10. Verification Results (M=64, max absolute error vs CPU reference)
@@ -1364,16 +1473,17 @@ Real weights are loaded by the **server** (`main.exe`, default). It reads a leng
 uv venv .venv                                  # once
 uv pip install --python .venv/Scripts/python.exe tokenizers   # once
 
-.venv/Scripts/python.exe vk_llm.py <model_dir> <max_ctx> "prompt text" [--think] [--prune]
+.venv/Scripts/python.exe vk_llm.py <model_dir> <max_ctx> "prompt text" [--think] [--prune] [--experts-vram N]
 # e.g.
 .venv/Scripts/python.exe vk_llm.py model/Qwen3.5-2B 8192 "why the sky is blue?" --think
+.venv/Scripts/python.exe vk_llm.py model/Qwen3.6-35B-A3B 8192 "why the sky is blue?" --think --prune --experts-vram 32
 ```
 
 No `--think` means non-thinking mode. `--prune` selects the **pruned 86,016-token vocab** and bootstraps a fresh model dir: the engine's `pruneVocab` resolves the vocab weights cache-first (weight cache → `<model>/vocab/` → auto-gather from the shards via `pruned-vocab/mapping.npy`, §4.7) and always ensures the tokenizer files in `<model>/vocab/` (the Python frontend copies them from the root `pruned-vocab/` before spawning the engine, since it needs the tokenizer first). Once the weight cache or `vocab/` exists, `--prune` is a no-op and can be dropped.
 
 **Without `--prune` the engine runs the original 248,320-token vocab** straight from the shards: `vocab` comes from `config.json`'s `vocab_size`, the tokenizer is the model-root `tokenizer.json` (original ids), and EOS resolves via the `added_tokens` fallback (§4.7). The two modes keep separate cache files (`embed_86016_FP16.bin` vs `embed_248320_FP16.bin`) and can be interleaved freely. **VRAM caveat**: the full vocab fits the 8 GB heap only on the 2B (~1 GB tied embed); the 9B's two untied FP16 heads (~4 GB) OOM — run the 9B with `--prune`.
 
-`vk_llm.py` exposes `start_llm(weight_dir, max_ctx, max_new_tokens, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False)`, `apply_chat_template(messages, enable_thinking=True)`, `tokenize`, `generate`, `generate_stream`, `detokenize`, `close`. `tokenize(text)` wraps the text in the **Qwen3.5 chat template** with the `<think>` control token (gotcha 32); the tokenizer comes from `<weight_dir>/vocab/tokenizer.json` (pruned ids, 85992 EOS) with `prune_vocab=True`, else the model-root `tokenizer.json` (original ids, 248046 EOS) — the choice must match the engine's `--prune` flag or ids desynchronize.
+`vk_llm.py` exposes `start_llm(weight_dir, max_ctx, max_new_tokens, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0)`, `apply_chat_template(messages, enable_thinking=True)`, `tokenize`, `generate`, `generate_stream`, `detokenize`, `close`. `tokenize(text)` wraps the text in the **Qwen3.5 chat template** with the `<think>` control token (gotcha 32); the tokenizer comes from `<weight_dir>/vocab/tokenizer.json` (pruned ids, 85992 EOS) with `prune_vocab=True`, else the model-root `tokenizer.json` (original ids, 248046 EOS) — the choice must match the engine's `--prune` flag or ids desynchronize.
 
 **Sampling** is opt-in and configured by module-level constants near the top of `vk_llm.py` — `is_sampling`, `temperature`, `rep_penalty`, `penalty_len`, `top_k`, `top_p`, `min_p`, `seed`. With `is_sampling = False` (default/greedy) the request sends `temperature = 0.0`; with `is_sampling = True` it sends the constants and the backend runs the sampler (§7.7). These are consumed by `_stream_ids`, so `generate`/`generate_stream` take only `(llm, token_ids)`. Defaults follow Qwen3's thinking-mode recommendation: temperature 0.6 / top_k 20 / top_p 0.95 / rep_penalty 1.05 / penalty_len 64 (`min_p = 0.0` optional tail filter).
 
@@ -1399,6 +1509,17 @@ This fits arithmetically but overflows at runtime — fragmentation from ~450 di
 
 The 2B (all-FP16, 86016 vocab, tied embeddings) totals ~3.1 GB of weights + ~0.4 GB state — comfortable at `max_ctx = 32768` (~46 tok/s decode). In original-vocab mode (no `--prune`) the 2B's tied embed grows to ~1.0 GB (~3.6 GB total, still comfortable); the 9B's two untied heads would need ~4 GB and does not fit the heap — run the 9B pruned. Note the 9B's measured budget can also be squeezed by *other applications* holding VRAM (browser/OBS reserve ~1.3 GB some sessions) — an OOM at `max_ctx 8192` that previously worked is usually external pressure, not a regression; retry after freeing VRAM or run at a lower `--max-ctx`.
 
+**Qwen3.6-35B-A3B (MoE, experts_vram=32)**: device-local ~3.6 GB weights (embed+lmHead 704 MB
+pruned, INT8-edge/INT4-mid attention ~1.0 GB, 33-expert VRAM pools ~2.0 GB, routers 40 MB) +
+~0.5 GB state — comfortable. The **host-visible** side is the constraint: 224 RAM experts/layer
+across 40 layers ~= 13.5 GB of host-visible pool + transient staging (batched to ~12 buffers).
+The heap is 16091 MB; with ~16 GB free system RAM the 32/224 split just fits. Raising
+`--experts-vram` trades host for device memory (each extra VRAM expert costs ~1.55 MB device,
+saves ~1.55 MB host per layer): the device ceiling (~7.2 GB usable) caps experts_vram around ~95
+on this GPU. Decode runs at ~10.7 tok/s with 224 RAM experts streaming over PCIe (~1.5 MB read
+per RAM expert hit) — the planned LFRU expert swap (keep hot experts in VRAM, prefetch on routing
+probability) is the path to the all-VRAM ~25 tok/s.
+
 ## 13. Known issues / not yet implemented
 
 1. **(Resolved)** Gated-deltaNet `A_log`/`dt_bias` exponential decay, the q/k L2-norm (eps 1e-6, q Ã— 1/š128), the decayed-`vhat` delta rule, and the `in_proj_z` output gate (`rmsnorm(y)Â·norm.weightÂ·silu(z)`) are all implemented (Â§7.3). Linear-attention layers are **HF-identical** to the Qwen3.5 9B block.
@@ -1418,4 +1539,17 @@ The 2B (all-FP16, 86016 vocab, tied embeddings) totals ~3.1 GB of weights + ~0.4
 14. **(Resolved) Subgroup portability (wave32 GPUs).** Cross-subgroup scratch arrays were sized TS/64 (wave64) with hardcoded 4-slot combines — out-of-bounds on wave32 devices (RTX 4060: 8 subgroups per 256 threads). All such arrays are now sized (TS+31)/32 with gl_NumSubgroups-bounded combines; RmsNorm-Prologue (whose whole-workgroup-one-subgroup assumption raced on wave32) uses a shared-memory tree reduction; bare subgroupMax/subgroupAdd calls on 64-thread workgroups (Att-SplitK*) were replaced with workgroup-wide shared reductions (gotcha 39). Untested on the actual wave32 hardware end-to-end, but structurally correct.
 15. **(Resolved) Cache-first weight loading.** Every load path checks the on-disk cache (in/weights/<model>/) before opening safetensors: shards are optional (a copied cache runs standalone), vocab weights resolve cache → ocab/ folder → shard, and small vectors (norms / A_log / dt_bias / conv1d) have their own ec_*/conv_* cache entries. One model per process keeps the specialization constant (d_model) consistent with the cached pipelines.
 16. **Vocab re-prune cache invalidation is manual** (gotcha 37). The weight cache keys on (tensor name, dims, quant) — after re-gathering a vocab or editing quant_config.json, delete in/weights/<model>/ or generation silently runs on stale tensors.
-17. **MTP and vision tensors are ignored** (text-only baseline). Heads-up: layer 0 must be linear_attention is validated at config load — an architecture whose first layer is full-attention would need the decode embed-fusion (Embed-RmsNorm-LinearProj) reworked.
+
+18. **(Resolved) Qwen3.6-35B-A3B MoE support.** `num_experts > 0` in config.json switches every FFN
+    to `FFN_MOE`: per-layer 257-expert INT4 pools (cache-complete + cold-build from the 26 shards,
+    ~30-60 min one-time), FP16 router + shared-expert gate, four-op MoE chain (§7.8), expert
+    pools split VRAM/RAM by `--experts-vram` (default from quant_config, 32), and the
+    `nV*dim != K` out-projection generalization (gotchas 42-48). Verified layer-by-layer against a
+    CPU safetensors reference (delta L0 corr 0.9999 including the stateful recurrence, full-attn L3
+    corr 0.998 with gqa 8, all 9 MoE slots >= 0.986) and end-to-end ("2+2" -> "4", a correct
+    Rayleigh-scattering paragraph, ~10.7 tok/s decode, EOS-terminated). The 2B and 9B remain green.
+    MoE model constraint: layer 0 attention must be `fp16` (the fused decode
+    Embed-RmsNorm-LinearProj op is FP16-only and reads the L0 proj weights as FP16 — an INT8/INT4
+    L0 emits NaNs from the first decode step; the 35B quant_config sets layer 0 attn fp16).
+
+.

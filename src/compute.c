@@ -60,6 +60,8 @@ void serverMain(int argc, char** argv) {
     loadModelConfig(&spec, weightDir, maxCtxOverride, doPrune);
     if (doPrune) pruneVocab(weightDir, &spec);
     parseEos(&spec.dims, weightDir, doPrune);
+    int expertsVram = atoi(argval(argc, argv, "--experts-vram", "0"));
+    if (expertsVram > 0) spec.expertsVram = expertsVram;
 
     if (timing) setTimingEnabled(1);
     session s = createSession();

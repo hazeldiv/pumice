@@ -32,8 +32,8 @@ model_state createState(session s, const model_config* spec, int maxM, int vocab
     st.act = createZeroed(s, (int64_t)sizeof(float) * maxM * d->ffnN, "act");
     st.embOut = createZeroed(s, (int64_t)sizeof(float) * mn, "embOut");
     st.embStaged = createZeroed(s, (int64_t)sizeof(float) * mn, "embStaged");
-    st.yGated = createZeroed(s, (int64_t)sizeof(float) * mn, "yGated");
-    st.attnOut = createZeroed(s, (int64_t)sizeof(float) * mn, "attnOut");
+    st.yGated = createZeroed(s, (int64_t)sizeof(float) * maxM * (d->nV * d->dim), "yGated");
+    st.attnOut = createZeroed(s, (int64_t)sizeof(float) * maxM * d->qOff, "attnOut");
     st.gAttn = createZeroed(s, (int64_t)sizeof(float) * maxM * d->qOff, "gAttn");
     st.qOut = createZeroed(s, (int64_t)sizeof(float) * mn, "qOut");
     st.qProj = createZeroed(s, (int64_t)sizeof(float) * maxM * (d->nQk * d->dim), "qProj");
@@ -110,12 +110,31 @@ model_state createState(session s, const model_config* spec, int maxM, int vocab
     st.gAct = createZeroed(s, (int64_t)sizeof(float) * maxM * d->ffnN, "gAct");
     st.uAct = createZeroed(s, (int64_t)sizeof(float) * maxM * d->ffnN, "uAct");
 
+    if (d->experts > 0) {
+        int slots = d->expertsPerTok + 1;
+        uint32_t* idsInit = (uint32_t*)calloc((size_t)maxM * slots, sizeof(uint32_t));
+        for (int m = 0; m < maxM; m++) {
+            idsInit[m * slots + slots - 1] = (uint32_t)d->experts;
+        }
+        st.moeIds = createBufferNamed(s.dev.device, s.dev.physicalDevice, idsInit, (int64_t)sizeof(uint32_t) * maxM * slots, MEMORY_VRAM, "moeIds");
+        free(idsInit);
+        st.moeWeights = createZeroed(s, (int64_t)sizeof(float) * maxM * slots, "moeWeights");
+        st.moeSharedW = createZeroed(s, (int64_t)sizeof(float) * maxM, "moeSharedW");
+        st.moeXn = createZeroed(s, (int64_t)sizeof(float) * maxM * d->K, "moeXn");
+        st.moeH = createZeroed(s, (int64_t)sizeof(float) * maxM * slots * d->moeI, "moeH");
+        st.moeP = createZeroed(s, (int64_t)sizeof(float) * maxM * slots * d->K, "moeP");
+    }
+
     buffer bufs[] = {
         st.h, st.act, st.embOut, st.yGated, st.attnOut, st.gAttn, st.qOut,
         st.qProj, st.kProj, st.vProj, st.zProj, st.aProj, st.bProj,
-        st.maxValue, st.maxIndex, st.result
+        st.maxValue, st.maxIndex, st.result,
+        st.gAct, st.uAct, st.invRms, st.qkvRaw, st.gemvPartial, st.qkvPartial,
+        st.ffnPartial, st.linprojPartial, st.attPartial, st.smSum, st.logits,
+        st.moeIds, st.moeWeights, st.moeSharedW, st.moeXn, st.moeH, st.moeP
     };
-    createTransferAndCopy(s.dev.device, s.dev.queue, bufs, 16);
+    createTransferAndCopy(s.dev.device, s.dev.queue, bufs, 32);
+    for (int i = 0; i < 32; i++) releaseStaging(s.dev.device, &bufs[i]);
     for (int L = 0; L < d->layerCount; L++) {
         if (st.kCache[L].buffer != VK_NULL_HANDLE) {
             buffer ks[] = {st.kCache[L], st.vCache[L], st.kScale[L], st.kZero[L], st.vScale[L], st.vZero[L]};
@@ -177,6 +196,14 @@ void destroyState(session s, model_state* st) {
     destroyBuffer(s.dev.device, st->qkvRaw);
     destroyBuffer(s.dev.device, st->gAct);
     destroyBuffer(s.dev.device, st->uAct);
+    if (st->moeIds.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(s.dev.device, st->moeIds);
+        destroyBuffer(s.dev.device, st->moeWeights);
+        destroyBuffer(s.dev.device, st->moeSharedW);
+        destroyBuffer(s.dev.device, st->moeXn);
+        destroyBuffer(s.dev.device, st->moeH);
+        destroyBuffer(s.dev.device, st->moeP);
+    }
     destroyBuffer(s.dev.device, st->logits);
     destroyBuffer(s.dev.device, st->sampleParams);
     destroyBuffer(s.dev.device, st->sampleHistory);

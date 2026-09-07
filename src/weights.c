@@ -20,7 +20,7 @@ static void printProgress(void) {
             (double)weightBytes / (1024.0 * 1024.0));
 }
 
-#define TENSOR_CACHE_MAX 256
+#define TENSOR_CACHE_MAX 512
 #define TENSOR_FILE_MAGIC 0x54454E53
 
 typedef struct {
@@ -51,14 +51,38 @@ static void fatal(const char* msg) {
 }
 
 #define MAX_WEIGHT_BUFS 2560
+#define WEIGHT_FLUSH_BATCH 12
 
-static buffer g_wbufs[MAX_WEIGHT_BUFS];
+static session g_wbufSession;
+static buffer* g_wbufs[MAX_WEIGHT_BUFS];
 static int g_wbufsCount = 0;
+static buffer g_wbufSmall[MAX_WEIGHT_BUFS];
+static int g_wbufSmallCount = 0;
 
-static void registerWeightBuffer(buffer b) {
+static void weightFlush(void) {
+    if (g_wbufsCount + g_wbufSmallCount == 0) return;
+    buffer tmp[WEIGHT_FLUSH_BATCH * 2];
+    int n = 0;
+    for (int i = 0; i < g_wbufsCount; i++) tmp[n++] = *g_wbufs[i];
+    for (int i = 0; i < g_wbufSmallCount; i++) tmp[n++] = g_wbufSmall[i];
+    createTransferAndCopy(g_wbufSession.dev.device, g_wbufSession.dev.queue, tmp, n);
+    for (int i = 0; i < g_wbufsCount; i++) releaseStaging(g_wbufSession.dev.device, g_wbufs[i]);
+    g_wbufsCount = 0;
+    g_wbufSmallCount = 0;
+}
+
+static void registerWeightBuffer(buffer* b) {
     if (g_wbufsCount < MAX_WEIGHT_BUFS) {
         g_wbufs[g_wbufsCount++] = b;
     }
+    if (g_wbufsCount + g_wbufSmallCount >= WEIGHT_FLUSH_BATCH) weightFlush();
+}
+
+static void registerWeightBufferSmall(buffer b) {
+    if (g_wbufSmallCount < MAX_WEIGHT_BUFS) {
+        g_wbufSmall[g_wbufSmallCount++] = b;
+    }
+    if (g_wbufsCount + g_wbufSmallCount >= WEIGHT_FLUSH_BATCH) weightFlush();
 }
 
 static cachedTensor* cacheFind(const char* name, QuantType q) {
@@ -211,11 +235,10 @@ static void countBuffer(const char* name, int layer, buffer b) {
     }
 }
 
-static tensor createTensor(session s, const char* name, int layer, int rows, int cols, QuantType q, float wscale, const float* mat) {
-    tensor t = {0};
-    t.q = q;
-    t.rows = rows;
-    t.cols = cols;
+static void loadTensorInto(session s, tensor* t, const char* name, int layer, int rows, int cols, QuantType q, float wscale, const float* mat) {
+    t->q = q;
+    t->rows = rows;
+    t->cols = cols;
 
     cachedTensor* ct = cacheGet(name, q, rows, cols);
     if (ct == NULL) {
@@ -224,23 +247,21 @@ static tensor createTensor(session s, const char* name, int layer, int rows, int
         ct = tensorBuild(path, name, q, rows, cols, wscale, mat);
     }
 
-    t.data = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->data, ct->dataBytes, MEMORY_VRAM, name);
-    countBuffer(name, layer, t.data);
-    registerWeightBuffer(t.data);
+    t->data = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->data, ct->dataBytes, MEMORY_VRAM, name);
+    countBuffer(name, layer, t->data);
+    registerWeightBuffer(&t->data);
     if (q != QUANT_FP16) {
         char label[80];
         snprintf(label, sizeof(label), "%s-scale", name);
-        t.scale = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->scale, sizeof(float) * ct->scaleCount, MEMORY_VRAM, label);
-        countBuffer(label, layer, t.scale);
-        registerWeightBuffer(t.scale);
+        t->scale = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->scale, sizeof(float) * ct->scaleCount, MEMORY_VRAM, label);
+        countBuffer(label, layer, t->scale);
+        registerWeightBuffer(&t->scale);
         snprintf(label, sizeof(label), "%s-zero", name);
-        t.zero = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->zero, sizeof(float) * ct->scaleCount, MEMORY_VRAM, label);
-        countBuffer(label, layer, t.zero);
-        registerWeightBuffer(t.zero);
+        t->zero = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->zero, sizeof(float) * ct->scaleCount, MEMORY_VRAM, label);
+        countBuffer(label, layer, t->zero);
+        registerWeightBuffer(&t->zero);
     }
     cacheRelease(ct);
-
-    return t;
 }
 
 static void destroyTensor(session s, tensor* t) {
@@ -277,9 +298,9 @@ static int g_shardState = 0;
 
 static const safetensors* shardSource(void) {
     if (g_shardState != 0) return g_shardState == 1 ? &g_shards : NULL;
-    char shardPaths[16][512];
-    const char* shardPtrs[16];
-    int shardCount = findShards(g_weightDir, shardPaths, 16);
+    char shardPaths[SA_MAX_FILES][512];
+    const char* shardPtrs[SA_MAX_FILES];
+    int shardCount = findShards(g_weightDir, shardPaths, SA_MAX_FILES);
     if (shardCount == 0) {
         g_shardState = -1;
         return NULL;
@@ -368,7 +389,7 @@ static buffer loadVecBuffer(session s, const char* hfName, int len, const char* 
     }
     buffer b = createBufferNamed(s.dev.device, s.dev.physicalDevice, v, sizeof(float) * len, MEMORY_VRAM, label);
     countBuffer(label, layer, b);
-    registerWeightBuffer(b);
+    registerWeightBufferSmall(b);
     free(v);
     return b;
 }
@@ -497,7 +518,7 @@ static void loadEmbedLike(session s, const char* const* candPaths, int candCount
     }
     *out = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->data, ct->dataBytes, MEMORY_VRAM, name);
     countBuffer(name, -1, *out);
-    registerWeightBuffer(*out);
+    registerWeightBuffer(out);
     cacheRelease(ct);
 }
 
@@ -516,14 +537,262 @@ static buffer loadConv(session s, const char* name, int layer) {
     }
     buffer b = createBufferNamed(s.dev.device, s.dev.physicalDevice, v, sizeof(float) * n, MEMORY_VRAM, cacheName);
     countBuffer("conv", layer, b);
-    registerWeightBuffer(b);
+    registerWeightBufferSmall(b);
     free(v);
     return b;
 }
 
+static buffer loadRouterFp16(session s, const char* hfName, int K, int N, const char* cacheName, int layer) {
+    char path[384];
+    snprintf(path, sizeof(path), "%s/%s.bin", cacheDir, cacheName);
+    int64_t bytes = (int64_t)K * N * 2;
+    uint16_t* tw = NULL;
+
+    FILE* f = fopen(path, "rb");
+    if (f != NULL) {
+        int header[4];
+        if (fread(header, sizeof(int), 4, f) == 4 &&
+            header[0] == TENSOR_FILE_MAGIC && header[1] == K && header[2] == N && header[3] == (int)QUANT_FP16) {
+            tw = (uint16_t*)malloc((size_t)bytes);
+            if (fread(tw, 1, (size_t)bytes, f) != (size_t)bytes) {
+                free(tw);
+                tw = NULL;
+            }
+        }
+        fclose(f);
+    }
+
+    if (tw == NULL) {
+        const safetensors* sf = shardSource();
+        const sa_tensor* t = require(sf, hfName);
+        if (t->ndim != 2 || t->shape[0] != N || t->shape[1] != K) fatal("router shape mismatch");
+        int64_t n = 0;
+        float* src = safetensors_load_f32(sf, t, &n);
+        if (!src || n != (int64_t)N * K) fatal("router length mismatch");
+        uint16_t* eng = (uint16_t*)malloc((size_t)bytes);
+        for (int e = 0; e < N; e++) {
+            for (int k = 0; k < K; k++) {
+                eng[(size_t)k * N + e] = float_to_fp16(src[(size_t)e * K + k]);
+            }
+        }
+        free(src);
+        tw = (uint16_t*)malloc((size_t)bytes);
+        transpose_block16((uint8_t*)eng, (uint8_t*)tw, K, N, QUANT_FP16);
+        free(eng);
+        tensorWriteFile(path, QUANT_FP16, K, N, (uint8_t*)tw, (int)bytes, NULL, NULL, 0);
+    }
+
+    buffer b = createBufferNamed(s.dev.device, s.dev.physicalDevice, tw, bytes, MEMORY_VRAM, cacheName);
+    countBuffer(cacheName, layer, b);
+    registerWeightBufferSmall(b);
+    free(tw);
+    return b;
+}
+
+typedef struct expert_pool_build {
+    cachedTensor* ct;
+    char name[64];
+    int rows;
+    int cols;
+    int experts;
+} expert_pool_build;
+
+static void expertPoolSplit(session s, expert_pool* p, const expert_pool_build* b, int vramExperts, int layer, const char* label) {
+    int rows = b->rows;
+    int cols = b->cols;
+    int experts = b->experts;
+    if (vramExperts > experts - 1) vramExperts = experts - 1;
+    if (vramExperts < 1) vramExperts = 1;
+    int vramCount = vramExperts + 1;
+    int ramCount = experts - 1 - vramExperts;
+    int64_t dataStride = (int64_t)rows * cols / 2;
+    int64_t scaleStride = (int64_t)sizeof(float) * rows * (cols / 256);
+
+    uint8_t* vramData;
+    float* vramScale;
+    float* vramZero;
+    if (ramCount == 0) {
+        vramData = b->ct->data;
+        vramScale = b->ct->scale;
+        vramZero = b->ct->zero;
+    } else {
+        vramData = (uint8_t*)malloc((size_t)(dataStride * vramCount));
+        vramScale = (float*)malloc((size_t)(scaleStride * vramCount));
+        vramZero = (float*)malloc((size_t)(scaleStride * vramCount));
+        memcpy(vramData, b->ct->data, (size_t)(dataStride * vramExperts));
+        memcpy(vramData + dataStride * vramExperts, (uint8_t*)b->ct->data + dataStride * (experts - 1), (size_t)dataStride);
+        memcpy(vramScale, b->ct->scale, (size_t)(scaleStride * vramExperts));
+        memcpy((uint8_t*)vramScale + scaleStride * vramExperts, (uint8_t*)b->ct->scale + scaleStride * (experts - 1), (size_t)scaleStride);
+        memcpy(vramZero, b->ct->zero, (size_t)(scaleStride * vramExperts));
+        memcpy((uint8_t*)vramZero + scaleStride * vramExperts, (uint8_t*)b->ct->zero + scaleStride * (experts - 1), (size_t)scaleStride);
+    }
+
+    char name[80];
+    snprintf(name, sizeof(name), "%s%d-vram", label, layer);
+    p->vramData = createBufferNamed(s.dev.device, s.dev.physicalDevice, vramData, dataStride * vramCount, MEMORY_VRAM, name);
+    snprintf(name, sizeof(name), "%s%d-vram-scale", label, layer);
+    p->vramScale = createBufferNamed(s.dev.device, s.dev.physicalDevice, vramScale, scaleStride * vramCount, MEMORY_VRAM, name);
+    snprintf(name, sizeof(name), "%s%d-vram-zero", label, layer);
+    p->vramZero = createBufferNamed(s.dev.device, s.dev.physicalDevice, vramZero, scaleStride * vramCount, MEMORY_VRAM, name);
+    registerWeightBuffer(&p->vramData);
+    registerWeightBuffer(&p->vramScale);
+    registerWeightBuffer(&p->vramZero);
+
+    if (ramCount > 0) {
+        snprintf(name, sizeof(name), "%s%d-ram", label, layer);
+        p->ramData = createBufferNamed(s.dev.device, s.dev.physicalDevice,
+                                       (uint8_t*)b->ct->data + dataStride * vramExperts,
+                                       dataStride * ramCount, MEMORY_RAM, name);
+        snprintf(name, sizeof(name), "%s%d-ram-scale", label, layer);
+        p->ramScale = createBufferNamed(s.dev.device, s.dev.physicalDevice,
+                                        (uint8_t*)b->ct->scale + scaleStride * vramExperts,
+                                        scaleStride * ramCount, MEMORY_RAM, name);
+        snprintf(name, sizeof(name), "%s%d-ram-zero", label, layer);
+        p->ramZero = createBufferNamed(s.dev.device, s.dev.physicalDevice,
+                                       (uint8_t*)b->ct->zero + scaleStride * vramExperts,
+                                       scaleStride * ramCount, MEMORY_RAM, name);
+    }
+
+    if (vramData != b->ct->data) {
+        free(vramData);
+        free(vramScale);
+        free(vramZero);
+    }
+
+    p->vramExperts = vramCount;
+    p->ramBase = vramCount;
+    p->expertCount = experts;
+    countBuffer(label, layer, p->vramData);
+}
+
+static void destroyExpertPool(session s, expert_pool* p) {
+    destroyBuffer(s.dev.device, p->vramData);
+    destroyBuffer(s.dev.device, p->vramScale);
+    destroyBuffer(s.dev.device, p->vramZero);
+    if (p->ramData.buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, p->ramData);
+    if (p->ramScale.buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, p->ramScale);
+    if (p->ramZero.buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, p->ramZero);
+}
+
+static cachedTensor* expertPoolLoadFile(const char* cacheName, QuantType q, int rows, int cols, int experts) {
+    char path[384];
+    snprintf(path, sizeof(path), "%s/%s_%s.bin", cacheDir, cacheName, quantSuffix(q));
+    int blocks = (cols + 255) / 256;
+    int scaleCount = rows * blocks;
+    int64_t dataBytes = (int64_t)rows * cols / 2;
+    int64_t scaleBytes = (int64_t)sizeof(float) * scaleCount * experts;
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    int header[5];
+    int ok = (fread(header, sizeof(int), 5, f) == 5 &&
+              header[0] == TENSOR_FILE_MAGIC && header[1] == rows && header[2] == cols &&
+              header[3] == (int)q && header[4] == experts);
+    if (!ok) {
+        fclose(f);
+        return NULL;
+    }
+    uint8_t* data = (uint8_t*)malloc((size_t)(dataBytes * experts));
+    float* scale = (float*)malloc((size_t)scaleBytes);
+    float* zero = (float*)malloc((size_t)scaleBytes);
+    if (fread(data, 1, (size_t)(dataBytes * experts), f) != (size_t)(dataBytes * experts) ||
+        fread(scale, 1, (size_t)scaleBytes, f) != (size_t)scaleBytes ||
+        fread(zero, 1, (size_t)scaleBytes, f) != (size_t)scaleBytes) {
+        free(data);
+        free(scale);
+        free(zero);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    return cacheStore(cacheName, q, rows, cols, data, (int)(dataBytes * experts), scale, zero, scaleCount * experts);
+}
+
+static void expertPoolWriteFile(const char* cacheName, QuantType q, int rows, int cols, int experts, const uint8_t* data, const float* scale, const float* zero, int scaleCount) {
+    char path[384];
+    snprintf(path, sizeof(path), "%s/%s_%s.bin", cacheDir, cacheName, quantSuffix(q));
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    int64_t dataBytes = (int64_t)rows * cols / 2 * experts;
+    int64_t scaleBytes = (int64_t)sizeof(float) * scaleCount;
+    int header[5] = {TENSOR_FILE_MAGIC, rows, cols, (int)q, experts};
+    fwrite(header, sizeof(int), 5, f);
+    fwrite(data, 1, (size_t)dataBytes, f);
+    fwrite(scale, 1, (size_t)scaleBytes, f);
+    fwrite(zero, 1, (size_t)scaleBytes, f);
+    fclose(f);
+}
+
+static void expertPoolBuildLayer(const safetensors* sf, const char* hfName, int rows, int cols, int experts,
+                                 const int* hfSrcRows, int hfSrcCount, const char* sharedName, const char* sharedUpName,
+                                 const char* cacheName, expert_pool_build* out) {
+    int blocks = (cols + 255) / 256;
+    int scaleCount = rows * blocks;
+    int64_t dataBytes = (int64_t)rows * cols / 2;
+    uint8_t* poolData = (uint8_t*)malloc((size_t)(dataBytes * experts));
+    float* poolScale = (float*)malloc(sizeof(float) * (size_t)scaleCount * experts);
+    float* poolZero = (float*)malloc(sizeof(float) * (size_t)scaleCount * experts);
+
+    for (int e = 0; e < experts; e++) {
+        float* eng = NULL;
+        if (e < hfSrcCount) {
+            const sa_tensor* t = require(sf, hfName);
+            if (t->ndim != 3 || t->shape[0] != hfSrcCount || t->shape[1] != cols || t->shape[2] != rows) fatal("expert tensor shape mismatch");
+            FILE* f = sf->files[t->fileIndex];
+            _fseeki64(f, t->offset + (int64_t)hfSrcRows[e] * cols * rows * 2, SEEK_SET);
+            int64_t n = (int64_t)cols * rows;
+            uint16_t* raw = (uint16_t*)malloc((size_t)n * 2);
+            if (fread(raw, 2, (size_t)n, f) != (size_t)n) fatal("expert read error");
+            eng = (float*)malloc(sizeof(float) * (size_t)n);
+            for (int64_t i = 0; i < n; i++) eng[i] = bf16_to_float(raw[i]);
+            free(raw);
+        } else if (sharedUpName != NULL) {
+            const sa_tensor* tg = require(sf, sharedName);
+            const sa_tensor* tu = require(sf, sharedUpName);
+            if (tg->ndim != 2 || tg->shape[0] != cols / 2 || tg->shape[1] != rows) fatal("shared expert gate shape mismatch");
+            if (tu->ndim != 2 || tu->shape[0] != cols / 2 || tu->shape[1] != rows) fatal("shared expert up shape mismatch");
+            int64_t half = (int64_t)(cols / 2) * rows;
+            int64_t got = 0;
+            float* gate = safetensors_load_f32(sf, tg, &got);
+            if (!gate || got != half) fatal("shared expert gate length mismatch");
+            float* up = safetensors_load_f32(sf, tu, &got);
+            if (!up || got != half) fatal("shared expert up length mismatch");
+            eng = (float*)malloc(sizeof(float) * (size_t)cols * rows);
+            memcpy(eng, gate, sizeof(float) * (size_t)half);
+            memcpy(eng + half, up, sizeof(float) * (size_t)half);
+            free(gate);
+            free(up);
+        } else {
+            const sa_tensor* t = require(sf, sharedName);
+            if (t->ndim != 2 || t->shape[0] != cols || t->shape[1] != rows) fatal("shared expert shape mismatch");
+            int64_t got = 0;
+            eng = safetensors_load_f32(sf, t, &got);
+            if (!eng || got != (int64_t)cols * rows) fatal("shared expert length mismatch");
+        }
+        float* hf = eng;
+        eng = (float*)malloc(sizeof(float) * (size_t)rows * cols);
+        transpose(hf, eng, cols, rows);
+        free(hf);
+        QuantizedData qd = quantizeDataINT4(eng, rows, cols);
+        free(eng);
+        transpose_block16(qd.data, poolData + (size_t)e * dataBytes, rows, cols, QUANT_INT4);
+        free(qd.data);
+        memcpy(poolScale + (size_t)e * scaleCount, qd.scale, sizeof(float) * scaleCount);
+        memcpy(poolZero + (size_t)e * scaleCount, qd.z, sizeof(float) * scaleCount);
+        free(qd.scale);
+        free(qd.z);
+    }
+
+    expertPoolWriteFile(cacheName, QUANT_INT4, rows, cols, experts, poolData, poolScale, poolZero, scaleCount * experts);
+    out->ct = cacheStore(cacheName, QUANT_INT4, rows, cols, poolData, (int)(dataBytes * experts), poolScale, poolZero, scaleCount * experts);
+    snprintf(out->name, sizeof(out->name), "%s", cacheName);
+    out->rows = rows;
+    out->cols = cols;
+    out->experts = experts;
+}
+
 static int findShards(const char* dir, char out[][512], int max) {
     char pattern[512];
-    snprintf(pattern, sizeof(pattern), "%s/model.safetensors*.safetensors", dir);
+    snprintf(pattern, sizeof(pattern), "%s/model*.safetensors", dir);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
@@ -583,6 +852,19 @@ static int vecCacheExists(const char* cacheName, int len) {
     return ok;
 }
 
+static int expertPoolCacheExists(const char* cacheName, int rows, int cols, int experts) {
+    char path[384];
+    snprintf(path, sizeof(path), "%s/%s_INT4.bin", cacheDir, cacheName);
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    int header[5];
+    int ok = (fread(header, sizeof(int), 5, f) == 5 &&
+              header[0] == TENSOR_FILE_MAGIC && header[1] == rows && header[2] == cols &&
+              header[3] == (int)QUANT_INT4 && header[4] == experts);
+    fclose(f);
+    return ok;
+}
+
 static int cacheComplete(const model_config* spec) {
     const model_dims* d = &spec->dims;
     char name[80];
@@ -622,7 +904,11 @@ static int cacheComplete(const model_config* spec) {
             if (!vecCacheExists(vecName, d->dim)) return 0;
         }
         snprintf(name, sizeof(name), "out_%d", L);
-        if (!cacheFileExists(name, q, d->K, d->K)) return 0;
+        if (ly->attn.type == ATTENTION_FULL) {
+            if (!cacheFileExists(name, q, d->qOff, d->K)) return 0;
+        } else {
+            if (!cacheFileExists(name, q, d->nV * d->dim, d->K)) return 0;
+        }
         if (ly->ffn.type == FFN_SWIGLU) {
             snprintf(name, sizeof(name), "gate_%d", L);
             if (!cacheFileExists(name, f, d->K, d->ffnN)) return 0;
@@ -630,6 +916,15 @@ static int cacheComplete(const model_config* spec) {
             if (!cacheFileExists(name, f, d->K, d->ffnN)) return 0;
             snprintf(name, sizeof(name), "down_%d", L);
             if (!cacheFileExists(name, f, d->ffnN, d->K)) return 0;
+        } else if (ly->ffn.type == FFN_MOE) {
+            snprintf(name, sizeof(name), "guPool_%d", L);
+            if (!expertPoolCacheExists(name, d->K, 2 * d->moeI, d->experts + 1)) return 0;
+            snprintf(name, sizeof(name), "dnPool_%d", L);
+            if (!expertPoolCacheExists(name, d->moeI, d->K, d->experts + 1)) return 0;
+            snprintf(name, sizeof(name), "router_%d", L);
+            if (!cacheFileExists(name, QUANT_FP16, d->K, d->experts)) return 0;
+            snprintf(name, sizeof(name), "sgGate_%d", L);
+            if (!cacheFileExists(name, QUANT_FP16, d->K, 1)) return 0;
         }
     }
     return 1;
@@ -641,14 +936,15 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     weightBytes = 0;
     verboseWeights = verbose;
     g_wbufsCount = 0;
+    g_wbufSession = s;
     cacheClear();
     snprintf(cacheDir, sizeof(cacheDir), "weights/%s", spec->name);
     snprintf(g_weightDir, sizeof(g_weightDir), "%s", weightDir);
     _mkdir("weights");
     _mkdir(cacheDir);
 
-    char shardProbe[16][512];
-    int shardCount = findShards(weightDir, shardProbe, 16);
+    char shardProbe[SA_MAX_FILES][512];
+    int shardCount = findShards(weightDir, shardProbe, SA_MAX_FILES);
     if (shardCount == 0 && !cacheComplete(spec)) {
         fatal("no safetensors found and weight cache is incomplete");
     }
@@ -667,7 +963,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     }
     w.theta = createBufferNamed(s.dev.device, s.dev.physicalDevice, theta, sizeof(float) * rotaryHalf, MEMORY_VRAM, "theta");
     countBuffer("theta", -1, w.theta);
-    registerWeightBuffer(w.theta);
+    registerWeightBuffer(&w.theta);
     free(theta);
 
     w.gammaFinal = loadVecBuffer(s, "model.language_model.norm.weight", d->K, "gammaFinal", -1, 1);
@@ -698,6 +994,21 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     w.gate = w.tensorBufs + 2 * d->layerCount;
     w.up = w.tensorBufs + 3 * d->layerCount;
     w.down = w.tensorBufs + 4 * d->layerCount;
+
+    int isMoe = 0;
+    for (int L = 0; L < d->layerCount; L++) {
+        if (spec->layers[L].ffn.type == FFN_MOE) {
+            isMoe = 1;
+            break;
+        }
+    }
+    if (isMoe) {
+        w.poolBufs = (expert_pool*)calloc((size_t)d->layerCount * 2, sizeof(expert_pool));
+        w.guPool = w.poolBufs + 0 * d->layerCount;
+        w.dnPool = w.poolBufs + 1 * d->layerCount;
+        w.router = (buffer*)calloc((size_t)d->layerCount, sizeof(buffer));
+        w.sharedGate = (buffer*)calloc((size_t)d->layerCount, sizeof(buffer));
+    }
 
     const char* embedCands[2];
     int embedCandCount = 0;
@@ -746,16 +1057,17 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
                 mat = buildQkvMatrix(shardSource(), n1, n2, n3, d->K, d->headDim, d->heads, &cols);
                 if (cols != d->qkvN) fatal("qkv projection width mismatch");
             }
-            w.proj[L] = createTensor(s, projName, L, d->K, d->qkvN, q, 1.0f, mat);
+            loadTensorInto(s, &w.proj[L], projName, L, d->K, d->qkvN, q, 1.0f, mat);
             free(mat);
 
             lname(n1, sizeof(n1), L, "self_attn.o_proj.weight");
             const char* on[1] = {n1};
             mat = NULL;
-            if (cacheGet(outName, q, d->K, d->K) == NULL) {
-                mat = buildEngineMatrix(shardSource(), on, 1, d->K, &cols);
+            if (cacheGet(outName, q, d->qOff, d->K) == NULL) {
+                mat = buildEngineMatrix(shardSource(), on, 1, d->qOff, &cols);
+                if (cols != d->K) fatal("o_proj width mismatch");
             }
-            w.out[L] = createTensor(s, outName, L, d->K, d->K, q, 1.0f, mat);
+            loadTensorInto(s, &w.out[L], outName, L, d->qOff, d->K, q, 1.0f, mat);
             free(mat);
         } else {
             lname(n1, sizeof(n1), L, "linear_attn.conv1d.weight");
@@ -778,16 +1090,18 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
                 mat = buildEngineMatrix(shardSource(), pn, 4, d->K, &cols);
                 if (cols != d->projN) fatal("delta projection width mismatch");
             }
-            w.proj[L] = createTensor(s, projName, L, d->K, d->projN, q, 1.0f, mat);
+            loadTensorInto(s, &w.proj[L], projName, L, d->K, d->projN, q, 1.0f, mat);
             free(mat);
 
             lname(n1, sizeof(n1), L, "linear_attn.out_proj.weight");
             const char* on[1] = {n1};
             mat = NULL;
-            if (cacheGet(outName, q, d->K, d->K) == NULL) {
-                mat = buildEngineMatrix(shardSource(), on, 1, d->K, &cols);
+            int deltaOutRows = d->nV * d->dim;
+            if (cacheGet(outName, q, deltaOutRows, d->K) == NULL) {
+                mat = buildEngineMatrix(shardSource(), on, 1, deltaOutRows, &cols);
+                if (cols != d->K) fatal("out_proj width mismatch");
             }
-            w.out[L] = createTensor(s, outName, L, d->K, d->K, q, 1.0f, mat);
+            loadTensorInto(s, &w.out[L], outName, L, deltaOutRows, d->K, q, 1.0f, mat);
             free(mat);
         }
 
@@ -805,7 +1119,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
                 mat = buildEngineMatrix(shardSource(), gn, 1, d->K, &cols);
                 if (cols != d->ffnN) fatal("gate width mismatch");
             }
-            w.gate[L] = createTensor(s, gateName, L, d->K, d->ffnN, f, 1.0f, mat);
+            loadTensorInto(s, &w.gate[L], gateName, L, d->K, d->ffnN, f, 1.0f, mat);
             free(mat);
 
             lname(n1, sizeof(n1), L, "mlp.up_proj.weight");
@@ -813,7 +1127,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             if (cacheGet(upName, f, d->K, d->ffnN) == NULL) {
                 mat = buildEngineMatrix(shardSource(), gn, 1, d->K, &cols);
             }
-            w.up[L] = createTensor(s, upName, L, d->K, d->ffnN, f, 1.0f, mat);
+            loadTensorInto(s, &w.up[L], upName, L, d->K, d->ffnN, f, 1.0f, mat);
             free(mat);
 
             lname(n1, sizeof(n1), L, "mlp.down_proj.weight");
@@ -822,8 +1136,53 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
                 mat = buildEngineMatrix(shardSource(), gn, 1, d->ffnN, &cols);
                 if (cols != d->K) fatal("down projection width mismatch");
             }
-            w.down[L] = createTensor(s, downName, L, d->ffnN, d->K, f, 1.0f, mat);
+            loadTensorInto(s, &w.down[L], downName, L, d->ffnN, d->K, f, 1.0f, mat);
             free(mat);
+        } else if (ly->ffn.type == FFN_MOE) {
+            char guName[64], dnName[64], rtName[64], sgName[64];
+            snprintf(guName, sizeof(guName), "guPool_%d", L);
+            snprintf(dnName, sizeof(dnName), "dnPool_%d", L);
+            snprintf(rtName, sizeof(rtName), "router_%d", L);
+            snprintf(sgName, sizeof(sgName), "sgGate_%d", L);
+
+            int poolExperts = d->experts + 1;
+            int* srcRows = (int*)malloc(sizeof(int) * d->experts);
+            for (int e = 0; e < d->experts; e++) srcRows[e] = e;
+
+            expert_pool_build gu, dn;
+            gu.ct = expertPoolLoadFile(guName, QUANT_INT4, d->K, 2 * d->moeI, poolExperts);
+            if (gu.ct == NULL) {
+                lname(n1, sizeof(n1), L, "mlp.experts.gate_up_proj");
+                lname(n2, sizeof(n2), L, "mlp.shared_expert.gate_proj.weight");
+                lname(n3, sizeof(n3), L, "mlp.shared_expert.up_proj.weight");
+                expertPoolBuildLayer(shardSource(), n1, d->K, 2 * d->moeI, poolExperts, srcRows, d->experts, n2, n3, guName, &gu);
+            } else {
+                gu.rows = d->K;
+                gu.cols = 2 * d->moeI;
+                gu.experts = poolExperts;
+            }
+
+            dn.ct = expertPoolLoadFile(dnName, QUANT_INT4, d->moeI, d->K, poolExperts);
+            if (dn.ct == NULL) {
+                lname(n1, sizeof(n1), L, "mlp.experts.down_proj");
+                lname(n2, sizeof(n2), L, "mlp.shared_expert.down_proj.weight");
+                expertPoolBuildLayer(shardSource(), n1, d->moeI, d->K, poolExperts, srcRows, d->experts, n2, NULL, dnName, &dn);
+            } else {
+                dn.rows = d->moeI;
+                dn.cols = d->K;
+                dn.experts = poolExperts;
+            }
+            free(srcRows);
+
+            expertPoolSplit(s, &w.guPool[L], &gu, spec->expertsVram, L, "guPool_");
+            expertPoolSplit(s, &w.dnPool[L], &dn, spec->expertsVram, L, "dnPool_");
+            cacheRelease(gu.ct);
+            cacheRelease(dn.ct);
+
+            lname(n1, sizeof(n1), L, "mlp.gate.weight");
+            w.router[L] = loadRouterFp16(s, n1, d->K, d->experts, rtName, L);
+            lname(n1, sizeof(n1), L, "mlp.shared_expert_gate.weight");
+            w.sharedGate[L] = loadRouterFp16(s, n1, d->K, 1, sgName, L);
         }
     }
 
@@ -831,7 +1190,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     shardSourceClose();
     cacheClear();
 
-    createTransferAndCopy(s.dev.device, s.dev.queue, g_wbufs, g_wbufsCount);
+    weightFlush();
 
     if (!verboseWeights) {
         fprintf(stderr, "\r[OK] loaded weights: %.2f MB             \n",
@@ -860,6 +1219,17 @@ void destroyWeights(session s, model_weights* w) {
         if (w->aLog[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->aLog[L]);
         if (w->dtBias[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->dtBias[L]);
         if (w->attnNorm[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->attnNorm[L]);
+    }
+    if (w->poolBufs != NULL) {
+        for (int L = 0; L < w->layerCount; L++) {
+            destroyExpertPool(s, &w->guPool[L]);
+            destroyExpertPool(s, &w->dnPool[L]);
+            destroyBuffer(s.dev.device, w->router[L]);
+            destroyBuffer(s.dev.device, w->sharedGate[L]);
+        }
+        free(w->poolBufs);
+        free(w->router);
+        free(w->sharedGate);
     }
     free(w->layerBufs);
     free(w->tensorBufs);

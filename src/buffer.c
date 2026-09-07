@@ -147,6 +147,15 @@ void destroyBuffer(VkDevice device, buffer buf) {
     vkFreeMemory(device, buf.memory, NULL);
 }
 
+void releaseStaging(VkDevice device, buffer* buf) {
+    if (buf->stagingBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device, buf->stagingBuffer, NULL);
+        vkFreeMemory(device, buf->stagingMemory, NULL);
+        buf->stagingBuffer = VK_NULL_HANDLE;
+        buf->stagingMemory = VK_NULL_HANDLE;
+    }
+}
+
 void readBuffer(VkDevice device, VkPhysicalDevice physicalDevice, VkQueue queue, buffer buf, void* output) {
     if (buf.mappedMemory != NULL) {
         memcpy(output, buf.mappedMemory, buf.size);

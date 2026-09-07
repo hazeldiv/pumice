@@ -21,6 +21,7 @@ buffer createBuffer(VkDevice device, VkPhysicalDevice physicalDevice, void* data
 buffer createBufferNamed(VkDevice device, VkPhysicalDevice physicalDevice, void* data, int64_t size, int memoryType, const char* name);
 void createTransferAndCopy(VkDevice device, VkQueue queue, buffer* buffers, int bufferCount);
 void readBuffer(VkDevice device, VkPhysicalDevice physicalDevice, VkQueue queue, buffer buf, void* output);
+void releaseStaging(VkDevice device, buffer* buf);
 void destroyBuffer(VkDevice device, buffer buf);
 
 #endif

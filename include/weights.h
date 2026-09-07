@@ -16,6 +16,18 @@ typedef struct tensor {
     int cols;
 } tensor;
 
+typedef struct expert_pool {
+    buffer vramData;
+    buffer vramScale;
+    buffer vramZero;
+    buffer ramData;
+    buffer ramScale;
+    buffer ramZero;
+    int vramExperts;
+    int ramBase;
+    int expertCount;
+} expert_pool;
+
 typedef struct model_weights {
     buffer theta;
     buffer embed;
@@ -30,12 +42,17 @@ typedef struct model_weights {
     tensor* gate;
     tensor* up;
     tensor* down;
+    expert_pool* guPool;
+    expert_pool* dnPool;
+    buffer* router;
+    buffer* sharedGate;
     buffer* conv;
     buffer* aLog;
     buffer* dtBias;
     buffer* attnNorm;
     buffer* layerBufs;
     tensor* tensorBufs;
+    expert_pool* poolBufs;
     int vocab;
     int layerCount;
 } model_weights;

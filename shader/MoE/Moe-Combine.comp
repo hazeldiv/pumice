@@ -12,7 +12,8 @@ layout(push_constant) uniform Params {
 layout(set = 0, binding = 0) readonly restrict buffer Partials { float p[]; };
 layout(set = 0, binding = 1) readonly restrict buffer Weights { float weights[]; };
 layout(set = 0, binding = 2) readonly restrict buffer SharedW { float sharedW[]; };
-layout(set = 0, binding = 3) writeonly restrict buffer Y { float y[]; };
+layout(set = 0, binding = 3) readonly restrict buffer Residual { float h[]; };
+layout(set = 0, binding = 4) writeonly restrict buffer Y { float y[]; };
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
@@ -23,5 +24,5 @@ void main() {
     for (uint s = 0; s < dims.slots - 1; s++) {
         acc += weights[m * dims.slots + s] * p[(m * dims.slots + s) * dims.N + c];
     }
-    y[i] = acc;
+    y[i] = acc + h[i];
 }

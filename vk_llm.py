@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent
 BACKEND = ROOT / "bin" / "main.exe"
 PRUNED_VOCAB = ROOT / "pruned-vocab"
 
-is_sampling = True
+is_sampling = False
 temperature = 0.6
 rep_penalty = 1.05
 penalty_len = 64
@@ -32,7 +32,7 @@ def _read_u32(proc):
     return struct.unpack("<I", raw)[0]
 
 
-def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False):
+def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0):
     import shutil
     weight_dir = Path(weight_dir).resolve()
     tokenizer_path = (weight_dir / "vocab" / "tokenizer.json") if prune_vocab else (weight_dir / "tokenizer.json")
@@ -63,6 +63,8 @@ def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump
         cmd += ["--debug-sampling"]
     if prune_vocab:
         cmd += ["--prune"]
+    if experts_vram > 0:
+        cmd += ["--experts-vram", str(experts_vram)]
 
     proc = subprocess.Popen(
         cmd,
@@ -156,16 +158,20 @@ def close(llm):
 
 
 def _main():
-    args = [a for a in sys.argv[1:] if a not in ("--think", "--prune")]
+    args = [a for a in sys.argv[1:] if a not in ("--think", "--prune") and not a.startswith("--experts-vram")]
     thinking = "--think" in sys.argv[1:]
     prune = "--prune" in sys.argv[1:]
+    evram = 0
+    for i, a in enumerate(sys.argv[1:]):
+        if a == "--experts-vram" and i + 2 < len(sys.argv):
+            evram = int(sys.argv[i + 2])
     weight_dir = args[0] if len(args) > 0 else "model/Qwen3.5-9B"
     max_ctx = int(args[1]) if len(args) > 1 else 16384
     text = args[2] if len(args) > 2 else None
     if text is None:
         return
 
-    llm = start_llm(weight_dir, max_ctx=max_ctx, max_new_tokens=16384, prune_vocab=prune)
+    llm = start_llm(weight_dir, max_ctx=max_ctx, max_new_tokens=16384, prune_vocab=prune, experts_vram=evram)
     ids = tokenize(llm, text, thinking)
     decoded_ids = []
     prev = ""

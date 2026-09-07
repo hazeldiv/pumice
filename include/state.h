@@ -58,6 +58,12 @@ typedef struct model_state {
     buffer gAct;
     buffer uAct;
     buffer logits;
+    buffer moeIds;
+    buffer moeWeights;
+    buffer moeSharedW;
+    buffer moeXn;
+    buffer moeH;
+    buffer moeP;
     buffer sampleParams;
     buffer sampleHistory;
     buffer sampleRng;

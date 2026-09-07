@@ -8,14 +8,19 @@ layout(push_constant) uniform Params {
     uint K;
     uint N;
     uint slots;
+    uint vramExperts;
+    uint experts;
 } dims;
 
 layout(set = 0, binding = 0) readonly restrict buffer Act { vec4 x[]; };
 layout(set = 0, binding = 1) readonly restrict buffer Ids { uint ids[]; };
-layout(set = 0, binding = 2) readonly restrict buffer GateUp { uvec4 w[]; };
-layout(set = 0, binding = 3) readonly restrict buffer Scales { vec4 scale[]; };
-layout(set = 0, binding = 4) readonly restrict buffer Zeros { vec4 zeroPoint[]; };
+layout(set = 0, binding = 2) readonly restrict buffer GateUpV { uvec4 w[]; };
+layout(set = 0, binding = 3) readonly restrict buffer ScaleV { vec4 scale[]; };
+layout(set = 0, binding = 4) readonly restrict buffer ZeroV { vec4 zeroPoint[]; };
 layout(set = 0, binding = 5) writeonly restrict buffer H { float h[]; };
+layout(set = 0, binding = 6) readonly restrict buffer GateUpR { uvec4 wr[]; };
+layout(set = 0, binding = 7) readonly restrict buffer ScaleR { vec4 scaleR[]; };
+layout(set = 0, binding = 8) readonly restrict buffer ZeroR { vec4 zeroPointR[]; };
 
 shared vec4 xCache[512];
 shared vec4 scaleSubG[2][TS];
@@ -34,10 +39,12 @@ void main() {
     uint col = gl_LocalInvocationID.x;
     uint globalSlot = gl_WorkGroupID.y;
     uint token = globalSlot / dims.slots;
-    uint slot = globalSlot % dims.slots;
     uint j = gl_WorkGroupID.x * TS + col;
     if (j >= dims.N) return;
-    uint e = ids[globalSlot];
+
+    uint src = ids[globalSlot];
+    bool useRam = (src != dims.experts - 1) && (src >= dims.vramExperts - 1);
+    uint e = useRam ? (src - (dims.vramExperts - 1)) : (src == dims.experts - 1 ? dims.vramExperts - 1 : src);
 
     uint nf = 2 * dims.N;
     uint expertW = e * (dims.K / 32) * nf;
@@ -49,10 +56,17 @@ void main() {
     for (uint i = col; i < dims.K / vec; i += TS) xCache[i] = x[token * (dims.K / vec) + i];
 
     if (col < dims.K / vec) {
-        scaleSubG[0][col] = scale[sBaseG + col];
-        zeroSubG[0][col] = zeroPoint[sBaseG + col];
-        scaleSubU[0][col] = scale[sBaseU + col];
-        zeroSubU[0][col] = zeroPoint[sBaseU + col];
+        if (useRam) {
+            scaleSubG[0][col] = scaleR[sBaseG + col];
+            zeroSubG[0][col] = zeroPointR[sBaseG + col];
+            scaleSubU[0][col] = scaleR[sBaseU + col];
+            zeroSubU[0][col] = zeroPointR[sBaseU + col];
+        } else {
+            scaleSubG[0][col] = scale[sBaseG + col];
+            zeroSubG[0][col] = zeroPoint[sBaseG + col];
+            scaleSubU[0][col] = scale[sBaseU + col];
+            zeroSubU[0][col] = zeroPoint[sBaseU + col];
+        }
     }
 
     float accGate = 0.0;
@@ -67,10 +81,17 @@ void main() {
             if (k + TS < dims.K / vec) {
                 uint nxt = (blockCount + 1) & 1;
                 if (k + TS + col < dims.K / vec) {
-                    scaleSubG[nxt][col] = scale[sBaseG + k + TS + col];
-                    zeroSubG[nxt][col] = zeroPoint[sBaseG + k + TS + col];
-                    scaleSubU[nxt][col] = scale[sBaseU + k + TS + col];
-                    zeroSubU[nxt][col] = zeroPoint[sBaseU + k + TS + col];
+                    if (useRam) {
+                        scaleSubG[nxt][col] = scaleR[sBaseG + k + TS + col];
+                        zeroSubG[nxt][col] = zeroPointR[sBaseG + k + TS + col];
+                        scaleSubU[nxt][col] = scaleR[sBaseU + k + TS + col];
+                        zeroSubU[nxt][col] = zeroPointR[sBaseU + k + TS + col];
+                    } else {
+                        scaleSubG[nxt][col] = scale[sBaseG + k + TS + col];
+                        zeroSubG[nxt][col] = zeroPoint[sBaseG + k + TS + col];
+                        scaleSubU[nxt][col] = scale[sBaseU + k + TS + col];
+                        zeroSubU[nxt][col] = zeroPoint[sBaseU + k + TS + col];
+                    }
                 }
                 blockCount++;
             }
@@ -86,7 +107,7 @@ void main() {
         vec4 xv6 = xCache[k + 6];
         vec4 xv7 = xCache[k + 7];
 
-        uvec4 rawG = w[baseRow];
+        uvec4 rawG = useRam ? wr[baseRow] : w[baseRow];
         accGate += dot(xv0, unpackInt4x4(rawG.x, lowShifts) * scaleSubG[cur][ki] - zeroSubG[cur][ki]);
         accGate += dot(xv1, unpackInt4x4(rawG.x, highShifts) * scaleSubG[cur][ki + 1] - zeroSubG[cur][ki + 1]);
         accGate += dot(xv2, unpackInt4x4(rawG.y, lowShifts) * scaleSubG[cur][ki + 2] - zeroSubG[cur][ki + 2]);
@@ -96,7 +117,8 @@ void main() {
         accGate += dot(xv6, unpackInt4x4(rawG.w, lowShifts) * scaleSubG[cur][ki + 6] - zeroSubG[cur][ki + 6]);
         accGate += dot(xv7, unpackInt4x4(rawG.w, highShifts) * scaleSubG[cur][ki + 7] - zeroSubG[cur][ki + 7]);
 
-        uvec4 rawU = w[baseRow + dims.N];
+        uint rowU = baseRow + dims.N;
+        uvec4 rawU = useRam ? wr[rowU] : w[rowU];
         accUp += dot(xv0, unpackInt4x4(rawU.x, lowShifts) * scaleSubU[cur][ki] - zeroSubU[cur][ki]);
         accUp += dot(xv1, unpackInt4x4(rawU.x, highShifts) * scaleSubU[cur][ki + 1] - zeroSubU[cur][ki + 1]);
         accUp += dot(xv2, unpackInt4x4(rawU.y, lowShifts) * scaleSubU[cur][ki + 2] - zeroSubU[cur][ki + 2]);

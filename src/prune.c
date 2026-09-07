@@ -105,7 +105,7 @@ static int vocabFileExists(const char* dir, const char* prefix) {
 
 static int findShardPaths(const char* modelDir, char out[][512], int max) {
     char pattern[512];
-    snprintf(pattern, sizeof(pattern), "%s/model.safetensors*.safetensors", modelDir);
+    snprintf(pattern, sizeof(pattern), "%s/model*.safetensors", modelDir);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
@@ -206,9 +206,9 @@ int pruneVocab(const char* modelDir, const model_config* spec) {
     snprintf(path, sizeof(path), "%s/mapping.npy", PRUNED_VOCAB_DIR);
     int32_t* mapping = loadMapping(path, d->vocab);
 
-    char shardPaths[16][512];
-    const char* shardPtrs[16];
-    int shardCount = findShardPaths(modelDir, shardPaths, 16);
+    char shardPaths[32][512];
+    const char* shardPtrs[32];
+    int shardCount = findShardPaths(modelDir, shardPaths, 32);
     if (shardCount == 0) pfatal("no model shards found");
     for (int i = 0; i < shardCount; i++) shardPtrs[i] = shardPaths[i];
 

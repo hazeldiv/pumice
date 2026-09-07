@@ -222,7 +222,7 @@ static int parse_header(safetensors* sf, const char* buf, size_t len, int fileIn
 
 int safetensors_open(safetensors* sf, const char** paths, int count) {
     memset(sf, 0, sizeof(*sf));
-    if (count > 16) return -1;
+    if (count > SA_MAX_FILES) return -1;
 
     for (int i = 0; i < count; i++) {
         sf->files[i] = fopen(paths[i], "rb");
