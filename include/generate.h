@@ -1,6 +1,7 @@
 #ifndef generate_h
 #define generate_h
 
+#include <stdio.h>
 #include "session.h"
 #include "model.h"
 #include "weights.h"
@@ -34,6 +35,9 @@ typedef struct generator {
     int sampling;
     char dumpHiddenDir[256];
     int dumpHiddenReq;
+    char dumpTopPPath[512];
+    FILE* dumpTopPFile;
+    uint32_t dumpTopPStep;
 } generator;
 
 generator* createGenerator(session s, const model_config* spec, const char* weightDir, int verboseWeights);
@@ -47,6 +51,8 @@ void generatorSetDumpLayers(generator* g, int layers);
 void generatorDumpDecodeStep(generator* g, int step);
 void generatorSetSampling(generator* g, const sample_params* p, uint32_t seed);
 void generatorSetDumpHidden(generator* g, const char* dir, int reqIdx);
+void generatorSetDumpTopP(generator* g, const char* path);
+void generatorCloseDumpTopP(generator* g);
 void generatorDumpSamplingDebug(generator* g, const uint32_t* generated, int nGen, int nPrompt);
 
 #endif

@@ -49,6 +49,7 @@ void serverMain(int argc, char** argv) {
     int verboseWeights = argflag(argc, argv, "--verbose-weights");
     int timing = argflag(argc, argv, "--timing");
     const char* dumpHiddenDir = argval(argc, argv, "--dump-hidden", NULL);
+    const char* dumpTopPPath = argval(argc, argv, "--dump-topp", NULL);
     int doPrune = argflag(argc, argv, "--prune");
     dbgSampling = argflag(argc, argv, "--debug-sampling");
     if (maxNew < 1) maxNew = 1;
@@ -66,6 +67,7 @@ void serverMain(int argc, char** argv) {
     if (timing) setTimingEnabled(1);
     session s = createSession();
     generator* g = createGenerator(s, &spec, weightDir, verboseWeights);
+    if (dumpTopPPath != NULL) generatorSetDumpTopP(g, dumpTopPPath);
     if (dumpDir != NULL) {
         generatorSetDumpDir(g, dumpDir);
         generatorSetDumpLayers(g, dumpLayers);
@@ -111,6 +113,7 @@ void serverMain(int argc, char** argv) {
     }
 
     free(prompt);
+    generatorCloseDumpTopP(g);
     destroyGenerator(g);
     destroySession(s);
     if (timing) closeTimingLog();

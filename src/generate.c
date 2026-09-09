@@ -1,11 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <windows.h>
 #include "generate.h"
 
 #define ATT_SPLIT_THRESHOLD 256
 #define FIRST_TOKEN_DELAY_MS 25.0
+#define TOPP_KEEP 512
 
 static double g_qpcFreqMs = 0.0;
 
@@ -669,6 +671,96 @@ static void dumpBufferU8(generator* g, buffer buf, const char* name, int64_t byt
     free(host);
 }
 
+typedef struct {
+    float logit;
+    uint32_t id;
+} topp_entry;
+
+static void heapPush(topp_entry* heap, int* n, float logit, uint32_t id) {
+    int i = (*n)++;
+    while (i > 0) {
+        int p = (i - 1) / 2;
+        if (heap[p].logit <= logit) break;
+        heap[i] = heap[p];
+        i = p;
+    }
+    heap[i].logit = logit;
+    heap[i].id = id;
+}
+
+static void heapReplaceRoot(topp_entry* heap, int n, float logit, uint32_t id) {
+    int i = 0;
+    for (;;) {
+        int l = 2 * i + 1;
+        int r = l + 1;
+        int m = i;
+        float mv = logit;
+        if (l < n && heap[l].logit < mv) { m = l; mv = heap[l].logit; }
+        if (r < n && heap[r].logit < mv) { m = r; mv = heap[r].logit; }
+        if (m == i) break;
+        heap[i] = heap[m];
+        i = m;
+    }
+    heap[i].logit = logit;
+    heap[i].id = id;
+}
+
+static int toppCmp(const void* a, const void* b) {
+    const topp_entry* x = (const topp_entry*)a;
+    const topp_entry* y = (const topp_entry*)b;
+    if (x->logit > y->logit) return -1;
+    if (x->logit < y->logit) return 1;
+    if (x->id < y->id) return -1;
+    if (x->id > y->id) return 1;
+    return 0;
+}
+
+static int toppFinite(float v) {
+    return v > -1e29f && v < 1e29f;
+}
+
+static void dumpTopPStep(generator* g) {
+    if (g->dumpTopPFile == NULL) return;
+    model_state* st = &g->st;
+    int vocab = g->vocab;
+    float* logits = (float*)malloc(sizeof(float) * (size_t)vocab);
+    if (logits == NULL) return;
+    readBuffer(g->s.dev.device, g->s.dev.physicalDevice, g->s.dev.queue, st->logits, logits);
+    double sum = 0.0;
+    for (int i = 0; i < vocab; i++) {
+        if (toppFinite(logits[i])) sum += (double)expf(logits[i]);
+    }
+    topp_entry* heap = (topp_entry*)malloc(sizeof(topp_entry) * TOPP_KEEP);
+    if (heap == NULL) {
+        free(logits);
+        return;
+    }
+    int n = 0;
+    for (uint32_t i = 0; i < (uint32_t)vocab; i++) {
+        float lg = logits[i];
+        if (!toppFinite(lg)) continue;
+        if (n < TOPP_KEEP) {
+            heapPush(heap, &n, lg, i);
+        } else if (lg > heap[0].logit) {
+            heapReplaceRoot(heap, TOPP_KEEP, lg, i);
+        }
+    }
+    qsort(heap, (size_t)n, sizeof(topp_entry), toppCmp);
+    uint32_t count = (uint32_t)n;
+    double s = sum;
+    fwrite(&g->dumpTopPStep, sizeof(uint32_t), 1, g->dumpTopPFile);
+    fwrite(&count, sizeof(uint32_t), 1, g->dumpTopPFile);
+    for (int i = 0; i < n; i++) {
+        fwrite(&heap[i].id, sizeof(uint32_t), 1, g->dumpTopPFile);
+        fwrite(&heap[i].logit, sizeof(float), 1, g->dumpTopPFile);
+    }
+    fwrite(&s, sizeof(double), 1, g->dumpTopPFile);
+    fflush(g->dumpTopPFile);
+    g->dumpTopPStep++;
+    free(heap);
+    free(logits);
+}
+
 static void executeChunked(session s, operation* ops, int opCount, const char* phase, int token) {
     int done = 0;
     while (done < opCount) {
@@ -822,7 +914,17 @@ uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens) {
 
     stateSetPosition(g->s, &g->st, g->nextPos + (uint32_t)nTokens);
 
-    executeLogged(g->s, g->finalOps, g->finalOpCount, "prefill", (int)g->nextPos);
+    if (g->dumpTopPFile != NULL && g->finalOpCount >= 2) {
+        executeRecord(&g->s, g->finalOps, g->finalOpCount - 1);
+        executeSubmitNow(&g->s);
+        executeWaitLast(&g->s);
+        dumpTopPStep(g);
+        executeRecord(&g->s, g->finalOps + g->finalOpCount - 1, 1);
+        executeSubmitNow(&g->s);
+        executeWaitLast(&g->s);
+    } else {
+        executeLogged(g->s, g->finalOps, g->finalOpCount, "prefill", (int)g->nextPos);
+    }
 
     g->nextPos += (uint32_t)nTokens;
 
@@ -840,6 +942,30 @@ void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNe
     int count = 1;
     emit(token, ctx);
     if (token == (uint32_t)g->eos || maxNewTokens <= 1) {
+        return;
+    }
+
+    if (g->dumpTopPFile != NULL) {
+        ((uint32_t*)g->st.tokenIds.mappedMemory)[0] = token;
+        for (int i = 1; i < maxNewTokens; i++) {
+            int split = (int)(g->nextPos >= ATT_SPLIT_THRESHOLD);
+            operation* ops = split ? g->groupOps : g->groupOpsShort;
+            int pt = (split ? g->groupOpCount : g->groupOpCountShort) / DECODE_GROUP;
+            executeRecord(&g->s, ops, pt - 1);
+            executeSubmitNow(&g->s);
+            executeWaitLast(&g->s);
+            dumpTopPStep(g);
+            executeRecord(&g->s, ops + pt - 1, 1);
+            executeSubmitNow(&g->s);
+            executeWaitLast(&g->s);
+            uint32_t picks[DECODE_GROUP];
+            readBuffer(g->s.dev.device, g->s.dev.physicalDevice, g->s.dev.queue, g->st.result, picks);
+            token = picks[0];
+            emit(token, ctx);
+            count++;
+            g->nextPos++;
+            if (token == (uint32_t)g->eos) break;
+        }
         return;
     }
 
@@ -947,6 +1073,12 @@ void generatorSetSampling(generator* g, const sample_params* p, uint32_t seed) {
         *(uint32_t*)g->st.sampleRng.mappedMemory = seed;
     }
     int sampling = (p->temperature > 0.0f) ? 1 : 0;
+    if (g->dumpTopPFile != NULL && !sampling) {
+        sample_params sp = *p;
+        sp.temperature = 1e-9f;
+        memcpy(g->st.sampleParams.mappedMemory, &sp, sizeof(sample_params));
+        sampling = 1;
+    }
     if (g->sampling == sampling) return;
     g->sampling = sampling;
     g->groupOpCount = compileDecodeGroup(g, g->groupOps, 1);
@@ -969,6 +1101,31 @@ void generatorSetDumpHidden(generator* g, const char* dir, int reqIdx) {
     }
     snprintf(g->dumpHiddenDir, sizeof(g->dumpHiddenDir), "%s", dir);
     g->dumpHiddenReq = reqIdx;
+}
+
+void generatorSetDumpTopP(generator* g, const char* path) {
+    if (g->dumpTopPFile != NULL) {
+        fclose(g->dumpTopPFile);
+        g->dumpTopPFile = NULL;
+    }
+    if (path == NULL || path[0] == '\0') {
+        g->dumpTopPPath[0] = '\0';
+        return;
+    }
+    snprintf(g->dumpTopPPath, sizeof(g->dumpTopPPath), "%s", path);
+    g->dumpTopPFile = fopen(g->dumpTopPPath, "ab");
+    if (g->dumpTopPFile == NULL) {
+        fprintf(stderr, "[dump-topp] failed to open %s\n", g->dumpTopPPath);
+        return;
+    }
+    g->dumpTopPStep = 0;
+}
+
+void generatorCloseDumpTopP(generator* g) {
+    if (g->dumpTopPFile != NULL) {
+        fclose(g->dumpTopPFile);
+        g->dumpTopPFile = NULL;
+    }
 }
 
 void generatorDumpPrefill(generator* g, int rows) {
