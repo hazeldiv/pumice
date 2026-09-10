@@ -18,6 +18,7 @@ penalty_len = 64
 top_k = 20
 top_p = 0.95
 min_p = 0.0
+presence_penalty = 0.0
 seed = None
 
 
@@ -115,10 +116,10 @@ def _stream_ids(llm, token_ids):
         s = seed if seed is not None else random.getrandbits(32)
         if s == 0:
             s = 1
-        header = (temperature, rep_penalty, penalty_len, top_k, top_p, min_p, s)
+        header = (temperature, rep_penalty, penalty_len, top_k, top_p, min_p, presence_penalty, s)
     else:
-        header = (0.0, 1.0, 0, 0, 1.0, 0.0, 1)
-    llm.proc.stdin.write(struct.pack("<ffIIffI", *header))
+        header = (0.0, 1.0, 0, 0, 1.0, 0.0, 0.0, 1)
+    llm.proc.stdin.write(struct.pack("<ffIIfffI", *header))
     llm.proc.stdin.write(struct.pack("<%dI" % n, *token_ids))
     llm.proc.stdin.flush()
     while True:

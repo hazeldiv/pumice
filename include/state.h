@@ -12,6 +12,7 @@ typedef struct {
     uint32_t topK;
     float topP;
     float minP;
+    float presencePenalty;
 } sample_params;
 
 typedef struct model_state {

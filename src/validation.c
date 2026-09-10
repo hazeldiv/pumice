@@ -4978,12 +4978,15 @@ static uint32_t sampler_ref(float* logits, int V, const sample_params* sp, uint3
     double* p = (double*)malloc(sizeof(double) * V);
     unsigned char* seen = (unsigned char*)calloc(V, 1);
     for (int j = 0; j < V; j++) a[j] = (double)logits[j] / (double)sp->temperature;
-    if (penLen > 0 && sp->repPenalty != 1.0f) {
+    if (penLen > 0 && (sp->repPenalty != 1.0f || sp->presencePenalty != 0.0f)) {
         for (int h = 0; h < penLen; h++) {
             uint32_t id = history[h];
             if (id < (uint32_t)V && !seen[id]) {
                 seen[id] = 1;
-                a[id] = (a[id] > 0.0) ? (a[id] / (double)sp->repPenalty) : (a[id] * (double)sp->repPenalty);
+                if (sp->repPenalty != 1.0f) {
+                    a[id] = (a[id] > 0.0) ? (a[id] / (double)sp->repPenalty) : (a[id] * (double)sp->repPenalty);
+                }
+                a[id] -= (double)sp->presencePenalty / (double)sp->temperature;
             }
         }
     }
@@ -5108,8 +5111,13 @@ void validateArgMaxSampler(session s, int vocabSize) {
     uint32_t rngInit = 0x2545F491u;
     uint32_t resultVal = 0;
     uint32_t tokenVal = 0;
-    sample_params spCase[3] = {{0.1f, 1.2f, 256u, 40u, 0.9f, 0.0f}, {0.1f, 1.0f, 0u, 0u, 1.0f, 0.0f}, {0.1f, 1.0f, 0u, 0u, 1.0f, 0.001f}};
-    uint32_t rngSeed[3] = {0x2545F491u, 0x9E3779B9u, 0x85EBCA6Bu};
+    sample_params spCase[4] = {
+        {0.1f, 1.2f, 256u, 40u, 0.9f, 0.0f, 0.0f},
+        {0.1f, 1.0f, 0u, 0u, 1.0f, 0.0f, 0.0f},
+        {0.1f, 1.0f, 0u, 0u, 1.0f, 0.001f, 0.0f},
+        {0.1f, 1.0f, 256u, 40u, 0.9f, 0.0f, 0.3f}
+    };
+    uint32_t rngSeed[4] = {0x2545F491u, 0x9E3779B9u, 0x85EBCA6Bu, 0x7F4A7C15u};
 
     buffer maxValueBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, dummyMax, sizeof(float) * numGroups, MEMORY_VRAM);
     buffer maxIndexBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, dummyIdx, sizeof(uint32_t) * numGroups, MEMORY_VRAM);
@@ -5130,8 +5138,8 @@ void validateArgMaxSampler(session s, int vocabSize) {
     uint32_t posRef = posInit;
     uint32_t rngRef = rngSeed[0];
 
-    for (int c = 0; c < 3; c++) {
-        const char* name = c == 0 ? "ArgMax-Sampler-A" : (c == 1 ? "ArgMax-Sampler-B" : "ArgMax-Sampler-C");
+    for (int c = 0; c < 4; c++) {
+        const char* name = c == 0 ? "ArgMax-Sampler-A" : (c == 1 ? "ArgMax-Sampler-B" : (c == 2 ? "ArgMax-Sampler-C" : "ArgMax-Sampler-D"));
         memcpy(sampleParamsBuffer.mappedMemory, &spCase[c], sizeof(sample_params));
         rngRef = rngSeed[c];
         memcpy(rngBuffer.mappedMemory, &rngRef, sizeof(uint32_t));

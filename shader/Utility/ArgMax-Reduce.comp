@@ -25,6 +25,7 @@ layout(set = 0, binding = 3) readonly restrict buffer SamplerParamsBuffer {
     uint topK;
     float topP;
     float minP;
+    float presencePenalty;
 } sp;
 layout(set = 0, binding = 4) buffer HistoryBuffer { uint history[]; };
 layout(set = 0, binding = 5) buffer RngBuffer { uint rng[]; };
@@ -172,12 +173,13 @@ void main() {
     if (base4 < V4) cnt4 = min(E4, V4 - base4);
 
     float penalty = sp.repPenalty;
+    float pres = sp.presencePenalty * (1.0f / sp.temperature);
     uint penLen = sp.penaltyLength;
     if (penLen > MAX_PENALTY) penLen = MAX_PENALTY;
     uint topK = sp.topK;
     if (topK > V) topK = V;
     float topP = sp.topP;
-    bool doPen = (penLen > 0u) && (penalty != 1.0f);
+    bool doPen = (penLen > 0u) && (penalty != 1.0f || pres != 0.0f);
     float invT = 1.0f / sp.temperature;
 
     if (doPen) {
@@ -197,10 +199,22 @@ void main() {
         vec4 t = logits[base4 + k] * invT;
         if (doPen) {
             uint bits = (penBits[j >> 5u] >> (j & 31u)) & 0xFu;
-            if ((bits & 1u) != 0u) t.x = (t.x > 0.0f) ? (t.x / penalty) : (t.x * penalty);
-            if ((bits & 2u) != 0u) t.y = (t.y > 0.0f) ? (t.y / penalty) : (t.y * penalty);
-            if ((bits & 4u) != 0u) t.z = (t.z > 0.0f) ? (t.z / penalty) : (t.z * penalty);
-            if ((bits & 8u) != 0u) t.w = (t.w > 0.0f) ? (t.w / penalty) : (t.w * penalty);
+            if ((bits & 1u) != 0u) {
+                if (penalty != 1.0f) t.x = (t.x > 0.0f) ? (t.x / penalty) : (t.x * penalty);
+                t.x -= pres;
+            }
+            if ((bits & 2u) != 0u) {
+                if (penalty != 1.0f) t.y = (t.y > 0.0f) ? (t.y / penalty) : (t.y * penalty);
+                t.y -= pres;
+            }
+            if ((bits & 4u) != 0u) {
+                if (penalty != 1.0f) t.z = (t.z > 0.0f) ? (t.z / penalty) : (t.z * penalty);
+                t.z -= pres;
+            }
+            if ((bits & 8u) != 0u) {
+                if (penalty != 1.0f) t.w = (t.w > 0.0f) ? (t.w / penalty) : (t.w * penalty);
+                t.w -= pres;
+            }
         }
         if (j + 1u >= V) t.y = -3.4e38f;
         if (j + 2u >= V) t.z = -3.4e38f;
