@@ -42,7 +42,7 @@ Every value below is a field of `model_dims` (include/model.h), filled by `loadM
 | `ropeTheta` | 1e7 | 1e7 | 1e7 | `rope_parameters.rope_theta` |
 | `tied` | 0 | 0 | 1 | `tie_word_embeddings` (2B shares one embed matrix for embed+lm-head) |
 | `vocab` | 102400 / 248320 | 102400 / 248320 | 102400 / 248320 | mode-dependent: `--prune` -> hardcoded `MODEL_VOCAB` 102400 (include/generated_vocab.h); no `--prune` -> `config.json` `text_config.vocab_size` (the original HF vocab). The pruned vocab was grown 86016 -> 102400 with coding-domain tokens recovered from full-vocab top-p collection on the 2B (see §13 note 19 / tools/vocab_collect). The 248320 mode fits the 8 GB heap only on the 2B (~1 GB embed); the 9B/35B run pruned. |
-| `maxCtx` | 8192 | 32768 | 32768 | `quant_config.json` `max_ctx`, overridable via `--max-ctx` |
+| `maxCtx` | 8192 | 32768 | 32768 | `quant_config.json` `max_ctx`; `--max-ctx` is a true override in **both directions** (growing it grows the KV-cache/`attScores` allocations) and is clamped to config.json `max_position_embeddings` (2B: 262144). Decode attention supports up to `ATT_MAX_CHUNKS` × 256 = 262144 tokens (gotcha 49); validated end-to-end at 131072 on the 2B |
 | `prefillChunk` | 512 | 512 | 512 | `quant_config.json` `prefill_chunk` |
 | `experts` / `expertsPerTok` / `moeI` | 256 / 8 / 512 | 0 / 0 / 0 | 0 / 0 / 0 | `num_experts` / `num_experts_per_tok` / `moe_intermediate_size` — nonzero experts switch every FFN to `FFN_MOE` (§7.8); `ffnN` falls back to `moeI` when `intermediate_size` is absent |
 | `expertsVram` (config) | 32 (default) | n/a | n/a | `quant_config.json` `experts_vram`, overridable `--experts-vram N` — routed experts 0..N-1 + the shared expert live in a VRAM pool, the rest in a host-visible RAM pool (§4.7) |
@@ -259,7 +259,7 @@ All grids are computed from runtime dims:
 - Rope-GEMM: `dispatchX = 2*heads + 2*kvHeads` (q, g, k, v head workgroups), `dispatchY = M` (one row per workgroup, 256 threads).
 - Embed-Gather: `dispatchX = M`, 256 threads (each row gathers its K floats from the embed/lm-head column).
 - Attention prefill (QK2): `dispatchX = (ctxLen+63)/64` (64-token KV tiles), `dispatchY = (ceil(M/16)) * kvHeads` (m-tiles Ã— kv-head bands); Softmax: `dispatchX = M`, `dispatchY = kvHeads`; PV2: `dispatchX = headDim/64`, `dispatchY = (ceil(M/16)) * kvHeads`. The QK2/Softmax/PV2 trio is emitted **`heads/kvHeads` times** (one per GQA group, `headBase = hb*kvHeads`), so all query heads are computed while `attScores` stays `kvHeads`-sized (gotcha 25). All prefill GEMM/attention grids use `ceil(M/16)` so short prompts (M < 16) don't dispatch zero workgroups (gotcha 23).
-- Attention decode: `Att-full` `dispatchX = heads`; `Att-SplitK2` `dispatchX = heads`, `dispatchY = 128` (K-chunks of 4 tiles); `Reduce-Att2` `dispatchX = heads*headDim/256`.
+- Attention decode: `Att-full` `dispatchX = heads`; `Att-SplitK2` `dispatchX = heads`, `dispatchY = ceil(maxCtx/256)` capped at `ATT_MAX_CHUNKS` (K-chunks of 4 tiles); `Reduce-Att2` `dispatchX = heads*headDim/256`.
 - Split-K decode GEMVs: `dispatchX = N/256`, `dispatchY = 4` (K split over 4 workgroups).
 - GatedDeltaNet GEMM: `dispatchX = nV`, one workgroup per v-head.
 - Conv-SiLU: `dispatchX = zqkvN/256`, one thread per qkv channel (each thread shifts its own 3-slot history over the `min(M, realM)` real tokens, no barriers).
@@ -1240,7 +1240,7 @@ Whole-attention cost dropped 48.7 s — ~10.4 s for a 16k prompt (QK2    8.2 s, 
 - **`RmsNorm-up-ffn-SplitK-*` + `FFN-Down-SplitK-*`**: decode FFN flattened like the prefill flat kernel — one shader computes `silu(gate)Â·up` over `2Ã—FFN_N` columns (routing via `nBase >= off`, push `{M,N,K,off}`), writing `st->ffnPartial`; `FFN-Down-SplitK` then GEMVs the down matrix over the partial (which `Reduce-GEMV-ADD` reduces into `h`).
 - **`RmsNorm-QKV-SplitK-*` + `Reduce-Rope-*`**: split-K QKV projection to `st->qkvPartial`, then a per-head reduce that routes by column ranges — g (raw to `gAttn`), q/k (RMSNorm scaled by learned `q_norm`/`k_norm` + RoPE), v (raw) — and stores q/k/v to cache (replaces the old fused `RmsNorm-QKV-*`). K is written to the transposed cache at `kCache[row Â· MAXCTX + pos]` (`row = globalCol ' kOffset`), V to the token-major cache at `vCache[pos Â· (vOffset ' kOffset) + row]`. Quantized scale/zero are written at the fixed slot `kvHead * MODEL_MAX_CTX + pos`.
 - **`RmsNorm-LinearProj-SplitK-*` + `Reduce-LinearProj.comp`**: split-K proj to `st->linprojPartial`; reduce routes the 12352 columns into the six q/k/v/z/a/b output buffers.
-- **`Att-SplitK2-*` + `Reduce-Att2.comp`** (decode attention, ctx    256): `Att-SplitK2` splits the KV sequence into up to `MAXC = 128` chunks of 4 KV-tiles (LOOPS=4, 64-token tiles); each workgroup runs an online-softmax over its chunk and writes `{max, sum, acc[headDim]}` per (chunk, head) into `st->attPartial` (sized `128 Â· heads Â· (2 + headDim)` — runtime heads); `Reduce-Att2` re-normalizes across chunks (`w = exp(P[ml*2] - m)`) and writes all `headsÂ·headDim` outputs — its push block carries **both** `gqa` (4th member, cache routing not needed here) and the real `heads` (6th member, the `h >= HEADS` output guard — reusing the gqa slot for the guard once silently dropped heads gqa..heads-1 and collapsed all generation past ctx 256 into garbage; gotcha 34). The QK dot reads the **transposed** K cache (`key[(kv_row_base + d)Â·MAXCTX + s]`, coalesced across `s` = token), while the PÂ·V pass reads V token-major. Below 256 tokens the engine uses `Att-full-*` (single workgroup, online softmax, Â§7.2).
+- **`Att-SplitK2-*` + `Reduce-Att2.comp`** (decode attention, ctx    256): `Att-SplitK2` splits the KV sequence into up to `MAXC = ATT_MAX_CHUNKS = 1024` chunks of 4 KV-tiles (LOOPS=4, 64-token tiles — 262144-token ceiling; gotcha 49); each workgroup runs an online-softmax over its chunk and writes `{max, sum, acc[headDim]}` per (chunk, head) into `st->attPartial` (sized `ATT_MAX_CHUNKS Â· heads Â· (2 + headDim)` — runtime heads); `Reduce-Att2` re-normalizes across chunks (`w = exp(P[ml*2] - m)`) and writes all `headsÂ·headDim` outputs — its push block carries **both** `gqa` (4th member, cache routing not needed here) and the real `heads` (6th member, the `h >= HEADS` output guard — reusing the gqa slot for the guard once silently dropped heads gqa..heads-1 and collapsed all generation past ctx 256 into garbage; gotcha 34). The QK dot reads the **transposed** K cache (`key[(kv_row_base + d)Â·MAXCTX + s]`, coalesced across `s` = token), while the PÂ·V pass reads V token-major. Below 256 tokens the engine uses `Att-full-*` (single workgroup, online softmax, Â§7.2).
 
 ### 7.7 Token selection — greedy vs sampling
 
@@ -1423,6 +1423,26 @@ A separate `--debug-sampling` flag (`generatorDumpSamplingDebug`) reads back the
     `weights.o` was compiled against the old header — the struct-copy into `generator.w` then read
     garbage `vocab` (a 16-exabyte `maxValue` allocation). The Makefile has no header dependency
     tracking, so **any** header change needs `make clean` (gotcha 12, now enforced by habit).
+49. **The context length was pinned by a shrink-only `--max-ctx` and a silent 32768 decode-attention
+    cap.** Two independent limiters: (a) `loadModelConfig` only applied `maxCtxOverride` when it was
+    *smaller* than quant_config's `max_ctx`, so a larger `--max-ctx` was silently ignored — Python's
+    `max_ctx` argument merely rode on top of the config ceiling; (b) decode split-K attention
+    (`Att-SplitK2-*` TS=64 × LOOPS=4 × **MAXC=128** = 32768 tokens) hard-dropped every token beyond
+    32768 from attention — no crash, just quality corruption past the cap — with `MAXC` copied into
+    four shaders (`Att-SplitK2-{FP16,INT8,INT4}`, `Reduce-Att2`), the hardcoded
+    `dispatchY = 128` in `buildAttention`, the `attPartial` state sizing, and the validation
+    fixtures, all of which must stay in sync (they now share `ATT_MAX_CHUNKS 1024` /
+    `ATT_CHUNK_TOKENS 256` from model.h — 1024 × 256 = 262144). Excess chunks are harmless: the
+    SplitK2 shaders write NEG_INF partials for `start_tile >= num_tiles` and `Reduce-Att2` weights
+    them to zero. Related fixes in the same pass: `max_position_embeddings` is parsed from
+    config.json (before `json_free` — gotcha 35's use-after-free trap) and clamps `maxCtx`;
+    `generateTokens` rejects `nPrompt >= maxCtx` (previously an out-of-bounds KV write) and
+    `vk_llm.py` raises before sending; state creation now releases the KV-cache / `attScores`
+    staging allocations after the initial zero-copy (they are never re-uploaded) — **but**
+    `stateS`/`convHist`/`sampleHistory` staging must stay alive: `resetGenerator` re-copies those
+    still-intact staging buffers to re-zero state every request. Verified on the 2B at
+    `max_ctx=131072` with a 41698-token prompt whose needle sat past position 32768 (retrieved
+    correctly; prefill+decode 212 s), with short-prompt runs and `main.exe val` green.
 
 
 ---
@@ -1481,6 +1501,7 @@ uv pip install --python .venv/Scripts/python.exe tokenizers   # once
 .venv/Scripts/python.exe vk_llm.py <model_dir> <max_ctx> "prompt text" [--think] [--prune] [--experts-vram N]
 # e.g.
 .venv/Scripts/python.exe vk_llm.py model/Qwen3.5-2B 8192 "why the sky is blue?" --think
+.venv/Scripts/python.exe vk_llm.py model/Qwen3.5-2B 131072 "long document question" --prune
 .venv/Scripts/python.exe vk_llm.py model/Qwen3.6-35B-A3B 8192 "why the sky is blue?" --think --prune --experts-vram 32
 ```
 
@@ -1510,9 +1531,15 @@ Device-local memory (`heap[0]`) is **7936 MB**, not 8192. With the 9B hybrid spe
 | h/emb/attn/q-proj group, `qkvRaw`, partials | ~155 |
 | **total device-local** | **~7550** |
 
-This fits arithmetically but overflows at runtime — fragmentation from ~450 discrete allocations means a single further 128 MB `attScores` block can't be satisfied. The failure is deterministic and reported as `OOM: vkAllocateMemory failed for 'attScores' (DEVICE_LOCAL, 128.00 MB) | device_local=7352.66 MB`. Levers: lower `max_ctx` in `quant_config.json` (KV + attScores scale with it → −576 MB at 8192; the `--max-ctx` flag also *shrinks the allocations*, not just the generation limit), lower `prefill_chunk` (−160 MB at 256), INT8 embed/lm-head (−640 MB), or consolidating the ~450 tiny allocations into arenas. Staging/host buffers are **not** the issue — they live in the 16/32 GB system heap.
+This fits arithmetically but overflows at runtime — fragmentation from ~450 discrete allocations means a single further 128 MB `attScores` block can't be satisfied. The failure is deterministic and reported as `OOM: vkAllocateMemory failed for 'attScores' (DEVICE_LOCAL, 128.00 MB) | device_local=7352.66 MB`. Levers: lower `max_ctx` in `quant_config.json` (KV + attScores scale with it → −576 MB at 8192; the `--max-ctx` flag also *resizes the allocations* (grow or shrink), not just the generation limit), lower `prefill_chunk` (−160 MB at 256), INT8 embed/lm-head (−640 MB), or consolidating the ~450 tiny allocations into arenas. Staging/host buffers are **not** the issue — they live in the 16/32 GB system heap.
 
-The 2B (all-FP16, 102400 vocab, tied embeddings) totals ~3.3 GB of weights + ~0.4 GB state — comfortable at `max_ctx = 32768`. In original-vocab mode (no `--prune`) the 2B's tied embed grows to ~1.0 GB (~3.6 GB total, still comfortable); the 9B's two untied heads would need ~4.7 GB at 102400 and does not fit the heap — run the 9B pruned (lower `--max-ctx` if the extra 16384 rows tip it over). Note the 9B's measured budget can also be squeezed by *other applications* holding VRAM (browser/OBS reserve ~1.3 GB some sessions) — an OOM at `max_ctx 8192` that previously worked is usually external pressure, not a regression; retry after freeing VRAM or run at a lower `--max-ctx`.
+The 2B (all-FP16, 102400 vocab, tied embeddings) totals ~1.7 GB of weights + ~0.4 GB state at
+`max_ctx = 32768` — comfortable. Context is now runtime-resizable (gotcha 49): at
+`max_ctx = 131072` the ctx-dependent state grows to ~1.3 GB (KV caches ~1.0 GB + `attScores`
+256 MB, ~5 GB device total) and is validated end-to-end; the ceiling is `max_position_embeddings`
+262144 (~2.5 GB ctx-dependent state, still fits arithmetically). State-buffer staging is released
+after the initial zero-copy, so the retained host-visible footprint no longer mirrors the VRAM
+state total. In original-vocab mode (no `--prune`) the 2B's tied embed grows to ~1.0 GB (~3.6 GB total, still comfortable); the 9B's two untied heads would need ~4.7 GB at 102400 and does not fit the heap — run the 9B pruned (lower `--max-ctx` if the extra 16384 rows tip it over). Note the 9B's measured budget can also be squeezed by *other applications* holding VRAM (browser/OBS reserve ~1.3 GB some sessions) — an OOM at `max_ctx 8192` that previously worked is usually external pressure, not a regression; retry after freeing VRAM or run at a lower `--max-ctx`.
 
 **Qwen3.6-35B-A3B (MoE, experts_vram=32)**: device-local ~3.6 GB weights (embed+lmHead 704 MB
 pruned, INT8-edge/INT4-mid attention ~1.0 GB, 33-expert VRAM pools ~2.0 GB, routers 40 MB) +
@@ -1598,5 +1625,17 @@ probability) is the path to the all-VRAM ~25 tok/s.
     - **Validation (2B, --prune, 102400)**: thinking-mode sampled runs produce clean
       think-open/close + Python code with docstrings; Go / SQL / C++ sampled runs coherent; greedy
       fluent; no `?` collapse.
+
+20. **(Resolved, 2026-09) Runtime-resizable context length.** `--max-ctx` is now a true override in
+    both directions (grows or shrinks the KV-cache / `attScores` / `attPartial` allocations at
+    startup), clamped to config.json `max_position_embeddings`; the decode split-K attention cap
+    was lifted from 32768 to 262144 tokens (`ATT_MAX_CHUNKS 1024` shared by the four `Att-SplitK2`/
+    `Reduce-Att2` shaders, the dispatch geometry, and the state sizing — gotcha 49); over-long
+    prompts are rejected (`generateTokens` guard + `vk_llm.py` ValueError) instead of writing
+    out-of-bounds KV; and state staging is released after the initial zero-copy (except the
+    `resetGenerator`-relied-upon `stateS`/`convHist`/`sampleHistory` staging). Validated on the 2B
+    at `max_ctx = 131072`: a 41698-token prompt with a needle past position 32768 (unreachable
+    under the old decode cap) is retrieved correctly, short-prompt runs are unchanged at 32768 and
+    8192, and `main.exe val` is fully green.
 
 .

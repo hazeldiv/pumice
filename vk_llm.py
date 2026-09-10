@@ -111,6 +111,8 @@ def _stream_ids(llm, token_ids):
     if not token_ids:
         return
     n = len(token_ids)
+    if n >= llm.max_ctx:
+        raise ValueError(f"prompt length {n} exceeds max_ctx {llm.max_ctx}")
     llm.proc.stdin.write(struct.pack("<I", n))
     if is_sampling:
         s = seed if seed is not None else random.getrandbits(32)

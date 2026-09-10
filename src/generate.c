@@ -388,7 +388,9 @@ static void buildAttention(generator* g, operation* ops, int* n, int L, int gemm
         attBufs[ba++] = st->position;
         int push0[6] = {d->maxCtx, d->kvHeads, d->kvRows, d->heads / d->kvHeads, d->headDim, d->heads};
         if (splitAttn) {
-            addOp(ops, n, model_shader("Att-SplitK2", q), L, attBufs, ba, push0, 6, d->heads, 128);
+            int chunks = (d->maxCtx + ATT_CHUNK_TOKENS - 1) / ATT_CHUNK_TOKENS;
+            if (chunks > ATT_MAX_CHUNKS) chunks = ATT_MAX_CHUNKS;
+            addOp(ops, n, model_shader("Att-SplitK2", q), L, attBufs, ba, push0, 6, d->heads, chunks);
 
             buffer attRedBufs[3];
             attRedBufs[0] = st->attPartial;
@@ -977,6 +979,10 @@ uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens) {
 }
 
 void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNewTokens, void (*emit)(uint32_t token, void* ctx), void* ctx) {
+    if (nPrompt >= g->maxCtx) {
+        fprintf(stderr, "prompt length %d exceeds max ctx %d\n", nPrompt, g->maxCtx);
+        return;
+    }
     int limit = g->maxCtx - nPrompt;
     if (limit < 1) limit = 1;
     if (maxNewTokens > limit) maxNewTokens = limit;

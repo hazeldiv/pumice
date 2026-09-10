@@ -6,7 +6,7 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define TILE 64
 #define LOOPS 4
 #define NEG_INF -1e30
-#define MAXC 128
+#define MAXC 1024
 
 layout(push_constant) uniform Pc { uint maxCtx; uint kvHeads; uint kvRows; uint gqa; uint headDim; uint heads; } param;
 

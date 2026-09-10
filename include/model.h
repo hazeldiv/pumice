@@ -7,6 +7,8 @@
 #define MODEL_EOS 81896
 #define MODEL_MAX_OPS 2048
 #define MAX_PENALTY_LEN 1024
+#define ATT_MAX_CHUNKS 1024
+#define ATT_CHUNK_TOKENS 256
 
 typedef enum {
     ATTENTION_NONE,

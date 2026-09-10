@@ -134,6 +134,7 @@ int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride,
     d->tied = json_get_bool(txt, "tie_word_embeddings", 0);
     double partial = json_get_num(txt, "partial_rotary_factor", 0.25);
     int hfVocab = json_get_int(txt, "vocab_size", MODEL_VOCAB);
+    int maxPos = json_get_int(txt, "max_position_embeddings", 0);
     d->experts = json_get_int(txt, "num_experts", 0);
     d->expertsPerTok = json_get_int(txt, "num_experts_per_tok", 0);
     d->moeI = json_get_int(txt, "moe_intermediate_size", 0);
@@ -201,7 +202,12 @@ int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride,
     d->vocab = pruned ? MODEL_VOCAB : hfVocab;
     if (d->vocab <= 0) cfg_fatal("invalid vocab size");
     d->maxCtx = json_get_int(qc, "max_ctx", 32768);
-    if (maxCtxOverride > 0 && maxCtxOverride < d->maxCtx) d->maxCtx = maxCtxOverride;
+    if (maxCtxOverride > 0) d->maxCtx = maxCtxOverride;
+    if (d->maxCtx < 1) cfg_fatal("invalid max_ctx");
+    if (maxPos > 0 && d->maxCtx > maxPos) {
+        fprintf(stderr, "max_ctx %d exceeds max_position_embeddings %d, clamping\n", d->maxCtx, maxPos);
+        d->maxCtx = maxPos;
+    }
     d->prefillChunk = json_get_int(qc, "prefill_chunk", 512);
     cfg->embedQ = parse_quant(json_get_str(qc, "embed", "fp16"), QUANT_FP16);
     cfg->lmHeadQ = parse_quant(json_get_str(qc, "lm_head", "fp16"), QUANT_FP16);

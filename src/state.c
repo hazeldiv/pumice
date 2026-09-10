@@ -102,7 +102,7 @@ model_state createState(session s, const model_config* spec, int maxM, int vocab
     st.qkvPartial = createZeroed(s, (int64_t)sizeof(float) * 4 * d->qkvN, "qkvPartial");
     st.ffnPartial = createZeroed(s, (int64_t)sizeof(float) * 8 * d->ffnN, "ffnPartial");
     st.linprojPartial = createZeroed(s, (int64_t)sizeof(float) * 4 * d->projN, "linprojPartial");
-    st.attPartial = createZeroed(s, (int64_t)sizeof(float) * 128 * d->heads * (2 + d->headDim), "attPartial");
+    st.attPartial = createZeroed(s, (int64_t)sizeof(float) * ATT_MAX_CHUNKS * d->heads * (2 + d->headDim), "attPartial");
     st.invRms = createZeroed(s, (int64_t)sizeof(float) * maxM, "invRms");
     st.attScores = createZeroed(s, (int64_t)maxM * maxCtx * d->kvHeads * 2, "attScores");
     st.smSum = createZeroed(s, (int64_t)sizeof(float) * maxM * d->kvHeads, "smSum");
@@ -125,30 +125,38 @@ model_state createState(session s, const model_config* spec, int maxM, int vocab
         st.moeP = createZeroed(s, (int64_t)sizeof(float) * maxM * slots * d->K, "moeP");
     }
 
-    buffer bufs[] = {
-        st.h, st.act, st.embOut, st.yGated, st.attnOut, st.gAttn, st.qOut,
+    buffer bufs[35 + 6 * MODEL_MAX_LAYERS] = {
+        st.h, st.act, st.embStaged, st.embOut, st.yGated, st.attnOut, st.gAttn, st.qOut,
         st.qProj, st.kProj, st.vProj, st.zProj, st.aProj, st.bProj,
         st.maxValue, st.maxIndex, st.result,
         st.gAct, st.uAct, st.invRms, st.qkvRaw, st.gemvPartial, st.qkvPartial,
-        st.ffnPartial, st.linprojPartial, st.attPartial, st.smSum, st.logits,
+        st.ffnPartial, st.linprojPartial, st.attPartial, st.smSum, st.logits, st.attScores,
         st.moeIds, st.moeWeights, st.moeSharedW, st.moeXn, st.moeH, st.moeP
     };
-    createTransferAndCopy(s.dev.device, s.dev.queue, bufs, 32);
-    for (int i = 0; i < 32; i++) releaseStaging(s.dev.device, &bufs[i]);
+    int nb = 35;
     for (int L = 0; L < d->layerCount; L++) {
-        if (st.kCache[L].buffer != VK_NULL_HANDLE) {
-            buffer ks[] = {st.kCache[L], st.vCache[L], st.kScale[L], st.kZero[L], st.vScale[L], st.vZero[L]};
-            createTransferAndCopy(s.dev.device, s.dev.queue, ks, 6);
-        }
-        if (st.stateS[L].buffer != VK_NULL_HANDLE) {
-            buffer ss[] = {st.stateS[L]};
-            createTransferAndCopy(s.dev.device, s.dev.queue, ss, 1);
-        }
-        if (st.convHist[L].buffer != VK_NULL_HANDLE) {
-            buffer ch[] = {st.convHist[L]};
-            createTransferAndCopy(s.dev.device, s.dev.queue, ch, 1);
+        if (spec->layers[L].attn.type == ATTENTION_FULL) {
+            bufs[nb++] = st.kCache[L];
+            bufs[nb++] = st.vCache[L];
+            bufs[nb++] = st.kScale[L];
+            bufs[nb++] = st.kZero[L];
+            bufs[nb++] = st.vScale[L];
+            bufs[nb++] = st.vZero[L];
         }
     }
+    createTransferAndCopy(s.dev.device, s.dev.queue, bufs, nb);
+    for (int i = 0; i < nb; i++) releaseStaging(s.dev.device, &bufs[i]);
+
+    buffer persist[2 * MODEL_MAX_LAYERS + 1];
+    int np = 0;
+    for (int L = 0; L < d->layerCount; L++) {
+        if (spec->layers[L].attn.type == ATTENTION_DELTA) {
+            persist[np++] = st.stateS[L];
+            persist[np++] = st.convHist[L];
+        }
+    }
+    persist[np++] = st.sampleHistory;
+    createTransferAndCopy(s.dev.device, s.dev.queue, persist, np);
 
     return st;
 }

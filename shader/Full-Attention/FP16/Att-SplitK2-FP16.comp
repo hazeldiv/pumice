@@ -7,7 +7,7 @@
 #define LOOPS 4
 #define HEAD_DIM 256
 #define NEG_INF -1e30
-#define MAXC 128
+#define MAXC 1024
 
 layout(local_size_x = TS, local_size_y = 1, local_size_z = 1) in;
 
