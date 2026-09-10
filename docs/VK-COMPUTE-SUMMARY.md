@@ -41,7 +41,7 @@ Every value below is a field of `model_dims` (include/model.h), filled by `loadM
 | `rotaryDim` | 64 | 64 | 64 | `headDim Â· partial_rotary_factor` (0.25) |
 | `ropeTheta` | 1e7 | 1e7 | 1e7 | `rope_parameters.rope_theta` |
 | `tied` | 0 | 0 | 1 | `tie_word_embeddings` (2B shares one embed matrix for embed+lm-head) |
-| `vocab` | 86016 / 248320 | 86016 / 248320 | 86016 / 248320 | mode-dependent: `--prune` -> hardcoded `MODEL_VOCAB` 86016 (include/generated_vocab.h); no `--prune` -> `config.json` `text_config.vocab_size` (the original HF vocab). The 248320 mode fits the 8 GB heap only on the 2B (~1 GB embed); the 9B/35B run pruned. |
+| `vocab` | 102400 / 248320 | 102400 / 248320 | 102400 / 248320 | mode-dependent: `--prune` -> hardcoded `MODEL_VOCAB` 102400 (include/generated_vocab.h); no `--prune` -> `config.json` `text_config.vocab_size` (the original HF vocab). The pruned vocab was grown 86016 -> 102400 with coding-domain tokens recovered from full-vocab top-p collection on the 2B (see §13 note 19 / tools/vocab_collect). The 248320 mode fits the 8 GB heap only on the 2B (~1 GB embed); the 9B/35B run pruned. |
 | `maxCtx` | 8192 | 32768 | 32768 | `quant_config.json` `max_ctx`, overridable via `--max-ctx` |
 | `prefillChunk` | 512 | 512 | 512 | `quant_config.json` `prefill_chunk` |
 | `experts` / `expertsPerTok` / `moeI` | 256 / 8 / 512 | 0 / 0 / 0 | 0 / 0 / 0 | `num_experts` / `num_experts_per_tok` / `moe_intermediate_size` — nonzero experts switch every FFN to `FFN_MOE` (§7.8); `ffnN` falls back to `moeI` when `intermediate_size` is absent |
@@ -61,9 +61,11 @@ vk-compute/
        tools/json_reader.py  tools/cmp_layers.py    # vocab / HF layer-comparison helpers
        tools/run_dump.py             # drives --dump layer-differential runs
         tools/setup_2b.py            # (legacy) 2B prep: checks tokenizer parity, runs the pruner
-       tools/pruner/                # vocab pruner (Wikipedia corpus, chat-token protection)
-            pruner.py  vocab_select.py  emit.py  gather_weights.py  check.py
-            engine_harness.py  compare_hf.py  cmp_hidden.py  (.venv with torch/transformers)
+        tools/pruner/                # vocab pruner (Wikipedia corpus, chat-token protection)
+             pruner.py  vocab_select.py  emit.py  gather_weights.py  check.py
+             engine_harness.py  compare_hf.py  cmp_hidden.py  (.venv with torch/transformers)
+        tools/vocab_collect/         # top-p token collection + vocab growth (2026-09)
+             prompts.py  collect.py  build_vocab.py  (uses .venv: tokenizers + numpy)
        Makefile                    # recursive shader build -> bin/shader/*.spv
        include/                    # C headers
             buffer.h  data.h  descriptor.h  device.h  dispatch.h
@@ -143,8 +145,10 @@ model/<name>/
            mapping.npy                   # new-id — original-id int32[V]
 
 pruned-vocab/                            # repo root, hardcoded in C (PRUNED_VOCAB_DIR)
-       mapping.npy                       # new-id — original-id int32[86016]
+       mapping.npy                       # new-id — original-id int32[102400]
        tokenizer.json  tokenizer_config.json  vocab.json   # pruned tokenizer (renumbered ids)
+       topp_tokens.json                  # union of top-p nuclei from the coding-token collection run
+       counts.npy  chat_protect.npy  selection.json  prune_report.txt   # original 86016-prune artifacts
 ```
 
 ---
@@ -267,7 +271,7 @@ Loading is **cache-first and lazy at every level, for every weight class** (matr
 
 **Config & pruning pipeline** (runs before weights, in `serverMain`):
 
-1. `loadModelConfig` (src/model.c) parses `<modelDir>/config.json` (HF: hidden_size, layer count, layer_types, head counts, head_dim, intermediate_size, linear_* geometry, rope_parameters, tie_word_embeddings, vocab_size) with the generic JSON DOM parser (src/json.c) and derives `qkvN`, `projN`, `zqkvN`, `kvRows`, offsets, `rotaryDim`. It then parses `quant_config.json` (name, max_ctx, prefill_chunk, per-layer attn/ffn quant, embed/lm_head quant). **`vocab` is mode-dependent**: `--prune` → the hardcoded pruned size `MODEL_VOCAB` = 86016 (include/generated_vocab.h); no `--prune` → `config.json`'s original `vocab_size` (248320). `vocab_size` must be read **before** `json_free(hf)` — after the free the pointer dangles (gotcha 35's use-after-free trap, hit again here).
+1. `loadModelConfig` (src/model.c) parses `<modelDir>/config.json` (HF: hidden_size, layer count, layer_types, head counts, head_dim, intermediate_size, linear_* geometry, rope_parameters, tie_word_embeddings, vocab_size) with the generic JSON DOM parser (src/json.c) and derives `qkvN`, `projN`, `zqkvN`, `kvRows`, offsets, `rotaryDim`. It then parses `quant_config.json` (name, max_ctx, prefill_chunk, per-layer attn/ffn quant, embed/lm_head quant). **`vocab` is mode-dependent**: `--prune` → the hardcoded pruned size `MODEL_VOCAB` = 102400 (include/generated_vocab.h); no `--prune` → `config.json`'s original `vocab_size` (248320). `vocab_size` must be read **before** `json_free(hf)` — after the free the pointer dangles (gotcha 35's use-after-free trap, hit again here).
 2. `pruneVocab(modelDir, spec)` (src/prune.c, gated by the `--prune` flag) resolves vocab weights in cache-first order:
    - **weight cache**: if `bin/weights/<name>/embed_<V>_FP16.bin` (and `lmHead_<V>_FP16.bin` for untied models) exists with a matching `{magic, K, V, FP16}` header, skip the gather entirely;
    - **vocab folder**: if `<modelDir>/vocab/embed_tokens.<V>.safetensors` (and `lm_head.<V>` for untied) exists, skip the gather;
@@ -287,7 +291,7 @@ Loading is **cache-first and lazy at every level, for every weight class** (matr
 4. The `Qwen3_5RMSNorm` vectors (`input_layernorm`, `post_attention_layernorm`, final `norm`, `q_norm`/`k_norm` [headDim]) are loaded **with `+1.0` added** — `Qwen3_5RMSNorm` stores `weight` zeros-init and applies `scale = 1 + weight`, and the checkpoint stores the raw (near-zero) delta. The delta `norm.weight` [dim] (`Qwen3_5RMSNormGated`, ones-init, applied directly — **no** `+1`) is loaded unchanged, as are `A_log`[nV] and `dt_bias`[nV]. `conv1d.weight` (`[zqkvNÃ—1Ã—4]` — zqkvN channels Ã— 4 taps, channel-major `w0..w3` with `w0` = t'3    `w3` = current) is loaded **FP32** and consumed by `Conv-SiLU.spv` (Â§7.3). See gotcha 22.
 5. Small vectors (norms, `A_log`, `dt_bias`, `conv1d`) have their own on-disk cache (`vec_<label>_<layer>.bin`, `conv_<layer>.bin`) so a cache-only run needs no safetensors at all. All of them resolve cache → `shardSource()` (the conv loader once checked shards *first* and rewrote its cache file every run — now cache-first like the rest).
 
-**Disk cache** (`bin/weights/<model-name>/` — one directory per model, so two models never collide): quantized matrices as `<name>_<QUANT>.bin` (header `{magic, rows, cols, quant}` — a dim or quant change auto-invalidates), embeddings as `embed_<V>_FP16.bin` / `lmHead_<V>_FP16.bin`. The embed cache filename carries V, so the pruned (86016) and original (248320) vocab modes **coexist** in one cache dir without invalidation. **Gotcha: the cache keys on dims, not weight-file content — after re-gathering a vocab or editing quant_config.json, delete the model's cache directory or generation runs on stale tensors** (gotcha 37).
+**Disk cache** (`bin/weights/<model-name>/` — one directory per model, so two models never collide): quantized matrices as `<name>_<QUANT>.bin` (header `{magic, rows, cols, quant}` — a dim or quant change auto-invalidates), embeddings as `embed_<V>_FP16.bin` / `lmHead_<V>_FP16.bin`. The embed cache filename carries V, so vocab modes **coexist** in one cache dir without invalidation (e.g. `embed_102400_FP16.bin`, `embed_86016_FP16.bin`, `embed_248320_FP16.bin`). **Gotcha: the cache keys on dims, not weight-file content — after re-gathering a vocab or editing quant_config.json, delete the model's cache directory or generation runs on stale tensors** (gotcha 37).
 
 **Tied vs untied embeddings**: `tie_word_embeddings: true` (2B) loads the single embedding matrix once and aliases `lmHead = embed`; `false` (9B) loads two separate matrices from the vocab folder (`embed_tokens.<V>.safetensors` / `lm_head.<V>.safetensors`, both required — they are genuinely different matrices, verified at the source). Vocab weights resolve cache-first — vocab-folder safetensors (opened lazily, V-exact match) — shard tensors. In original-vocab mode the shard tensors are the only source (the vocab folder holds pruned-size files only). `rope_theta`, `partial_rotary_factor`, and `rms_norm_eps = 1e-6` all come from config.
 
@@ -1479,9 +1483,9 @@ uv pip install --python .venv/Scripts/python.exe tokenizers   # once
 .venv/Scripts/python.exe vk_llm.py model/Qwen3.6-35B-A3B 8192 "why the sky is blue?" --think --prune --experts-vram 32
 ```
 
-No `--think` means non-thinking mode. `--prune` selects the **pruned 86,016-token vocab** and bootstraps a fresh model dir: the engine's `pruneVocab` resolves the vocab weights cache-first (weight cache → `<model>/vocab/` → auto-gather from the shards via `pruned-vocab/mapping.npy`, §4.7) and always ensures the tokenizer files in `<model>/vocab/` (the Python frontend copies them from the root `pruned-vocab/` before spawning the engine, since it needs the tokenizer first). Once the weight cache or `vocab/` exists, `--prune` is a no-op and can be dropped.
+No `--think` means non-thinking mode. `--prune` selects the **pruned 102,400-token vocab** and bootstraps a fresh model dir: the engine's `pruneVocab` resolves the vocab weights cache-first (weight cache → `<model>/vocab/` → auto-gather from the shards via `pruned-vocab/mapping.npy`, §4.7) and always ensures the tokenizer files in `<model>/vocab/` (the Python frontend copies them from the root `pruned-vocab/` before spawning the engine, since it needs the tokenizer first). Once the weight cache or `vocab/` exists, `--prune` is a no-op and can be dropped.
 
-**Without `--prune` the engine runs the original 248,320-token vocab** straight from the shards: `vocab` comes from `config.json`'s `vocab_size`, the tokenizer is the model-root `tokenizer.json` (original ids), and EOS resolves via the `added_tokens` fallback (§4.7). The two modes keep separate cache files (`embed_86016_FP16.bin` vs `embed_248320_FP16.bin`) and can be interleaved freely. **VRAM caveat**: the full vocab fits the 8 GB heap only on the 2B (~1 GB tied embed); the 9B's two untied FP16 heads (~4 GB) OOM — run the 9B with `--prune`.
+**Without `--prune` the engine runs the original 248,320-token vocab** straight from the shards: `vocab` comes from `config.json`'s `vocab_size`, the tokenizer is the model-root `tokenizer.json` (original ids), and EOS resolves via the `added_tokens` fallback (§4.7). The two modes keep separate cache files (`embed_102400_FP16.bin` vs `embed_248320_FP16.bin`) and can be interleaved freely. **VRAM caveat**: the full vocab fits the 8 GB heap only on the 2B (~1 GB tied embed); the 9B's two untied FP16 heads (~4 GB) OOM — run the 9B with `--prune`.
 
 `vk_llm.py` exposes `start_llm(weight_dir, max_ctx, max_new_tokens, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0)`, `apply_chat_template(messages, enable_thinking=True)`, `tokenize`, `generate`, `generate_stream`, `detokenize`, `close`. `tokenize(text)` wraps the text in the **Qwen3.5 chat template** with the `<think>` control token (gotcha 32); the tokenizer comes from `<weight_dir>/vocab/tokenizer.json` (pruned ids, 85992 EOS) with `prune_vocab=True`, else the model-root `tokenizer.json` (original ids, 248046 EOS) — the choice must match the engine's `--prune` flag or ids desynchronize.
 
@@ -1507,7 +1511,7 @@ Device-local memory (`heap[0]`) is **7936 MB**, not 8192. With the 9B hybrid spe
 
 This fits arithmetically but overflows at runtime — fragmentation from ~450 discrete allocations means a single further 128 MB `attScores` block can't be satisfied. The failure is deterministic and reported as `OOM: vkAllocateMemory failed for 'attScores' (DEVICE_LOCAL, 128.00 MB) | device_local=7352.66 MB`. Levers: lower `max_ctx` in `quant_config.json` (KV + attScores scale with it → −576 MB at 8192; the `--max-ctx` flag also *shrinks the allocations*, not just the generation limit), lower `prefill_chunk` (−160 MB at 256), INT8 embed/lm-head (−640 MB), or consolidating the ~450 tiny allocations into arenas. Staging/host buffers are **not** the issue — they live in the 16/32 GB system heap.
 
-The 2B (all-FP16, 86016 vocab, tied embeddings) totals ~3.1 GB of weights + ~0.4 GB state — comfortable at `max_ctx = 32768` (~46 tok/s decode). In original-vocab mode (no `--prune`) the 2B's tied embed grows to ~1.0 GB (~3.6 GB total, still comfortable); the 9B's two untied heads would need ~4 GB and does not fit the heap — run the 9B pruned. Note the 9B's measured budget can also be squeezed by *other applications* holding VRAM (browser/OBS reserve ~1.3 GB some sessions) — an OOM at `max_ctx 8192` that previously worked is usually external pressure, not a regression; retry after freeing VRAM or run at a lower `--max-ctx`.
+The 2B (all-FP16, 102400 vocab, tied embeddings) totals ~3.3 GB of weights + ~0.4 GB state — comfortable at `max_ctx = 32768`. In original-vocab mode (no `--prune`) the 2B's tied embed grows to ~1.0 GB (~3.6 GB total, still comfortable); the 9B's two untied heads would need ~4.7 GB at 102400 and does not fit the heap — run the 9B pruned (lower `--max-ctx` if the extra 16384 rows tip it over). Note the 9B's measured budget can also be squeezed by *other applications* holding VRAM (browser/OBS reserve ~1.3 GB some sessions) — an OOM at `max_ctx 8192` that previously worked is usually external pressure, not a regression; retry after freeing VRAM or run at a lower `--max-ctx`.
 
 **Qwen3.6-35B-A3B (MoE, experts_vram=32)**: device-local ~3.6 GB weights (embed+lmHead 704 MB
 pruned, INT8-edge/INT4-mid attention ~1.0 GB, 33-expert VRAM pools ~2.0 GB, routers 40 MB) +
@@ -1535,7 +1539,7 @@ probability) is the path to the all-VRAM ~25 tok/s.
 11. **(Resolved) Sampling — temperature / repetition penalty / top-k / top-p.** `ArgMax-Reduce` was extended into a `mode`-selected sampler over a new full-logits buffer (Â§7.7), with a per-request `sampleParams` block, a sentinel-filled repetition-penalty ring (`sampleHistory`), and an on-GPU xorshift32 RNG (`sampleRng`). `g->sampling = (temperature > 0)`; greedy (`mode 0`) is byte-identical to the prior behavior. Sampling is opt-in from Python via module constants (`is_sampling`, `temperature`, `rep_penalty`, `penalty_len`, `top_k`, `top_p`, `min_p`, `seed`), and a `--debug-sampling` flag dumps the history ring / position / generated tokens for diagnostics. The initial sampler cost ~15 ms/token (sampling at ~20 tok/s vs 30+ greedy); the Â§7.1 rewrite (probability-space conversion, per-thread early-outs, vec4 access, 28 bisections, subgroup reductions, TS 256—1024) cut it to 0.64 ms/token — the sampling/greedy gap is now under 1 tok/s. A second-round fix replaced the per-logit repetition-penalty history scan with a shared-memory membership bitmap, making the penalty cost independent of `penalty_len` (penalty_len=256 previously dropped sampling ~30 — ~26 tok/s; now parity with 16) and restoring once-only CTRL scaling for duplicated ids; `validateArgMaxSampler` (Â§6) plus the re-enabled `validateLmHeadArgMaxFP16` cover both modes against a fp64 CPU reference. A `min_p` filter (`p < min_p` dropped; trivial in prob space, Â§7.1) was added as a fourth knob with its own validator case.
 12. **(Resolved) Thinking-mode degeneration — pruned vocab was missing the model's reasoning-starter tokens.** Symptom: sampling at temp 0.6+ produced spurious `</thinking>` close-tags assembled from plain tokens, repeated answers, or early EOS; greedy degenerated into `1. 1. 1.` loops. Diagnostics: same-seed runs were reproducible, `top_k=1` matched greedy exactly, and the engine matched the **pruned-constrained** HF greedy 159/160 tokens — the engine was numerically correct. The real cause: HF's top-1 token after `<think>\n` was `'Thinking'` (logit margin +4.75 over rank 1) and `'Okay'`/`'Looking'`/`'Trying'` were also top-10 — all pruned away by the Wikipedia-corpus frequency trim. Every thinking generation started off-distribution. Fix: data-driven protection — teacher-forced HF over diverse engine-generated sequences to collect top-10 missing tokens (772 ids, `chat_protect.npy`), a `--protect-ids` option added to the pruner (`tools/pruner`), re-selected/re-applied the 81920 vocab, and re-gathered the embed/lm-head rows. **Gotcha: `bin/weights/` caches quantized tensors on disk — after any vocab change delete `embed_81920_FP16.bin`/`lmHead_81920_FP16.bin` or every generation is gibberish.** After the re-prune the engine matches unconstrained HF greedy from the very first token (`'Thinking'` — id 40378), thinking closes exactly once, and 6/6 sampled runs at temp 0.6 are structurally clean (previously ~50% broken).
 
-13. **(Resolved) Multi-model support — Qwen3.5 2B.** All model dimensions, the layer spec, and the per-layer quantization now come from the model folder's config.json + quant_config.json (§1, §4.7) — no engine rebuild or shader recompile per model. Three model-specific bugs were found and fixed while enabling the 2B (heads 8 / kvHeads 2 / K 2048 / tied embeddings): the GQA mapping assumption heads == kvHeads² (gotcha 34 — the 9B's 16/4 only worked by coincidence; the stable fix pushes gqa and the real heads as separate push members), the q_proj de-interleave dims (gotcha 33), and prefill pad-token state poisoning (gotcha 38). The 2B runs at ~46 tok/s (all-FP16, 86016-vocab, max_ctx 32768, ~3.5 GB VRAM), greedy-matches HF through long-context decode, and its sampling path is clean past ctx 256 (the exact failure the Reduce-Att2 head-count bug caused). A fresh model dir is bootstrapped by the `--prune` flag, which gathers the 86016-row vocab from the shards via the root `pruned-vocab/mapping.npy` (§4.7, §11).
+13. **(Resolved) Multi-model support — Qwen3.5 2B.** All model dimensions, the layer spec, and the per-layer quantization now come from the model folder's config.json + quant_config.json (§1, §4.7) — no engine rebuild or shader recompile per model. Three model-specific bugs were found and fixed while enabling the 2B (heads 8 / kvHeads 2 / K 2048 / tied embeddings): the GQA mapping assumption heads == kvHeads² (gotcha 34 — the 9B's 16/4 only worked by coincidence; the stable fix pushes gqa and the real heads as separate push members), the q_proj de-interleave dims (gotcha 33), and prefill pad-token state poisoning (gotcha 38). The 2B runs at ~46 tok/s (all-FP16, pruned vocab, max_ctx 32768, ~3.5 GB VRAM), greedy-matches HF through long-context decode, and its sampling path is clean past ctx 256 (the exact failure the Reduce-Att2 head-count bug caused). A fresh model dir is bootstrapped by the `--prune` flag, which gathers the pruned-row vocab from the shards via the root `pruned-vocab/mapping.npy` (§4.7, §11).
 14. **(Resolved) Subgroup portability (wave32 GPUs).** Cross-subgroup scratch arrays were sized TS/64 (wave64) with hardcoded 4-slot combines — out-of-bounds on wave32 devices (RTX 4060: 8 subgroups per 256 threads). All such arrays are now sized (TS+31)/32 with gl_NumSubgroups-bounded combines; RmsNorm-Prologue (whose whole-workgroup-one-subgroup assumption raced on wave32) uses a shared-memory tree reduction; bare subgroupMax/subgroupAdd calls on 64-thread workgroups (Att-SplitK*) were replaced with workgroup-wide shared reductions (gotcha 39). Untested on the actual wave32 hardware end-to-end, but structurally correct.
 15. **(Resolved) Cache-first weight loading.** Every load path checks the on-disk cache (in/weights/<model>/) before opening safetensors: shards are optional (a copied cache runs standalone), vocab weights resolve cache → ocab/ folder → shard, and small vectors (norms / A_log / dt_bias / conv1d) have their own ec_*/conv_* cache entries. One model per process keeps the specialization constant (d_model) consistent with the cached pipelines.
 16. **Vocab re-prune cache invalidation is manual** (gotcha 37). The weight cache keys on (tensor name, dims, quant) — after re-gathering a vocab or editing quant_config.json, delete in/weights/<model>/ or generation silently runs on stale tensors.
@@ -1549,7 +1553,49 @@ probability) is the path to the all-VRAM ~25 tok/s.
     corr 0.998 with gqa 8, all 9 MoE slots >= 0.986) and end-to-end ("2+2" -> "4", a correct
     Rayleigh-scattering paragraph, ~10.7 tok/s decode, EOS-terminated). The 2B and 9B remain green.
     MoE model constraint: layer 0 attention must be `fp16` (the fused decode
-    Embed-RmsNorm-LinearProj op is FP16-only and reads the L0 proj weights as FP16 — an INT8/INT4
+    Embed-RmsNorm-LinearProj op is FP16-only and reads the L0 proj weights as FP16 - an INT8/INT4
     L0 emits NaNs from the first decode step; the 35B quant_config sets layer 0 attn fp16).
+    (Lifted 2026-09: the decode L0 input projection is now quantization-aware — for INT8/INT4 L0
+    the fused op is replaced by Embed-Gather + RmsNorm-LinearProj-SplitK-{INT8,INT4} +
+    Reduce-LinearProj, the same quantized pair prefill already uses; the FP16 path keeps the
+    fused kernel and its trajectory is byte-identical. L0 may now use any precision.)
+
+19. **(Resolved, 2026-09) Coding-domain vocab recovery — pruned vocab grown 86016 → 102400.**
+    The Wikipedia-corpus pruned vocab struggled at coding tasks: code tokens (BPE identifier
+    fragments, operators, keywords, punctuation runs) were largely trimmed away. The fix collects
+    the missing tokens **from the engine itself**, using the 2B at the full 248320-vocab (the only
+    model whose tied embed fits the 8 GB heap unpruned):
+
+    - **`--dump-topp <file>`** (server flag, src/generate.c): when active the lm-head chain is
+      split — `LMHead-GEMV-FP16` runs alone, the full 248320-vocab `logits` buffer is read back,
+      the top-512 `(id, logit)` pairs are selected host-side with a fixed min-heap, and one record
+      `[step u32][count u32][{id u32, logit f32}×count][expSum f64]` is appended and flushed per
+      step (prefill `finalOps` split and a dedicated sequential one-token-per-dispatch decode loop;
+      `generatorSetSampling` forces sampling mode at temperature 1e-9 when the flag is set so the
+      logits buffer is always written). Verified: greedy picks equal dump top-1 token-for-token,
+      trajectory byte-identical to a no-dump run, record count == max_new.
+    - **`tools/vocab_collect/collect.py`**: drives the engine over `prompts.py` (111 coding
+      prompts: python, web, react, php, sql/sql-server/postgres, mongodb, c, c++, go, shell,
+      json/yaml/docker, regex — thinking and non-thinking variants) × 3 seeds × 96 tokens at the
+      Qwen sampling defaults; incrementally parses the dump, computes the exact nucleus
+      (cumulative exp / expSum ≥ top_p 0.95) per step, and unions distinct ids →
+      `pruned-vocab/topp_tokens.json`.
+    - **`tools/vocab_collect/build_vocab.py`**: filters the collected ids to those **missing** from
+      `mapping.npy`, appends them (append-only — every existing pruned id keeps its value), pads
+      with unused original ids up to the next 4096-multiple, and rewrites `mapping.npy` +
+      `tokenizer.json` + `vocab.json` (renumbered; `--backup` writes `.bak` copies, `--dry`
+      previews).
+    - **Result**: 333 runs → 29711 distinct nucleus ids, 13111 missing from the 86016 mapping →
+      `MODEL_VOCAB` 102400 (99127 used, 3273 pad; 90112/94208 were too small per the 4096-multiple
+      rule). Recovered tokens include `=>`, `.get`, `</`, `!=`, `&&`, `<div`, `(function`,
+      `Integer`, `IMPORTANT`, `False`, `Args`.
+    - **Cache/mapping notes**: `include/generated_vocab.h` bumped to 102400 (header edit →
+      `make clean`, gotcha 12); model weight caches deleted so `--prune` re-gathers
+      `embed_102400_FP16.bin` (2B: 419 MB). Old 86016 caches would still load if the header were
+      reverted — the V-suffixed filenames keep all vocab modes coexisting (§4.7). The 9B/35B pick
+      up the same files unchanged; the extra 16384 rows cost ~670 MB per untied FP16 head (§12).
+    - **Validation (2B, --prune, 102400)**: thinking-mode sampled runs produce clean
+      think-open/close + Python code with docstrings; Go / SQL / C++ sampled runs coherent; greedy
+      fluent; no `?` collapse.
 
 .

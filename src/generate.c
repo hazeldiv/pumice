@@ -539,16 +539,59 @@ static void buildLmHead(generator* g, operation* ops, int* n, buffer* input, int
     addOp(ops, n, "ArgMax-Reduce.spv", -1, redBufs, 9, pushR, 4, 1, 1);
 }
 
-static int compileDecodeGroup(generator* g, operation* ops, int splitAttn) {
+static void addDecodeEmbedLinearProj(generator* g, operation* ops, int* n) {
     model_state* st = &g->st;
     model_weights* w = &g->w;
+    const model_dims* d = g->dims;
+    QuantType q = g->spec->layers[0].attn.q;
+
+    if (q == QUANT_FP16) {
+        buffer embedBufs[] = {st->tokenIds, w->embed, w->gammaIn[0], w->proj[0].data, st->qProj, st->kProj, st->vProj, st->zProj, st->aProj, st->bProj, st->embOut};
+        int pushE[] = {1, d->projN, d->K, d->projKOff, d->projVOff, d->projZOff, d->projAOff, d->projBOff, g->vocab};
+        addOp(ops, n, "Embed-RmsNorm-LinearProj-FP16.spv", -1, embedBufs, 11, pushE, 9, (d->projN + 255) / 256, 1);
+        return;
+    }
+
+    buffer gatherBufs[4];
+    gatherBufs[0] = st->tokenIds;
+    gatherBufs[1] = w->embed;
+    gatherBufs[2] = st->embStaged;
+    gatherBufs[3] = st->embOut;
+    int pushG[] = {g->vocab, d->K};
+    addOp(ops, n, "Embed-Gather.spv", -1, gatherBufs, 4, pushG, 2, 1, 1);
+
+    buffer bufs[6];
+    int b = 0;
+    bufs[b++] = st->embStaged;
+    bufs[b++] = w->gammaIn[0];
+    bufs[b++] = w->proj[0].data;
+    bufs[b++] = w->proj[0].scale;
+    bufs[b++] = w->proj[0].zero;
+    bufs[b++] = st->linprojPartial;
+    int push[] = {1, d->projN, d->K};
+    addOp(ops, n, model_shader("RmsNorm-LinearProj-SplitK", q), 0, bufs, b, push, 3,
+          (d->projN + 255) / 256, 4);
+
+    buffer rBufs[7];
+    rBufs[0] = st->linprojPartial;
+    rBufs[1] = st->qProj;
+    rBufs[2] = st->kProj;
+    rBufs[3] = st->vProj;
+    rBufs[4] = st->zProj;
+    rBufs[5] = st->aProj;
+    rBufs[6] = st->bProj;
+    int pushR[] = {d->projN, d->projKOff, d->projVOff, d->projZOff, d->projAOff, d->projBOff};
+    addOp(ops, n, "Reduce-LinearProj.spv", 0, rBufs, 7, pushR, 6,
+          (d->projN + 255) / 256, 1);
+}
+
+static int compileDecodeGroup(generator* g, operation* ops, int splitAttn) {
+    model_state* st = &g->st;
     const model_dims* d = g->dims;
     int n = 0;
 
     for (int p = 0; p < DECODE_GROUP; p++) {
-        buffer embedBufs[] = {st->tokenIds, w->embed, w->gammaIn[0], w->proj[0].data, st->qProj, st->kProj, st->vProj, st->zProj, st->aProj, st->bProj, st->embOut};
-        int pushE[] = {1, d->projN, d->K, d->projKOff, d->projVOff, d->projZOff, d->projAOff, d->projBOff, g->vocab};
-        addOp(ops, &n, "Embed-RmsNorm-LinearProj-FP16.spv", -1, embedBufs, 11, pushE, 9, (d->projN + 255) / 256, 1);
+        addDecodeEmbedLinearProj(g, ops, &n);
 
         for (int L = 0; L < g->layerCount; L++) {
             buildLayer(g, ops, &n, L, 0, 1, splitAttn, 0, 0, 1);
