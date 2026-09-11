@@ -7,6 +7,7 @@
 #include "weights.h"
 #include "safetensors.h"
 #include "gguf.h"
+#include "hqm.h"
 
 static int64_t weightBytes = 0;
 static int verboseWeights = 0;
@@ -22,7 +23,6 @@ static void printProgress(void) {
 }
 
 #define TENSOR_CACHE_MAX 512
-#define TENSOR_FILE_MAGIC 0x54454E53
 
 typedef struct {
     char name[64];
@@ -38,12 +38,14 @@ typedef struct {
 
 static cachedTensor tensorCache[TENSOR_CACHE_MAX];
 static int tensorCacheCount = 0;
-static char cacheDir[256] = "weights";
 
-static const char* quantSuffix(QuantType q) {
-    if (q == QUANT_FP16) return "FP16";
-    if (q == QUANT_INT8) return "INT8";
-    return "INT4";
+static hqm g_hqm;
+static int g_hqmOpen = 0;
+static hqm_writer* g_hqmWriter = NULL;
+static int g_export = 1;
+
+void weightsSetExport(int enabled) {
+    g_export = enabled;
 }
 
 static void fatal(const char* msg) {
@@ -130,70 +132,68 @@ static void cacheRelease(cachedTensor* ct) {
     ct->zero = NULL;
 }
 
-static void tensorWriteFile(const char* path, QuantType q, int rows, int cols, const uint8_t* data, int dataBytes, const float* scale, const float* zero, int scaleCount) {
-    FILE* f = fopen(path, "wb");
-    if (!f) return;
-    int header[4] = {TENSOR_FILE_MAGIC, rows, cols, (int)q};
-    fwrite(header, sizeof(int), 4, f);
-    fwrite(data, 1, dataBytes, f);
-    if (q != QUANT_FP16) {
-        fwrite(scale, sizeof(float), scaleCount, f);
-        fwrite(zero, sizeof(float), scaleCount, f);
-    }
-    fclose(f);
+static int tensorHave(const char* name, QuantType q, int rows, int cols) {
+    (void)rows;
+    (void)cols;
+    if (cacheFind(name, q) != NULL) return 1;
+    return g_hqmOpen;
 }
 
-static cachedTensor* tensorLoadFile(const char* path, const char* name, QuantType q, int rows, int cols, int blocks) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
-    int header[4];
-    if (fread(header, sizeof(int), 4, f) != 4) {
-        fclose(f);
-        return NULL;
-    }
-    if (header[0] != TENSOR_FILE_MAGIC || header[1] != rows || header[2] != cols || header[3] != (int)q) {
-        fclose(f);
-        return NULL;
-    }
-    int dataBytes;
-    if (q == QUANT_FP16) dataBytes = rows * cols * 2;
-    else if (q == QUANT_INT8) dataBytes = rows * cols;
-    else dataBytes = rows * cols / 2;
-    int scaleCount = rows * blocks;
-    uint8_t* data = (uint8_t*)malloc(dataBytes);
+static cachedTensor* hqmReadQuant(const char* name, QuantType q, int rows, int cols, int experts) {
+    const hqm_tensor* t = hqm_tensor_find(&g_hqm, name);
+    if (t == NULL) fatal("hqm missing tensor");
+    int blocks = (cols + 255) / 256;
+    int64_t dataBytes = (q == QUANT_FP16 ? (int64_t)rows * cols * 2 :
+                         q == QUANT_INT8 ? (int64_t)rows * cols :
+                         (int64_t)rows * cols / 2) * experts;
+    int scaleCount = rows * blocks * experts;
+    uint8_t* data = (uint8_t*)hqm_tensor_read(&g_hqm, t, NULL);
+    if (data == NULL) fatal("hqm tensor read error");
     float* scale = NULL;
     float* zero = NULL;
-    if (fread(data, 1, dataBytes, f) != (size_t)dataBytes) {
-        free(data);
-        fclose(f);
-        return NULL;
-    }
     if (q != QUANT_FP16) {
-        scale = (float*)malloc(sizeof(float) * scaleCount);
-        zero = (float*)malloc(sizeof(float) * scaleCount);
-        if (fread(scale, sizeof(float), scaleCount, f) != (size_t)scaleCount ||
-            fread(zero, sizeof(float), scaleCount, f) != (size_t)scaleCount) {
-            free(data);
-            free(scale);
-            free(zero);
-            fclose(f);
-            return NULL;
-        }
+        char sub[96];
+        snprintf(sub, sizeof(sub), "%s.scale", name);
+        const hqm_tensor* ts = hqm_tensor_find(&g_hqm, sub);
+        if (ts == NULL) fatal("hqm missing scale");
+        scale = (float*)hqm_tensor_read(&g_hqm, ts, NULL);
+        snprintf(sub, sizeof(sub), "%s.zero", name);
+        const hqm_tensor* tz = hqm_tensor_find(&g_hqm, sub);
+        if (tz == NULL) fatal("hqm missing zero");
+        zero = (float*)hqm_tensor_read(&g_hqm, tz, NULL);
+        if (scale == NULL || zero == NULL) fatal("hqm scale read error");
     }
-    fclose(f);
-    return cacheStore(name, q, rows, cols, data, dataBytes, scale, zero, scaleCount);
+    return cacheStore(name, q, rows, cols, data, (int)dataBytes, scale, zero, scaleCount);
 }
 
-static cachedTensor* cacheGet(const char* name, QuantType q, int rows, int cols) {
-    cachedTensor* ct = cacheFind(name, q);
-    if (ct != NULL) return ct;
-    int blocks = (cols + 255) / 256;
-    char path[384];
-    snprintf(path, sizeof(path), "%s/%s_%s.bin", cacheDir, name, quantSuffix(q));
-    return tensorLoadFile(path, name, q, rows, cols, blocks);
+static void hqmExportTensor(const cachedTensor* ct) {
+    if (g_hqmWriter == NULL) return;
+    int type = ct->q == QUANT_FP16 ? HQM_T_FP16 : ct->q == QUANT_INT8 ? HQM_T_INT8 : HQM_T_INT4;
+    int64_t dims[2] = {ct->rows, ct->cols};
+    hqm_writer_tensor(g_hqmWriter, ct->name, type, ct->data, ct->dataBytes, dims, 2);
+    if (ct->q != QUANT_FP16) {
+        char sub[96];
+        int64_t sd[1] = {ct->scaleCount};
+        snprintf(sub, sizeof(sub), "%s.scale", ct->name);
+        hqm_writer_tensor(g_hqmWriter, sub, HQM_T_F32, ct->scale, (int64_t)sizeof(float) * ct->scaleCount, sd, 1);
+        snprintf(sub, sizeof(sub), "%s.zero", ct->name);
+        hqm_writer_tensor(g_hqmWriter, sub, HQM_T_F32, ct->zero, (int64_t)sizeof(float) * ct->scaleCount, sd, 1);
+    }
 }
 
-static cachedTensor* tensorBuild(const char* path, const char* name, QuantType q, int rows, int cols, float wscale, const float* mat) {
+static void hqmExportPool(const cachedTensor* ct, int experts) {
+    if (g_hqmWriter == NULL) return;
+    int64_t dims[3] = {experts, ct->rows, ct->cols};
+    hqm_writer_tensor(g_hqmWriter, ct->name, HQM_T_INT4, ct->data, ct->dataBytes, dims, 3);
+    char sub[96];
+    int64_t sd[1] = {ct->scaleCount};
+    snprintf(sub, sizeof(sub), "%s.scale", ct->name);
+    hqm_writer_tensor(g_hqmWriter, sub, HQM_T_F32, ct->scale, (int64_t)sizeof(float) * ct->scaleCount, sd, 1);
+    snprintf(sub, sizeof(sub), "%s.zero", ct->name);
+    hqm_writer_tensor(g_hqmWriter, sub, HQM_T_F32, ct->zero, (int64_t)sizeof(float) * ct->scaleCount, sd, 1);
+}
+
+static cachedTensor* tensorBuild(const char* name, QuantType q, int rows, int cols, float wscale, const float* mat) {
     int blocks = (cols + 255) / 256;
     int scaleCount = rows * blocks;
     int64_t total = (int64_t)rows * cols;
@@ -206,7 +206,6 @@ static cachedTensor* tensorBuild(const char* path, const char* name, QuantType q
         transpose_block16((uint8_t*)w, (uint8_t*)tw, rows, cols, QUANT_FP16);
         free(w);
         ct = cacheStore(name, q, rows, cols, (uint8_t*)tw, (int)(total * 2), NULL, NULL, 0);
-        tensorWriteFile(path, q, rows, cols, ct->data, ct->dataBytes, NULL, NULL, 0);
     } else {
         QuantizedData qd = (q == QUANT_INT8) ? quantizeDataINT8(mat, rows, cols) : quantizeDataINT4(mat, rows, cols);
         if (wscale != 1.0f) {
@@ -220,8 +219,8 @@ static cachedTensor* tensorBuild(const char* path, const char* name, QuantType q
         transpose_block16(qd.data, tw, rows, cols, q);
         free(qd.data);
         ct = cacheStore(name, q, rows, cols, tw, dataBytes, qd.scale, qd.z, scaleCount);
-        tensorWriteFile(path, q, rows, cols, ct->data, ct->dataBytes, ct->scale, ct->zero, ct->scaleCount);
     }
+    hqmExportTensor(ct);
     return ct;
 }
 
@@ -241,12 +240,9 @@ static void loadTensorInto(session s, tensor* t, const char* name, int layer, in
     t->rows = rows;
     t->cols = cols;
 
-    cachedTensor* ct = cacheGet(name, q, rows, cols);
-    if (ct == NULL) {
-        char path[384];
-        snprintf(path, sizeof(path), "%s/%s_%s.bin", cacheDir, name, quantSuffix(q));
-        ct = tensorBuild(path, name, q, rows, cols, wscale, mat);
-    }
+    cachedTensor* ct = cacheFind(name, q);
+    if (ct == NULL && g_hqmOpen) ct = hqmReadQuant(name, q, rows, cols, 1);
+    if (ct == NULL) ct = tensorBuild(name, q, rows, cols, wscale, mat);
 
     t->data = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->data, ct->dataBytes, MEMORY_VRAM, name);
     countBuffer(name, layer, t->data);
@@ -288,8 +284,6 @@ static const sa_tensor* require(const safetensors* sf, const char* name) {
     }
     return t;
 }
-
-#define VEC_FILE_MAGIC 0x56454353
 
 static int findShards(const char* dir, char out[][512], int max);
 
@@ -336,64 +330,25 @@ static void shardSourceClose(void) {
     g_shardState = 0;
 }
 
-static float* loadVecRaw(const char* cacheName, int len) {
-    char path[384];
-    snprintf(path, sizeof(path), "%s/%s.bin", cacheDir, cacheName);
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
-    int header[2];
-    if (fread(header, sizeof(int), 2, f) != 2 || header[0] != VEC_FILE_MAGIC || header[1] != len) {
-        fclose(f);
-        return NULL;
-    }
-    float* v = (float*)malloc(sizeof(float) * len);
-    if (fread(v, sizeof(float), len, f) != (size_t)len) {
-        free(v);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
+static float* hqmReadVec(const char* name, int64_t* outLen) {
+    const hqm_tensor* t = hqm_tensor_find(&g_hqm, name);
+    if (t == NULL) fatal("hqm missing vector");
+    int64_t bytes = 0;
+    float* v = (float*)hqm_tensor_read(&g_hqm, t, &bytes);
+    if (v == NULL) fatal("hqm vector read error");
+    *outLen = bytes / 4;
     return v;
-}
-
-static float* loadVecRawAny(const char* cacheName, int64_t* outLen) {
-    char path[384];
-    snprintf(path, sizeof(path), "%s/%s.bin", cacheDir, cacheName);
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
-    int header[2];
-    if (fread(header, sizeof(int), 2, f) != 2 || header[0] != VEC_FILE_MAGIC || header[1] <= 0) {
-        fclose(f);
-        return NULL;
-    }
-    int len = header[1];
-    float* v = (float*)malloc(sizeof(float) * len);
-    if (fread(v, sizeof(float), len, f) != (size_t)len) {
-        free(v);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-    *outLen = len;
-    return v;
-}
-
-static void saveVecRaw(const char* cacheName, const float* v, int len) {
-    char path[384];
-    snprintf(path, sizeof(path), "%s/%s.bin", cacheDir, cacheName);
-    FILE* f = fopen(path, "wb");
-    if (!f) return;
-    int header[2] = {VEC_FILE_MAGIC, len};
-    fwrite(header, sizeof(int), 2, f);
-    fwrite(v, sizeof(float), len, f);
-    fclose(f);
 }
 
 static buffer loadVecBuffer(session s, const char* hfName, int len, const char* label, int layer, int addOne) {
     char cacheName[80];
     snprintf(cacheName, sizeof(cacheName), "vec_%s_%d", label, layer);
-    float* v = loadVecRaw(cacheName, len);
-    if (v == NULL) {
+    float* v = NULL;
+    if (g_hqmOpen) {
+        int64_t n = 0;
+        v = hqmReadVec(cacheName, &n);
+        if (n != len) fatal("hqm vector length mismatch");
+    } else {
         const safetensors* sf = shardSource();
         const sa_tensor* t = require(sf, hfName);
         int64_t n = 0;
@@ -405,7 +360,10 @@ static buffer loadVecBuffer(session s, const char* hfName, int len, const char* 
         if (g_gguf && strcmp(label, "aLog") == 0) {
             for (int i = 0; i < len; i++) v[i] = logf(-v[i]);
         }
-        saveVecRaw(cacheName, v, len);
+        if (g_hqmWriter != NULL) {
+            int64_t dims[1] = {len};
+            hqm_writer_tensor(g_hqmWriter, cacheName, HQM_T_F32, v, (int64_t)sizeof(float) * len, dims, 1);
+        }
     }
     buffer b = createBufferNamed(s.dev.device, s.dev.physicalDevice, v, sizeof(float) * len, MEMORY_VRAM, label);
     countBuffer(label, layer, b);
@@ -495,9 +453,8 @@ static float* buildQkvMatrix(const safetensors* sf, const char* qn, const char* 
 }
 
 static void loadEmbedLike(session s, const char* const* candPaths, int candCount, const char* hfName, const char* name, int V, int K, buffer* out) {
-    char path[384];
-    snprintf(path, sizeof(path), "%s/%s_%d_FP16.bin", cacheDir, name, V);
-    cachedTensor* ct = tensorLoadFile(path, name, QUANT_FP16, K, V, (V + 255) / 256);
+    cachedTensor* ct = cacheFind(name, QUANT_FP16);
+    if (ct == NULL && g_hqmOpen) ct = hqmReadQuant(name, QUANT_FP16, K, V, 1);
     if (ct == NULL) {
         const sa_tensor* t = NULL;
         safetensors sfCand;
@@ -545,7 +502,7 @@ static void loadEmbedLike(session s, const char* const* candPaths, int candCount
         transpose_block16((uint8_t*)eng, (uint8_t*)tw, K, V, QUANT_FP16);
         free(eng);
         ct = cacheStore(name, QUANT_FP16, K, V, (uint8_t*)tw, K * V * 2, NULL, NULL, 0);
-        tensorWriteFile(path, QUANT_FP16, K, V, ct->data, ct->dataBytes, NULL, NULL, 0);
+        hqmExportTensor(ct);
         if (opened) safetensors_close(&sfCand);
     }
     *out = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->data, ct->dataBytes, MEMORY_VRAM, name);
@@ -557,15 +514,19 @@ static void loadEmbedLike(session s, const char* const* candPaths, int candCount
 static buffer loadConv(session s, const char* name, int layer) {
     char cacheName[80];
     snprintf(cacheName, sizeof(cacheName), "conv_%d", layer);
-    float* v;
+    float* v = NULL;
     int64_t n = 0;
-    v = loadVecRawAny(cacheName, &n);
-    if (v == NULL) {
+    if (g_hqmOpen) {
+        v = hqmReadVec(cacheName, &n);
+    } else {
         const safetensors* sf = shardSource();
         const sa_tensor* t = require(sf, name);
         v = safetensors_load_f32(sf, t, &n);
         if (!v) fatal("conv read error");
-        saveVecRaw(cacheName, v, (int)n);
+        if (g_hqmWriter != NULL) {
+            int64_t dims[1] = {n};
+            hqm_writer_tensor(g_hqmWriter, cacheName, HQM_T_F32, v, n * 4, dims, 1);
+        }
     }
     buffer b = createBufferNamed(s.dev.device, s.dev.physicalDevice, v, sizeof(float) * n, MEMORY_VRAM, cacheName);
     countBuffer("conv", layer, b);
@@ -575,26 +536,10 @@ static buffer loadConv(session s, const char* name, int layer) {
 }
 
 static buffer loadRouterFp16(session s, const char* hfName, int K, int N, const char* cacheName, int layer) {
-    char path[384];
-    snprintf(path, sizeof(path), "%s/%s.bin", cacheDir, cacheName);
     int64_t bytes = (int64_t)K * N * 2;
-    uint16_t* tw = NULL;
-
-    FILE* f = fopen(path, "rb");
-    if (f != NULL) {
-        int header[4];
-        if (fread(header, sizeof(int), 4, f) == 4 &&
-            header[0] == TENSOR_FILE_MAGIC && header[1] == K && header[2] == N && header[3] == (int)QUANT_FP16) {
-            tw = (uint16_t*)malloc((size_t)bytes);
-            if (fread(tw, 1, (size_t)bytes, f) != (size_t)bytes) {
-                free(tw);
-                tw = NULL;
-            }
-        }
-        fclose(f);
-    }
-
-    if (tw == NULL) {
+    cachedTensor* ct = cacheFind(cacheName, QUANT_FP16);
+    if (ct == NULL && g_hqmOpen) ct = hqmReadQuant(cacheName, QUANT_FP16, K, N, 1);
+    if (ct == NULL) {
         const safetensors* sf = shardSource();
         const sa_tensor* t = require(sf, hfName);
         if (t->ndim != 2 || t->shape[0] != N || t->shape[1] != K) fatal("router shape mismatch");
@@ -608,16 +553,16 @@ static buffer loadRouterFp16(session s, const char* hfName, int K, int N, const 
             }
         }
         free(src);
-        tw = (uint16_t*)malloc((size_t)bytes);
+        uint16_t* tw = (uint16_t*)malloc((size_t)bytes);
         transpose_block16((uint8_t*)eng, (uint8_t*)tw, K, N, QUANT_FP16);
         free(eng);
-        tensorWriteFile(path, QUANT_FP16, K, N, (uint8_t*)tw, (int)bytes, NULL, NULL, 0);
+        ct = cacheStore(cacheName, QUANT_FP16, K, N, (uint8_t*)tw, (int)bytes, NULL, NULL, 0);
+        hqmExportTensor(ct);
     }
-
-    buffer b = createBufferNamed(s.dev.device, s.dev.physicalDevice, tw, bytes, MEMORY_VRAM, cacheName);
+    buffer b = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->data, ct->dataBytes, MEMORY_VRAM, cacheName);
     countBuffer(cacheName, layer, b);
     registerWeightBufferSmall(b);
-    free(tw);
+    cacheRelease(ct);
     return b;
 }
 
@@ -706,52 +651,11 @@ static void destroyExpertPool(session s, expert_pool* p) {
     if (p->ramZero.buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, p->ramZero);
 }
 
-static cachedTensor* expertPoolLoadFile(const char* cacheName, QuantType q, int rows, int cols, int experts) {
-    char path[384];
-    snprintf(path, sizeof(path), "%s/%s_%s.bin", cacheDir, cacheName, quantSuffix(q));
-    int blocks = (cols + 255) / 256;
-    int scaleCount = rows * blocks;
-    int64_t dataBytes = (int64_t)rows * cols / 2;
-    int64_t scaleBytes = (int64_t)sizeof(float) * scaleCount * experts;
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
-    int header[5];
-    int ok = (fread(header, sizeof(int), 5, f) == 5 &&
-              header[0] == TENSOR_FILE_MAGIC && header[1] == rows && header[2] == cols &&
-              header[3] == (int)q && header[4] == experts);
-    if (!ok) {
-        fclose(f);
-        return NULL;
-    }
-    uint8_t* data = (uint8_t*)malloc((size_t)(dataBytes * experts));
-    float* scale = (float*)malloc((size_t)scaleBytes);
-    float* zero = (float*)malloc((size_t)scaleBytes);
-    if (fread(data, 1, (size_t)(dataBytes * experts), f) != (size_t)(dataBytes * experts) ||
-        fread(scale, 1, (size_t)scaleBytes, f) != (size_t)scaleBytes ||
-        fread(zero, 1, (size_t)scaleBytes, f) != (size_t)scaleBytes) {
-        free(data);
-        free(scale);
-        free(zero);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-    return cacheStore(cacheName, q, rows, cols, data, (int)(dataBytes * experts), scale, zero, scaleCount * experts);
-}
-
-static void expertPoolWriteFile(const char* cacheName, QuantType q, int rows, int cols, int experts, const uint8_t* data, const float* scale, const float* zero, int scaleCount) {
-    char path[384];
-    snprintf(path, sizeof(path), "%s/%s_%s.bin", cacheDir, cacheName, quantSuffix(q));
-    FILE* f = fopen(path, "wb");
-    if (!f) return;
-    int64_t dataBytes = (int64_t)rows * cols / 2 * experts;
-    int64_t scaleBytes = (int64_t)sizeof(float) * scaleCount;
-    int header[5] = {TENSOR_FILE_MAGIC, rows, cols, (int)q, experts};
-    fwrite(header, sizeof(int), 5, f);
-    fwrite(data, 1, (size_t)dataBytes, f);
-    fwrite(scale, 1, (size_t)scaleBytes, f);
-    fwrite(zero, 1, (size_t)scaleBytes, f);
-    fclose(f);
+static cachedTensor* expertPoolAcquire(const char* cacheName, int rows, int cols, int experts) {
+    cachedTensor* ct = cacheFind(cacheName, QUANT_INT4);
+    if (ct != NULL) return ct;
+    if (g_hqmOpen) return hqmReadQuant(cacheName, QUANT_INT4, rows, cols, experts);
+    return NULL;
 }
 
 static void expertPoolBuildLayer(const safetensors* sf, const char* hfName, int rows, int cols, int experts,
@@ -814,8 +718,8 @@ static void expertPoolBuildLayer(const safetensors* sf, const char* hfName, int 
         free(qd.z);
     }
 
-    expertPoolWriteFile(cacheName, QUANT_INT4, rows, cols, experts, poolData, poolScale, poolZero, scaleCount * experts);
     out->ct = cacheStore(cacheName, QUANT_INT4, rows, cols, poolData, (int)(dataBytes * experts), poolScale, poolZero, scaleCount * experts);
+    hqmExportPool(out->ct, experts);
     snprintf(out->name, sizeof(out->name), "%s", cacheName);
     out->rows = rows;
     out->cols = cols;
@@ -860,106 +764,70 @@ static int findVocabFile(const char* dir, const char* prefix, int V, char* out, 
     return 1;
 }
 
-static int cacheFileExists(const char* name, QuantType q, int rows, int cols) {
-    char path[384];
-    snprintf(path, sizeof(path), "%s/%s_%s.bin", cacheDir, name, quantSuffix(q));
+static int readWholeFile(const char* path, uint8_t** out, int64_t* outLen) {
     FILE* f = fopen(path, "rb");
-    if (!f) return 0;
-    int header[4];
-    int ok = (fread(header, sizeof(int), 4, f) == 4 &&
-              header[0] == TENSOR_FILE_MAGIC && header[1] == rows && header[2] == cols && header[3] == (int)q);
-    fclose(f);
-    return ok;
-}
-
-static int vecCacheExists(const char* cacheName, int len) {
-    char path[384];
-    snprintf(path, sizeof(path), "%s/%s.bin", cacheDir, cacheName);
-    FILE* f = fopen(path, "rb");
-    if (!f) return 0;
-    int header[2];
-    int ok = (fread(header, sizeof(int), 2, f) == 2 &&
-              header[0] == VEC_FILE_MAGIC && header[1] == len);
-    fclose(f);
-    return ok;
-}
-
-static int expertPoolCacheExists(const char* cacheName, int rows, int cols, int experts) {
-    char path[384];
-    snprintf(path, sizeof(path), "%s/%s_INT4.bin", cacheDir, cacheName);
-    FILE* f = fopen(path, "rb");
-    if (!f) return 0;
-    int header[5];
-    int ok = (fread(header, sizeof(int), 5, f) == 5 &&
-              header[0] == TENSOR_FILE_MAGIC && header[1] == rows && header[2] == cols &&
-              header[3] == (int)QUANT_INT4 && header[4] == experts);
-    fclose(f);
-    return ok;
-}
-
-static int cacheComplete(const model_config* spec) {
-    const model_dims* d = &spec->dims;
-    char name[80];
-    if (!vecCacheExists("vec_gammaFinal_-1", d->K)) return 0;
-    snprintf(name, sizeof(name), "embed_%d", d->vocab);
-    if (!cacheFileExists(name, QUANT_FP16, d->K, d->vocab)) return 0;
-    if (!d->tied) {
-        snprintf(name, sizeof(name), "lmHead_%d", d->vocab);
-        if (!cacheFileExists(name, QUANT_FP16, d->K, d->vocab)) return 0;
+    if (f == NULL) return 0;
+    _fseeki64(f, 0, SEEK_END);
+    int64_t n = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+    uint8_t* buf = (uint8_t*)malloc((size_t)n + 1);
+    if (buf == NULL || (n > 0 && fread(buf, 1, (size_t)n, f) != (size_t)n)) {
+        free(buf);
+        fclose(f);
+        return 0;
     }
-    for (int L = 0; L < d->layerCount; L++) {
-        const layer* ly = &spec->layers[L];
-        QuantType q = ly->attn.q;
-        QuantType f = ly->ffn.q;
-        char vecName[80];
-        snprintf(vecName, sizeof(vecName), "vec_gammaIn_%d", L);
-        if (!vecCacheExists(vecName, d->K)) return 0;
-        snprintf(vecName, sizeof(vecName), "vec_gammaF_%d", L);
-        if (!vecCacheExists(vecName, d->K)) return 0;
-        if (ly->attn.type == ATTENTION_FULL) {
-            snprintf(name, sizeof(name), "proj_%d", L);
-            if (!cacheFileExists(name, q, d->K, d->qkvN)) return 0;
-            snprintf(vecName, sizeof(vecName), "vec_qNorm_%d", L);
-            if (!vecCacheExists(vecName, d->headDim)) return 0;
-            snprintf(vecName, sizeof(vecName), "vec_kNorm_%d", L);
-            if (!vecCacheExists(vecName, d->headDim)) return 0;
-        } else {
-            snprintf(name, sizeof(name), "proj_%d", L);
-            if (!cacheFileExists(name, q, d->K, d->projN)) return 0;
-            snprintf(vecName, sizeof(vecName), "conv_%d", L);
-            if (!vecCacheExists(vecName, 4 * d->zqkvN)) return 0;
-            snprintf(vecName, sizeof(vecName), "vec_aLog_%d", L);
-            if (!vecCacheExists(vecName, d->nV)) return 0;
-            snprintf(vecName, sizeof(vecName), "vec_dtBias_%d", L);
-            if (!vecCacheExists(vecName, d->nV)) return 0;
-            snprintf(vecName, sizeof(vecName), "vec_attnNorm_%d", L);
-            if (!vecCacheExists(vecName, d->dim)) return 0;
-        }
-        snprintf(name, sizeof(name), "out_%d", L);
-        if (ly->attn.type == ATTENTION_FULL) {
-            if (!cacheFileExists(name, q, d->qOff, d->K)) return 0;
-        } else {
-            if (!cacheFileExists(name, q, d->nV * d->dim, d->K)) return 0;
-        }
-        if (ly->ffn.type == FFN_SWIGLU) {
-            snprintf(name, sizeof(name), "gate_%d", L);
-            if (!cacheFileExists(name, f, d->K, d->ffnN)) return 0;
-            snprintf(name, sizeof(name), "up_%d", L);
-            if (!cacheFileExists(name, f, d->K, d->ffnN)) return 0;
-            snprintf(name, sizeof(name), "down_%d", L);
-            if (!cacheFileExists(name, f, d->ffnN, d->K)) return 0;
-        } else if (ly->ffn.type == FFN_MOE) {
-            snprintf(name, sizeof(name), "guPool_%d", L);
-            if (!expertPoolCacheExists(name, d->K, 2 * d->moeI, d->experts + 1)) return 0;
-            snprintf(name, sizeof(name), "dnPool_%d", L);
-            if (!expertPoolCacheExists(name, d->moeI, d->K, d->experts + 1)) return 0;
-            snprintf(name, sizeof(name), "router_%d", L);
-            if (!cacheFileExists(name, QUANT_FP16, d->K, d->experts)) return 0;
-            snprintf(name, sizeof(name), "sgGate_%d", L);
-            if (!cacheFileExists(name, QUANT_FP16, d->K, 1)) return 0;
-        }
-    }
+    fclose(f);
+    *out = buf;
+    *outLen = n;
     return 1;
+}
+
+static void exportBytes(hqm_writer* w, const char* dir, const char* name) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    uint8_t* buf = NULL;
+    int64_t n = 0;
+    if (!readWholeFile(path, &buf, &n)) return;
+    int64_t dims[1] = {n};
+    hqm_writer_tensor(w, name, HQM_T_BYTES, buf, n, dims, 1);
+    free(buf);
+}
+
+static void exportTokenizer(hqm_writer* w, const model_config* spec, const char* modelDir, const char* weightDir) {
+    char dir[512];
+    if (spec->pruned) snprintf(dir, sizeof(dir), "%s/vocab", modelDir);
+    else snprintf(dir, sizeof(dir), "%s", modelDir);
+
+    char probe[512];
+    snprintf(probe, sizeof(probe), "%s/tokenizer.json", dir);
+    if (fopen(probe, "rb") != NULL) {
+        exportBytes(w, dir, "tokenizer.json");
+        exportBytes(w, dir, "tokenizer_config.json");
+        exportBytes(w, dir, "vocab.json");
+        if (spec->pruned) exportBytes(w, dir, "mapping.npy");
+        return;
+    }
+
+    if (!gguf_path_is_file(weightDir)) return;
+    gguf g;
+    if (gguf_open(&g, weightDir) != 0) return;
+    char** toks = NULL;
+    char** merges = NULL;
+    int32_t* ttypes = NULL;
+    int64_t nTok = 0, nMerge = 0, nType = 0;
+    if (gguf_meta_str_array(&g, "tokenizer.ggml.tokens", &toks, &nTok)) {
+        hqm_writer_str_array(w, "tokenizer.tokens", (const char* const*)toks, nTok);
+    }
+    if (gguf_meta_str_array(&g, "tokenizer.ggml.merges", &merges, &nMerge)) {
+        hqm_writer_str_array(w, "tokenizer.merges", (const char* const*)merges, nMerge);
+    }
+    if (gguf_meta_i32_array(&g, "tokenizer.ggml.token_type", &ttypes, &nType)) {
+        hqm_writer_i32(w, "tokenizer.token_type", ttypes, nType);
+    }
+    gguf_str_array_free(toks, nTok);
+    gguf_str_array_free(merges, nMerge);
+    free(ttypes);
+    gguf_close(&g);
 }
 
 model_weights createWeights(session s, const model_config* spec, const char* weightDir, int verbose) {
@@ -970,19 +838,35 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     g_wbufsCount = 0;
     g_wbufSession = s;
     cacheClear();
-    snprintf(cacheDir, sizeof(cacheDir), "weights/%s", spec->name);
     snprintf(g_weightDir, sizeof(g_weightDir), "%s", weightDir);
     g_gguf = gguf_path_is_file(weightDir);
     char modelDir[512];
     snprintf(modelDir, sizeof(modelDir), "%s", weightDir);
     if (gguf_path_is_file(weightDir)) gguf_dir_of(weightDir, modelDir, sizeof(modelDir));
-    _mkdir("weights");
-    _mkdir(cacheDir);
 
-    char shardProbe[SA_MAX_FILES][512];
-    int shardCount = findShards(weightDir, shardProbe, SA_MAX_FILES);
-    if (!gguf_path_is_file(weightDir) && shardCount == 0 && !cacheComplete(spec)) {
-        fatal("no safetensors found and weight cache is incomplete");
+    char hqmPath[512];
+    g_hqmOpen = 0;
+    g_hqmWriter = NULL;
+    if (hqm_resolve(spec, weightDir, hqmPath, sizeof(hqmPath))) {
+        if (hqm_open(&g_hqm, hqmPath) != 0) fatal("cannot open hqm");
+        g_hqmOpen = 1;
+        fprintf(stderr, "weights: loading from %s\n", hqmPath);
+    } else if (g_export) {
+        hqm_model_path(spec, weightDir, hqmPath, sizeof(hqmPath));
+        g_hqmWriter = hqm_writer_open(hqmPath);
+        if (g_hqmWriter != NULL) {
+            hqm_write_config(g_hqmWriter, spec);
+        } else {
+            fprintf(stderr, "weights: cannot export %s\n", hqmPath);
+        }
+    }
+
+    if (!g_hqmOpen) {
+        char shardProbe[SA_MAX_FILES][512];
+        int shardCount = findShards(weightDir, shardProbe, SA_MAX_FILES);
+        if (!gguf_path_is_file(weightDir) && shardCount == 0) {
+            fatal("no model source found");
+        }
     }
 
     char headPath[512];
@@ -1089,7 +973,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             lname(n3, sizeof(n3), L, "self_attn.v_proj.weight");
             int cols = 0;
             float* mat = NULL;
-            if (cacheGet(projName, q, d->K, d->qkvN) == NULL) {
+            if (!tensorHave(projName, q, d->K, d->qkvN)) {
                 mat = buildQkvMatrix(shardSource(), n1, n2, n3, d->K, d->headDim, d->heads, &cols);
                 if (cols != d->qkvN) fatal("qkv projection width mismatch");
             }
@@ -1099,7 +983,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             lname(n1, sizeof(n1), L, "self_attn.o_proj.weight");
             const char* on[1] = {n1};
             mat = NULL;
-            if (cacheGet(outName, q, d->qOff, d->K) == NULL) {
+            if (!tensorHave(outName, q, d->qOff, d->K)) {
                 mat = buildEngineMatrix(shardSource(), on, 1, d->qOff, &cols);
                 if (cols != d->K) fatal("o_proj width mismatch");
             }
@@ -1122,7 +1006,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             const char* pn[4] = {n1, n2, n3, n4};
             int cols = 0;
             float* mat = NULL;
-            if (cacheGet(projName, q, d->K, d->projN) == NULL) {
+            if (!tensorHave(projName, q, d->K, d->projN)) {
                 mat = buildEngineMatrix(shardSource(), pn, 4, d->K, &cols);
                 if (cols != d->projN) fatal("delta projection width mismatch");
             }
@@ -1133,7 +1017,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             const char* on[1] = {n1};
             mat = NULL;
             int deltaOutRows = d->nV * d->dim;
-            if (cacheGet(outName, q, deltaOutRows, d->K) == NULL) {
+            if (!tensorHave(outName, q, deltaOutRows, d->K)) {
                 mat = buildEngineMatrix(shardSource(), on, 1, deltaOutRows, &cols);
                 if (cols != d->K) fatal("out_proj width mismatch");
             }
@@ -1151,7 +1035,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             int cols = 0;
             lname(n1, sizeof(n1), L, "mlp.gate_proj.weight");
             float* mat = NULL;
-            if (cacheGet(gateName, f, d->K, d->ffnN) == NULL) {
+            if (!tensorHave(gateName, f, d->K, d->ffnN)) {
                 mat = buildEngineMatrix(shardSource(), gn, 1, d->K, &cols);
                 if (cols != d->ffnN) fatal("gate width mismatch");
             }
@@ -1160,7 +1044,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
 
             lname(n1, sizeof(n1), L, "mlp.up_proj.weight");
             mat = NULL;
-            if (cacheGet(upName, f, d->K, d->ffnN) == NULL) {
+            if (!tensorHave(upName, f, d->K, d->ffnN)) {
                 mat = buildEngineMatrix(shardSource(), gn, 1, d->K, &cols);
             }
             loadTensorInto(s, &w.up[L], upName, L, d->K, d->ffnN, f, 1.0f, mat);
@@ -1168,7 +1052,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
 
             lname(n1, sizeof(n1), L, "mlp.down_proj.weight");
             mat = NULL;
-            if (cacheGet(downName, f, d->ffnN, d->K) == NULL) {
+            if (!tensorHave(downName, f, d->ffnN, d->K)) {
                 mat = buildEngineMatrix(shardSource(), gn, 1, d->ffnN, &cols);
                 if (cols != d->K) fatal("down projection width mismatch");
             }
@@ -1186,7 +1070,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             for (int e = 0; e < d->experts; e++) srcRows[e] = e;
 
             expert_pool_build gu, dn;
-            gu.ct = expertPoolLoadFile(guName, QUANT_INT4, d->K, 2 * d->moeI, poolExperts);
+            gu.ct = expertPoolAcquire(guName, d->K, 2 * d->moeI, poolExperts);
             if (gu.ct == NULL) {
                 lname(n1, sizeof(n1), L, "mlp.experts.gate_up_proj");
                 lname(n2, sizeof(n2), L, "mlp.shared_expert.gate_proj.weight");
@@ -1198,7 +1082,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
                 gu.experts = poolExperts;
             }
 
-            dn.ct = expertPoolLoadFile(dnName, QUANT_INT4, d->moeI, d->K, poolExperts);
+            dn.ct = expertPoolAcquire(dnName, d->moeI, d->K, poolExperts);
             if (dn.ct == NULL) {
                 lname(n1, sizeof(n1), L, "mlp.experts.down_proj");
                 lname(n2, sizeof(n2), L, "mlp.shared_expert.down_proj.weight");
@@ -1222,9 +1106,18 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
         }
     }
 
-    if (g_shardState == 0) fprintf(stderr, "weights: resolved fully from cache\n");
     shardSourceClose();
     cacheClear();
+
+    if (g_hqmWriter != NULL) {
+        exportTokenizer(g_hqmWriter, spec, modelDir, weightDir);
+        hqm_writer_finish(g_hqmWriter);
+        g_hqmWriter = NULL;
+    }
+    if (g_hqmOpen) {
+        hqm_close(&g_hqm);
+        g_hqmOpen = 0;
+    }
 
     weightFlush();
 

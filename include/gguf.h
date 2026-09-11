@@ -15,6 +15,7 @@ typedef struct {
     char str[256];
     int arrType;
     int64_t arrCount;
+    int64_t arrOffset;
 } gguf_kv;
 
 typedef struct {
@@ -44,6 +45,9 @@ int64_t gguf_meta_int(const gguf* g, const char* key, int64_t def);
 double gguf_meta_num(const gguf* g, const char* key, double def);
 const char* gguf_meta_str(const gguf* g, const char* key, const char* def);
 int64_t gguf_meta_arr_count(const gguf* g, const char* key, int64_t def);
+int gguf_meta_str_array(const gguf* g, const char* key, char*** out, int64_t* count);
+void gguf_str_array_free(char** arr, int64_t count);
+int gguf_meta_i32_array(const gguf* g, const char* key, int32_t** out, int64_t* count);
 int gguf_meta_int_arch(const gguf* g, const char* suffix, int64_t def);
 double gguf_meta_num_arch(const gguf* g, const char* suffix, double def);
 const char* gguf_arch(const gguf* g);

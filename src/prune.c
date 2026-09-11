@@ -13,7 +13,6 @@
 #define EMBED_NAME "model.language_model.embed_tokens.weight"
 #define HEAD_NAME "lm_head.weight"
 #define GATHER_CHUNK 8192
-#define TENSOR_FILE_MAGIC 0x54454E53
 
 static void pfatal(const char* msg) {
     fprintf(stderr, "prune: %s\n", msg);
@@ -70,29 +69,6 @@ static void ensureTokenizerFiles(const char* vocabDir, const char* sourceDir) {
         snprintf(path, sizeof(path), "%s/%s", sourceDir, tokFiles[i]);
         if (fopen(path, "rb") != NULL) copyFileTo(path, vocabDir);
     }
-}
-
-static int cacheHeaderMatches(const char* path, int rows, int cols) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return 0;
-    int header[4];
-    int ok = (fread(header, sizeof(int), 4, f) == 4 &&
-              header[0] == TENSOR_FILE_MAGIC && header[1] == rows &&
-              header[2] == cols && header[3] == (int)QUANT_FP16);
-    fclose(f);
-    return ok;
-}
-
-static int embedCacheValid(const char* modelName, int K, int V) {
-    char path[512];
-    snprintf(path, sizeof(path), "weights/%s/embed_%d_FP16.bin", modelName, V);
-    return cacheHeaderMatches(path, K, V);
-}
-
-static int headCacheValid(const char* modelName, int K, int V) {
-    char path[512];
-    snprintf(path, sizeof(path), "weights/%s/lmHead_%d_FP16.bin", modelName, V);
-    return cacheHeaderMatches(path, K, V);
 }
 
 static int vocabFileExists(const char* dir, const char* prefix) {
@@ -200,13 +176,6 @@ int pruneVocab(const char* modelPath, const model_config* spec) {
 
     char vocabDir[512];
     snprintf(vocabDir, sizeof(vocabDir), "%s/vocab", modelDir);
-
-    if (embedCacheValid(spec->name, d->K, d->vocab) &&
-        (d->tied || headCacheValid(spec->name, d->K, d->vocab))) {
-        ensureTokenizerFiles(vocabDir, PRUNED_VOCAB_DIR);
-        fprintf(stderr, "prune: weight cache present, skipping gather\n");
-        return 0;
-    }
 
     int needEmbed = !vocabFileExists(modelDir, "embed_tokens");
     int needHead = !d->tied && !vocabFileExists(modelDir, "lm_head");

@@ -9,6 +9,7 @@
 #include "generate.h"
 #include "prune.h"
 #include "gguf.h"
+#include "hqm.h"
 
 static const char* argval(int argc, char** argv, const char* name, const char* def) {
     for (int i = 1; i + 1 < argc; i++) {
@@ -65,8 +66,11 @@ void serverMain(int argc, char** argv) {
 
     static model_config spec;
     loadModelConfig(&spec, weightDir, maxCtxOverride, doPrune);
-    if (doPrune) pruneVocab(weightDir, &spec);
-    parseEos(&spec.dims, weightDir, doPrune);
+    char hqmPath[512];
+    int hqmSource = hqm_resolve(&spec, weightDir, hqmPath, sizeof(hqmPath));
+    if (doPrune && !hqmSource) pruneVocab(weightDir, &spec);
+    parseEos(&spec.dims, hqmSource ? hqmPath : weightDir, doPrune);
+    weightsSetExport(argflag(argc, argv, "--no-export") ? 0 : 1);
     int expertsVram = atoi(argval(argc, argv, "--experts-vram", "0"));
     if (expertsVram > 0) spec.expertsVram = expertsVram;
 

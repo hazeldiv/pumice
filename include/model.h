@@ -83,6 +83,7 @@ typedef struct model_config {
     QuantType embedQ;
     QuantType lmHeadQ;
     int expertsVram;
+    int pruned;
 } model_config;
 
 int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride, int pruned);

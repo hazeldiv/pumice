@@ -73,12 +73,13 @@ static int scalar_size(int type) {
     }
 }
 
-static int skip_array(FILE* f, int* elemType, int64_t* count) {
+static int skip_array(FILE* f, int* elemType, int64_t* count, int64_t* offset) {
     uint32_t et;
     uint64_t n;
     if (!rd_u32(f, &et) || !rd_u64(f, &n)) return 0;
     *elemType = (int)et;
     *count = (int64_t)n;
+    *offset = _ftelli64(f);
     if (et == GGUF_STRING) {
         for (uint64_t i = 0; i < n; i++) {
             if (!rd_string(f, NULL, 0)) return 0;
@@ -144,7 +145,7 @@ static int read_value(FILE* f, int type, gguf_kv* kv) {
         case GGUF_STRING:
             return rd_string(f, kv->str, (int)sizeof(kv->str));
         case GGUF_ARRAY:
-            return skip_array(f, &kv->arrType, &kv->arrCount);
+            return skip_array(f, &kv->arrType, &kv->arrCount, &kv->arrOffset);
         case GGUF_UINT64: {
             uint64_t v;
             if (!rd(f, &v, 8)) return 0;
@@ -320,6 +321,80 @@ int64_t gguf_meta_arr_count(const gguf* g, const char* key, int64_t def) {
     const gguf_kv* kv = gguf_kv_find(g, key);
     if (kv == NULL || kv->type != GGUF_ARRAY) return def;
     return kv->arrCount;
+}
+
+void gguf_str_array_free(char** arr, int64_t count) {
+    if (arr == NULL) return;
+    for (int64_t i = 0; i < count; i++) free(arr[i]);
+    free(arr);
+}
+
+int gguf_meta_str_array(const gguf* g, const char* key, char*** out, int64_t* count) {
+    const gguf_kv* kv = gguf_kv_find(g, key);
+    if (kv == NULL || kv->type != GGUF_ARRAY || kv->arrType != GGUF_STRING || kv->arrCount <= 0) return 0;
+    FILE* f = fopen(g->path, "rb");
+    if (f == NULL) return 0;
+    if (_fseeki64(f, kv->arrOffset, SEEK_SET) != 0) {
+        fclose(f);
+        return 0;
+    }
+    char** arr = (char**)calloc((size_t)kv->arrCount, sizeof(char*));
+    if (arr == NULL) {
+        fclose(f);
+        return 0;
+    }
+    for (int64_t i = 0; i < kv->arrCount; i++) {
+        uint64_t n;
+        if (!rd_u64(f, &n) || n > (1u << 24)) {
+            gguf_str_array_free(arr, i);
+            fclose(f);
+            return 0;
+        }
+        arr[i] = (char*)malloc((size_t)n + 1);
+        if (arr[i] == NULL) {
+            gguf_str_array_free(arr, i);
+            fclose(f);
+            return 0;
+        }
+        if (n > 0 && !rd(f, arr[i], (size_t)n)) {
+            free(arr[i]);
+            arr[i] = NULL;
+            gguf_str_array_free(arr, i);
+            fclose(f);
+            return 0;
+        }
+        arr[i][n] = '\0';
+    }
+    fclose(f);
+    *out = arr;
+    *count = kv->arrCount;
+    return 1;
+}
+
+int gguf_meta_i32_array(const gguf* g, const char* key, int32_t** out, int64_t* count) {
+    const gguf_kv* kv = gguf_kv_find(g, key);
+    if (kv == NULL || kv->type != GGUF_ARRAY || kv->arrCount <= 0) return 0;
+    if (kv->arrType != GGUF_INT32 && kv->arrType != GGUF_UINT32) return 0;
+    FILE* f = fopen(g->path, "rb");
+    if (f == NULL) return 0;
+    if (_fseeki64(f, kv->arrOffset, SEEK_SET) != 0) {
+        fclose(f);
+        return 0;
+    }
+    int32_t* arr = (int32_t*)malloc(sizeof(int32_t) * (size_t)kv->arrCount);
+    if (arr == NULL) {
+        fclose(f);
+        return 0;
+    }
+    if (fread(arr, 4, (size_t)kv->arrCount, f) != (size_t)kv->arrCount) {
+        free(arr);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    *out = arr;
+    *count = kv->arrCount;
+    return 1;
 }
 
 const char* gguf_arch(const gguf* g) {

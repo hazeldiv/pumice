@@ -105,10 +105,9 @@ def _gguf_tokenizer_meta(path):
     return tokens, merges, token_type
 
 
-def _tokenizer_from_gguf(path):
-    tokens, merges, token_type = _gguf_tokenizer_meta(path)
+def _tokenizer_from_parts(tokens, merges, token_type):
     if not tokens:
-        raise RuntimeError(f"gguf has no tokenizer vocab: {path}")
+        raise RuntimeError("tokenizer has no vocab")
     vocab = {tok: i for i, tok in enumerate(tokens)}
     pairs = []
     for m in merges or []:
@@ -128,6 +127,97 @@ def _tokenizer_from_gguf(path):
     return tokenizer
 
 
+def _tokenizer_from_gguf(path):
+    return _tokenizer_from_parts(*_gguf_tokenizer_meta(path))
+
+
+def _hqm_meta(path):
+    with open(path, "rb") as f:
+        r = _GgufReader(f)
+        magic = r.read(4)
+        if magic[:3] != b"HQM":
+            raise RuntimeError(f"not an hqm file: {path}")
+        r.u32()
+        n_tensors = r.u64()
+        n_kv = r.u64()
+        kvs = {}
+        for _ in range(n_kv):
+            key = r.string()
+            vtype = r.u32()
+            if vtype == 8:
+                kvs[key] = r.string()
+            elif vtype == 12:
+                kvs[key] = struct.unpack("<d", r.read(8))[0]
+            elif vtype in (4, 7):
+                kvs[key] = struct.unpack("<I", r.read(4))[0]
+            elif vtype == 10:
+                kvs[key] = r.u64()
+            else:
+                raise RuntimeError(f"unknown hqm kv type {vtype}")
+        tensors = {}
+        for _ in range(n_tensors):
+            name = r.string()
+            ndim = r.u32()
+            dims = [r.u64() for _ in range(ndim)]
+            ttype = r.u32()
+            offset = r.u64()
+            tensors[name] = (ttype, dims, offset)
+        data_offset = kvs["hqm.data_offset"]
+    return kvs, tensors, data_offset
+
+
+def _hqm_read_tensor(path, tensors, data_offset, name):
+    ttype, dims, offset = tensors[name]
+    size = 1
+    for d in dims:
+        size *= d
+    if ttype == 0:
+        nbytes = size * 4
+    elif ttype == 1:
+        nbytes = size * 2
+    elif ttype in (2, 4):
+        nbytes = size
+    elif ttype == 3:
+        nbytes = size // 2
+    elif ttype == 5:
+        nbytes = size * 4
+    else:
+        raise RuntimeError(f"unknown hqm tensor type {ttype}")
+    with open(path, "rb") as f:
+        f.seek(data_offset + offset)
+        return f.read(nbytes)
+
+
+def _read_str_array(raw):
+    count = struct.unpack_from("<I", raw, 0)[0]
+    pos = 4
+    out = []
+    for _ in range(count):
+        length = struct.unpack_from("<I", raw, pos)[0]
+        pos += 4
+        out.append(raw[pos:pos + length].decode("utf-8", errors="replace"))
+        pos += length
+    return out
+
+
+def _tokenizer_from_hqm(path):
+    kvs, tensors, data_offset = _hqm_meta(path)
+    if "tokenizer.json" in tensors:
+        raw = _hqm_read_tensor(path, tensors, data_offset, "tokenizer.json")
+        return Tokenizer.from_str(raw.decode("utf-8"))
+    if "tokenizer.tokens" in tensors:
+        tokens = _read_str_array(_hqm_read_tensor(path, tensors, data_offset, "tokenizer.tokens"))
+        merges = None
+        if "tokenizer.merges" in tensors:
+            merges = _read_str_array(_hqm_read_tensor(path, tensors, data_offset, "tokenizer.merges"))
+        token_type = None
+        if "tokenizer.token_type" in tensors:
+            raw = _hqm_read_tensor(path, tensors, data_offset, "tokenizer.token_type")
+            token_type = list(struct.unpack("<%di" % (len(raw) // 4), raw))
+        return _tokenizer_from_parts(tokens, merges, token_type)
+    raise RuntimeError(f"hqm has no tokenizer: {path}")
+
+
 def _read_u32(proc):
     raw = proc.stdout.read(4)
     if len(raw) != 4:
@@ -135,15 +225,17 @@ def _read_u32(proc):
     return struct.unpack("<I", raw)[0]
 
 
-def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0):
+def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0, export=True):
     import shutil
     weight_path = Path(weight_dir).resolve()
     is_gguf = weight_path.is_file() and weight_path.suffix.lower() == ".gguf"
-    model_dir = weight_path.parent if is_gguf else weight_path
+    is_hqm = weight_path.is_file() and weight_path.suffix.lower() == ".hqm"
+    model_dir = weight_path.parent if (is_gguf or is_hqm) else weight_path
+    do_prune = prune_vocab and not is_hqm
 
-    tokenizer_path = (model_dir / "vocab" / "tokenizer.json") if prune_vocab else (model_dir / "tokenizer.json")
+    tokenizer_path = (model_dir / "vocab" / "tokenizer.json") if do_prune else (model_dir / "tokenizer.json")
 
-    if prune_vocab and not tokenizer_path.exists():
+    if do_prune and not tokenizer_path.exists():
         vocab_dir = model_dir / "vocab"
         vocab_dir.mkdir(parents=True, exist_ok=True)
         for name in ("tokenizer.json", "tokenizer_config.json", "vocab.json"):
@@ -151,7 +243,9 @@ def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump
             if src.exists():
                 shutil.copy(src, vocab_dir / name)
 
-    if tokenizer_path.exists():
+    if is_hqm:
+        tokenizer = _tokenizer_from_hqm(weight_path)
+    elif tokenizer_path.exists():
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
     elif is_gguf:
         tokenizer = _tokenizer_from_gguf(weight_path)
@@ -170,12 +264,14 @@ def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump
     ]
     if is_gguf:
         cmd += ["--gguf"]
+    if not export:
+        cmd += ["--no-export"]
     if dump_dir is not None:
         Path(dump_dir).mkdir(parents=True, exist_ok=True)
         cmd += ["--dump", str(dump_dir), "--dump-layers", str(dump_layers)]
     if debug_sampling:
         cmd += ["--debug-sampling"]
-    if prune_vocab:
+    if do_prune:
         cmd += ["--prune"]
     if experts_vram > 0:
         cmd += ["--experts-vram", str(experts_vram)]
@@ -274,9 +370,10 @@ def close(llm):
 
 
 def _main():
-    args = [a for a in sys.argv[1:] if a not in ("--think", "--prune") and not a.startswith("--experts-vram")]
+    args = [a for a in sys.argv[1:] if a not in ("--think", "--prune", "--no-export") and not a.startswith("--experts-vram")]
     thinking = "--think" in sys.argv[1:]
     prune = "--prune" in sys.argv[1:]
+    export = "--no-export" not in sys.argv[1:]
     evram = 0
     for i, a in enumerate(sys.argv[1:]):
         if a == "--experts-vram" and i + 2 < len(sys.argv):
@@ -287,7 +384,7 @@ def _main():
     if text is None:
         return
 
-    llm = start_llm(weight_dir, max_ctx=max_ctx, max_new_tokens=16384, prune_vocab=prune, experts_vram=evram)
+    llm = start_llm(weight_dir, max_ctx=max_ctx, max_new_tokens=16384, prune_vocab=prune, experts_vram=evram, export=export)
     ids = tokenize(llm, text, thinking)
     decoded_ids = []
     prev = ""

@@ -58,6 +58,7 @@ typedef struct model_weights {
 } model_weights;
 
 model_weights createWeights(session s, const model_config* spec, const char* weightDir, int verbose);
+void weightsSetExport(int enabled);
 void destroyWeights(session s, model_weights* w);
 
 #endif

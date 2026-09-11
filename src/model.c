@@ -5,6 +5,7 @@
 #include "model.h"
 #include "json.h"
 #include "gguf.h"
+#include "hqm.h"
 #include "generated_vocab.h"
 
 const char* model_shader(const char* base, QuantType q) {
@@ -61,6 +62,13 @@ static int eosFromTokenizerJson(model_dims* d, const char* modelDir, const char*
 }
 
 int parseEos(model_dims* d, const char* modelDir, int pruned) {
+    if (hqm_path_is_file(modelDir)) {
+        hqm h;
+        if (hqm_open(&h, modelDir) != 0) cfg_fatal("cannot parse hqm");
+        d->eos = (int)hqm_meta_int(&h, "hqm.eos", d->eos);
+        hqm_close(&h);
+        return 0;
+    }
     if (!pruned && gguf_path_is_file(modelDir)) {
         gguf g;
         if (gguf_open(&g, modelDir) != 0) cfg_fatal("cannot open gguf");
@@ -240,6 +248,7 @@ static void loadGgufConfig(model_config* cfg, const char* ggufPath, int maxCtxOv
     }
     d->vocab = pruned ? MODEL_VOCAB : (int)vocab;
     if (d->vocab <= 0) cfg_fatal("invalid vocab size");
+    cfg->pruned = pruned;
 
     int maxPos = (int)gguf_meta_int_arch(&g, "context_length", 0);
     validateDims(d);
@@ -251,7 +260,80 @@ static void loadGgufConfig(model_config* cfg, const char* ggufPath, int maxCtxOv
     gguf_close(&g);
 }
 
+static void loadHqmConfig(model_config* cfg, const char* hqmPath, int maxCtxOverride) {
+    memset(cfg, 0, sizeof(model_config));
+
+    hqm h;
+    if (hqm_open(&h, hqmPath) != 0) cfg_fatal("cannot parse hqm");
+
+    model_dims* d = &cfg->dims;
+    snprintf(cfg->name, sizeof(cfg->name), "%s", hqm_meta_str(&h, "general.name", "model"));
+    snprintf(cfg->shaderDir, sizeof(cfg->shaderDir), "%s", hqm_meta_str(&h, "hqm.shader_dir", ""));
+    d->K = (int)hqm_meta_int(&h, "hqm.K", 0);
+    d->layerCount = (int)hqm_meta_int(&h, "hqm.layer_count", 0);
+    d->ffnN = (int)hqm_meta_int(&h, "hqm.ffn", 0);
+    d->heads = (int)hqm_meta_int(&h, "hqm.heads", 0);
+    d->kvHeads = (int)hqm_meta_int(&h, "hqm.kv_heads", 0);
+    d->headDim = (int)hqm_meta_int(&h, "hqm.head_dim", 0);
+    int rotaryDim = (int)hqm_meta_int(&h, "hqm.rotary_dim", 0);
+    d->ropeTheta = hqm_meta_num(&h, "hqm.rope_theta", 1e7);
+    d->partialRotary = d->headDim > 0 ? (double)rotaryDim / d->headDim : 0.25;
+    d->nQk = (int)hqm_meta_int(&h, "hqm.n_qk", 0);
+    d->nV = (int)hqm_meta_int(&h, "hqm.n_v", 0);
+    d->dim = (int)hqm_meta_int(&h, "hqm.dim", 0);
+    d->convHist = (int)hqm_meta_int(&h, "hqm.conv_hist", 3);
+    d->vocab = (int)hqm_meta_int(&h, "hqm.vocab", 0);
+    d->eos = (int)hqm_meta_int(&h, "hqm.eos", 0);
+    d->tied = (int)hqm_meta_int(&h, "hqm.tied", 0);
+    d->maxCtx = (int)hqm_meta_int(&h, "hqm.max_ctx", 32768);
+    d->prefillChunk = (int)hqm_meta_int(&h, "hqm.prefill_chunk", 512);
+    d->experts = (int)hqm_meta_int(&h, "hqm.experts", 0);
+    d->expertsPerTok = (int)hqm_meta_int(&h, "hqm.experts_per_tok", 0);
+    d->moeI = (int)hqm_meta_int(&h, "hqm.moe_i", 0);
+    if (d->ffnN <= 0 && d->moeI > 0) d->ffnN = d->moeI;
+    cfg->embedQ = (QuantType)hqm_meta_int(&h, "hqm.embed_quant", QUANT_FP16);
+    cfg->lmHeadQ = (QuantType)hqm_meta_int(&h, "hqm.lm_head_quant", QUANT_FP16);
+    cfg->expertsVram = (int)hqm_meta_int(&h, "hqm.experts_vram", d->experts);
+    cfg->pruned = (int)hqm_meta_int(&h, "hqm.pruned", 0);
+
+    validateDims(d);
+    deriveDims(d);
+
+    const hqm_tensor* lt = hqm_tensor_find(&h, "config.layer_type");
+    const hqm_tensor* la = hqm_tensor_find(&h, "config.layer_attn_quant");
+    const hqm_tensor* lf = hqm_tensor_find(&h, "config.layer_ffn_quant");
+    if (lt == NULL || la == NULL || lf == NULL) cfg_fatal("hqm missing layer config");
+    int64_t n1 = 0, n2 = 0, n3 = 0;
+    int32_t* types = (int32_t*)hqm_tensor_read(&h, lt, &n1);
+    int32_t* aq = (int32_t*)hqm_tensor_read(&h, la, &n2);
+    int32_t* fq = (int32_t*)hqm_tensor_read(&h, lf, &n3);
+    if (types == NULL || aq == NULL || fq == NULL ||
+        n1 / 4 != d->layerCount || n2 / 4 != d->layerCount || n3 / 4 != d->layerCount) {
+        cfg_fatal("hqm layer config mismatch");
+    }
+    for (int i = 0; i < d->layerCount; i++) {
+        cfg->layers[i].attn.type = (attention_type)types[i];
+        cfg->layers[i].attn.q = (QuantType)aq[i];
+        cfg->layers[i].ffn.type = d->experts > 0 ? FFN_MOE : FFN_SWIGLU;
+        cfg->layers[i].ffn.q = (QuantType)fq[i];
+    }
+    free(types);
+    free(aq);
+    free(fq);
+
+    if (maxCtxOverride > 0) d->maxCtx = maxCtxOverride;
+    if (d->maxCtx < 1) cfg_fatal("invalid max_ctx");
+    if (cfg->expertsVram < 1 || (d->experts > 0 && cfg->expertsVram > d->experts)) {
+        cfg->expertsVram = d->experts;
+    }
+    hqm_close(&h);
+}
+
 int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride, int pruned) {
+    if (hqm_path_is_file(modelDir)) {
+        loadHqmConfig(cfg, modelDir, maxCtxOverride);
+        return 0;
+    }
     if (gguf_path_is_file(modelDir)) {
         loadGgufConfig(cfg, modelDir, maxCtxOverride, pruned);
         return 0;
@@ -322,6 +404,7 @@ int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride,
 
     d->vocab = pruned ? MODEL_VOCAB : hfVocab;
     if (d->vocab <= 0) cfg_fatal("invalid vocab size");
+    cfg->pruned = pruned;
 
     loadQuantConfig(cfg, modelDir, maxCtxOverride, maxPos);
 
