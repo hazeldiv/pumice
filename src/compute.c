@@ -8,6 +8,7 @@
 #include "model.h"
 #include "generate.h"
 #include "prune.h"
+#include "gguf.h"
 
 static const char* argval(int argc, char** argv, const char* name, const char* def) {
     for (int i = 1; i + 1 < argc; i++) {
@@ -42,6 +43,11 @@ static void emitToken(uint32_t token, void* ctx) {
 
 void serverMain(int argc, char** argv) {
     const char* weightDir = argval(argc, argv, "--weights", "../model/Qwen3.5-9B");
+    int forceGguf = argflag(argc, argv, "--gguf");
+    if (forceGguf && !gguf_path_is_file(weightDir)) {
+        fprintf(stderr, "server: --gguf given but %s is not a gguf file\n", weightDir);
+        exit(1);
+    }
     int maxCtxOverride = atoi(argval(argc, argv, "--max-ctx", "0"));
     int maxNew = atoi(argval(argc, argv, "--max-new", "128"));
     const char* dumpDir = argval(argc, argv, "--dump", NULL);

@@ -287,6 +287,19 @@ float* safetensors_load_f32(const safetensors* sf, const sa_tensor* t, int64_t* 
             for (int64_t i = 0; i < c; i++) out[done + i] = bf16_to_float(chunk[i]);
             done += c;
         }
+    } else if (t->dtype == SA_DTYPE_F16) {
+        uint16_t chunk[8192];
+        int64_t done = 0;
+        while (done < n) {
+            int64_t c = n - done;
+            if (c > 8192) c = 8192;
+            if (fread(chunk, sizeof(uint16_t), (size_t)c, f) != (size_t)c) {
+                free(out);
+                return NULL;
+            }
+            for (int64_t i = 0; i < c; i++) out[done + i] = fp16_to_float(chunk[i]);
+            done += c;
+        }
     } else {
         free(out);
         return NULL;

@@ -4,6 +4,7 @@
 #include <math.h>
 #include "model.h"
 #include "json.h"
+#include "gguf.h"
 #include "generated_vocab.h"
 
 const char* model_shader(const char* base, QuantType q) {
@@ -60,9 +61,23 @@ static int eosFromTokenizerJson(model_dims* d, const char* modelDir, const char*
 }
 
 int parseEos(model_dims* d, const char* modelDir, int pruned) {
+    if (!pruned && gguf_path_is_file(modelDir)) {
+        gguf g;
+        if (gguf_open(&g, modelDir) != 0) cfg_fatal("cannot open gguf");
+        const gguf_kv* kv = gguf_kv_find(&g, "tokenizer.ggml.eos_token_id");
+        if (kv == NULL) cfg_fatal("gguf missing eos token id");
+        d->eos = (int)kv->ival;
+        gguf_close(&g);
+        return 0;
+    }
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s", modelDir);
+    if (gguf_path_is_file(modelDir)) gguf_dir_of(modelDir, dir, sizeof(dir));
+
     char path[512];
     const char* cfgName = pruned ? "vocab/tokenizer_config.json" : "tokenizer_config.json";
-    snprintf(path, sizeof(path), "%s/%s", modelDir, cfgName);
+    snprintf(path, sizeof(path), "%s/%s", dir, cfgName);
     json_value* tc = json_parse_file(path);
     if (tc == NULL) {
         char msg[256];
@@ -79,7 +94,7 @@ int parseEos(model_dims* d, const char* modelDir, int pruned) {
     json_free(tc);
 
     if (pruned) {
-        if (!eosFromVocabJson(d, modelDir, eosName)) {
+        if (!eosFromVocabJson(d, dir, eosName)) {
             char msg[256];
             snprintf(msg, sizeof(msg), "eos token %s not found in vocab/vocab.json", eosName);
             cfg_fatal(msg);
@@ -88,7 +103,7 @@ int parseEos(model_dims* d, const char* modelDir, int pruned) {
     }
 
     char vocabPath[512];
-    snprintf(vocabPath, sizeof(vocabPath), "%s/vocab.json", modelDir);
+    snprintf(vocabPath, sizeof(vocabPath), "%s/vocab.json", dir);
     json_value* vj = json_parse_file(vocabPath);
     if (vj != NULL && vj->type == JSON_OBJECT) {
         json_value* eosId = json_get(vj, eosName);
@@ -99,7 +114,7 @@ int parseEos(model_dims* d, const char* modelDir, int pruned) {
         }
         json_free(vj);
     }
-    if (!eosFromTokenizerJson(d, modelDir, eosName)) {
+    if (!eosFromTokenizerJson(d, dir, eosName)) {
         char msg[256];
         snprintf(msg, sizeof(msg), "eos token %s not found", eosName);
         cfg_fatal(msg);
@@ -107,7 +122,141 @@ int parseEos(model_dims* d, const char* modelDir, int pruned) {
     return 0;
 }
 
+static void deriveDims(model_dims* d) {
+    d->rotaryDim = (int)(d->headDim * d->partialRotary);
+    d->rotaryHalf = d->rotaryDim / 2;
+    d->qOff = d->heads * d->headDim;
+    d->gOff = d->qOff;
+    d->kOff = (d->heads + d->heads) * d->headDim;
+    d->vOff = (d->heads + d->heads + d->kvHeads) * d->headDim;
+    d->qkvN = d->vOff + d->kvHeads * d->headDim;
+    d->kvRows = d->kvHeads * d->headDim;
+    d->projKOff = d->nQk * d->dim;
+    d->projVOff = d->projKOff + d->nQk * d->dim;
+    d->projZOff = d->projVOff + d->nV * d->dim;
+    d->projAOff = d->projZOff + d->nV * d->dim;
+    d->projBOff = d->projAOff + d->nV;
+    d->projN = d->projBOff + d->nV;
+    d->zqkvN = 2 * d->nQk * d->dim + d->nV * d->dim;
+}
+
+static void validateDims(const model_dims* d) {
+    if (d->K <= 0 || d->layerCount <= 0 || d->heads <= 0 || d->kvHeads <= 0 ||
+        d->headDim <= 0 || d->ffnN <= 0 || d->nQk <= 0 || d->nV <= 0 || d->dim <= 0) {
+        cfg_fatal("missing or invalid dimensions");
+    }
+    if (d->heads % d->kvHeads != 0) cfg_fatal("heads not divisible by kv_heads");
+    if (d->nV % d->nQk != 0) cfg_fatal("n_v not divisible by n_qk");
+    if (d->layerCount > MODEL_MAX_LAYERS) cfg_fatal("too many layers");
+    if (d->convHist < 1) cfg_fatal("invalid linear_conv_kernel_dim");
+    if (d->experts > 256) cfg_fatal("too many experts");
+    if (d->experts > 0 && d->expertsPerTok != 8) cfg_fatal("only top-8 routing supported");
+    if (d->experts > 0 && d->moeI <= 0) cfg_fatal("moe_intermediate_size missing");
+}
+
+static void loadQuantConfig(model_config* cfg, const char* dir, int maxCtxOverride, int maxPos) {
+    model_dims* d = &cfg->dims;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/quant_config.json", dir);
+    json_value* qc = json_parse_file(path);
+    if (qc == NULL) cfg_fatal("cannot parse quant_config.json");
+
+    d->maxCtx = json_get_int(qc, "max_ctx", 0);
+    if (d->maxCtx <= 0) d->maxCtx = json_get_int(qc, "max-ctx", 32768);
+    if (maxCtxOverride > 0) d->maxCtx = maxCtxOverride;
+    if (d->maxCtx < 1) cfg_fatal("invalid max_ctx");
+    if (maxPos > 0 && d->maxCtx > maxPos) {
+        fprintf(stderr, "max_ctx %d exceeds max_position_embeddings %d, clamping\n", d->maxCtx, maxPos);
+        d->maxCtx = maxPos;
+    }
+    d->prefillChunk = json_get_int(qc, "prefill_chunk", 512);
+
+    const char* combined = json_get_str(qc, "embed/lm_head", NULL);
+    cfg->embedQ = parse_quant(combined ? combined : json_get_str(qc, "embed", "fp16"), QUANT_FP16);
+    cfg->lmHeadQ = parse_quant(combined ? combined : json_get_str(qc, "lm_head", "fp16"), QUANT_FP16);
+
+    json_value* layers = json_get(qc, "layers");
+    if (layers == NULL || layers->type != JSON_ARRAY || layers->count != d->layerCount) {
+        cfg_fatal("quant_config.json layers mismatch");
+    }
+    for (int i = 0; i < d->layerCount; i++) {
+        json_value* ly = &layers->items[i];
+        cfg->layers[i].attn.q = parse_quant(json_get_str(ly, "attn", "fp16"), QUANT_FP16);
+        cfg->layers[i].ffn.q = parse_quant(json_get_str(ly, "ffn", "fp16"), QUANT_FP16);
+        cfg->layers[i].ffn.type = d->experts > 0 ? FFN_MOE : FFN_SWIGLU;
+    }
+
+    cfg->expertsVram = json_get_int(qc, "experts_vram", d->experts);
+    if (cfg->expertsVram < 1 || (d->experts > 0 && cfg->expertsVram > d->experts)) {
+        cfg->expertsVram = d->experts;
+    }
+
+    snprintf(cfg->name, sizeof(cfg->name), "%s", json_get_str(qc, "name", "model"));
+    snprintf(cfg->shaderDir, sizeof(cfg->shaderDir), "%s", json_get_str(qc, "shader_dir", ""));
+    json_free(qc);
+}
+
+static void loadGgufConfig(model_config* cfg, const char* ggufPath, int maxCtxOverride, int pruned) {
+    memset(cfg, 0, sizeof(model_config));
+
+    gguf g;
+    if (gguf_open(&g, ggufPath) != 0) cfg_fatal("cannot parse gguf");
+    if (gguf_arch(&g)[0] == '\0') cfg_fatal("gguf missing general.architecture");
+
+    model_dims* d = &cfg->dims;
+    d->K = (int)gguf_meta_int_arch(&g, "embedding_length", 0);
+    d->layerCount = (int)gguf_meta_int_arch(&g, "block_count", 0);
+    d->heads = (int)gguf_meta_int_arch(&g, "attention.head_count", 0);
+    d->kvHeads = (int)gguf_meta_int_arch(&g, "attention.head_count_kv", 0);
+    d->headDim = (int)gguf_meta_int_arch(&g, "attention.key_length", 0);
+    d->ffnN = (int)gguf_meta_int_arch(&g, "feed_forward_length", 0);
+    d->ropeTheta = gguf_meta_num_arch(&g, "rope.freq_base", 1e7);
+    d->convHist = (int)gguf_meta_int_arch(&g, "ssm.conv_kernel", 4) - 1;
+    d->nQk = (int)gguf_meta_int_arch(&g, "ssm.group_count", 0);
+    d->dim = (int)gguf_meta_int_arch(&g, "ssm.state_size", 0);
+    d->experts = (int)gguf_meta_int_arch(&g, "expert_count", 0);
+    d->expertsPerTok = (int)gguf_meta_int_arch(&g, "expert_used_count", 0);
+    d->moeI = (int)gguf_meta_int_arch(&g, "expert_feed_forward_length", 0);
+    if (d->ffnN <= 0 && d->moeI > 0) d->ffnN = d->moeI;
+
+    int64_t inner = gguf_meta_int_arch(&g, "ssm.inner_size", 0);
+    if (d->dim > 0 && inner > 0 && inner % d->dim == 0) d->nV = (int)(inner / d->dim);
+
+    int64_t ropeDim = gguf_meta_int_arch(&g, "rope.dimension_count", 0);
+    d->partialRotary = (d->headDim > 0 && ropeDim > 0) ? (double)ropeDim / d->headDim : 0.25;
+
+    int64_t interval = gguf_meta_int_arch(&g, "full_attention_interval", 0);
+    if (interval <= 0) cfg_fatal("gguf missing full_attention_interval");
+    for (int i = 0; i < d->layerCount; i++) {
+        cfg->layers[i].attn.type = ((i + 1) % (int)interval == 0) ? ATTENTION_FULL : ATTENTION_DELTA;
+    }
+    if (cfg->layers[0].attn.type != ATTENTION_DELTA) cfg_fatal("layer 0 must be linear_attention");
+
+    d->tied = gguf_find(&g, "output.weight") == NULL;
+    int64_t vocab = gguf_meta_arr_count(&g, "tokenizer.ggml.tokens", 0);
+    if (vocab <= 0) {
+        const gguf_tensor* te = gguf_find(&g, "token_embd.weight");
+        if (te != NULL && te->nDims == 2) vocab = te->dims[1];
+    }
+    d->vocab = pruned ? MODEL_VOCAB : (int)vocab;
+    if (d->vocab <= 0) cfg_fatal("invalid vocab size");
+
+    int maxPos = (int)gguf_meta_int_arch(&g, "context_length", 0);
+    validateDims(d);
+    deriveDims(d);
+
+    char dir[512];
+    gguf_dir_of(ggufPath, dir, sizeof(dir));
+    loadQuantConfig(cfg, dir, maxCtxOverride, maxPos);
+    gguf_close(&g);
+}
+
 int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride, int pruned) {
+    if (gguf_path_is_file(modelDir)) {
+        loadGgufConfig(cfg, modelDir, maxCtxOverride, pruned);
+        return 0;
+    }
+
     memset(cfg, 0, sizeof(model_config));
 
     char path[512];
@@ -132,7 +281,7 @@ int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride,
     d->convHist = json_get_int(txt, "linear_conv_kernel_dim", 4) - 1;
     d->ropeTheta = json_get_num(txt, "rope_theta", 1e7);
     d->tied = json_get_bool(txt, "tie_word_embeddings", 0);
-    double partial = json_get_num(txt, "partial_rotary_factor", 0.25);
+    d->partialRotary = json_get_num(txt, "partial_rotary_factor", 0.25);
     int hfVocab = json_get_int(txt, "vocab_size", MODEL_VOCAB);
     int maxPos = json_get_int(txt, "max_position_embeddings", 0);
     d->experts = json_get_int(txt, "num_experts", 0);
@@ -142,41 +291,17 @@ int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride,
     json_value* rope = json_get(txt, "rope_parameters");
     if (rope != NULL) {
         d->ropeTheta = json_get_num(rope, "rope_theta", d->ropeTheta);
-        partial = json_get_num(rope, "partial_rotary_factor", partial);
+        d->partialRotary = json_get_num(rope, "partial_rotary_factor", d->partialRotary);
     }
 
     json_value* layerTypes = json_get(txt, "layer_types");
     if (layerTypes == NULL || layerTypes->type != JSON_ARRAY) cfg_fatal("config.json missing layer_types");
 
-    if (d->K <= 0 || d->layerCount <= 0 || d->heads <= 0 || d->kvHeads <= 0 ||
-        d->headDim <= 0 || d->ffnN <= 0 || d->nQk <= 0 || d->nV <= 0 || d->dim <= 0) {
-        cfg_fatal("config.json has missing or invalid dimensions");
-    }
+    validateDims(d);
     if (linKeyDim != d->dim) cfg_fatal("linear key/value head dims differ");
-    if (d->heads % d->kvHeads != 0) cfg_fatal("heads not divisible by kv_heads");
-    if (d->nV % d->nQk != 0) cfg_fatal("n_v not divisible by n_qk");
-    if (d->layerCount > MODEL_MAX_LAYERS) cfg_fatal("too many layers");
     if (layerTypes->count != d->layerCount) cfg_fatal("layer_types count mismatch");
-    if (d->convHist < 1) cfg_fatal("invalid linear_conv_kernel_dim");
-    if (d->experts > 256) cfg_fatal("too many experts");
-    if (d->experts > 0 && d->expertsPerTok != 8) cfg_fatal("only top-8 routing supported");
-    if (d->experts > 0 && d->moeI <= 0) cfg_fatal("moe_intermediate_size missing");
 
-    d->rotaryDim = (int)(d->headDim * partial);
-    d->rotaryHalf = d->rotaryDim / 2;
-    d->qOff = d->heads * d->headDim;
-    d->gOff = d->qOff;
-    d->kOff = (d->heads + d->heads) * d->headDim;
-    d->vOff = (d->heads + d->heads + d->kvHeads) * d->headDim;
-    d->qkvN = d->vOff + d->kvHeads * d->headDim;
-    d->kvRows = d->kvHeads * d->headDim;
-    d->projKOff = d->nQk * d->dim;
-    d->projVOff = d->projKOff + d->nQk * d->dim;
-    d->projZOff = d->projVOff + d->nV * d->dim;
-    d->projAOff = d->projZOff + d->nV * d->dim;
-    d->projBOff = d->projAOff + d->nV;
-    d->projN = d->projBOff + d->nV;
-    d->zqkvN = 2 * d->nQk * d->dim + d->nV * d->dim;
+    deriveDims(d);
 
     for (int i = 0; i < d->layerCount; i++) {
         json_value* lt = &layerTypes->items[i];
@@ -195,42 +320,10 @@ int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride,
 
     json_free(hf);
 
-    snprintf(path, sizeof(path), "%s/quant_config.json", modelDir);
-    json_value* qc = json_parse_file(path);
-    if (qc == NULL) cfg_fatal("cannot parse quant_config.json");
-
     d->vocab = pruned ? MODEL_VOCAB : hfVocab;
     if (d->vocab <= 0) cfg_fatal("invalid vocab size");
-    d->maxCtx = json_get_int(qc, "max_ctx", 32768);
-    if (maxCtxOverride > 0) d->maxCtx = maxCtxOverride;
-    if (d->maxCtx < 1) cfg_fatal("invalid max_ctx");
-    if (maxPos > 0 && d->maxCtx > maxPos) {
-        fprintf(stderr, "max_ctx %d exceeds max_position_embeddings %d, clamping\n", d->maxCtx, maxPos);
-        d->maxCtx = maxPos;
-    }
-    d->prefillChunk = json_get_int(qc, "prefill_chunk", 512);
-    cfg->embedQ = parse_quant(json_get_str(qc, "embed", "fp16"), QUANT_FP16);
-    cfg->lmHeadQ = parse_quant(json_get_str(qc, "lm_head", "fp16"), QUANT_FP16);
 
-    json_value* layers = json_get(qc, "layers");
-    if (layers == NULL || layers->type != JSON_ARRAY || layers->count != d->layerCount) {
-        cfg_fatal("quant_config.json layers mismatch");
-    }
-    for (int i = 0; i < d->layerCount; i++) {
-        json_value* ly = &layers->items[i];
-        cfg->layers[i].attn.q = parse_quant(json_get_str(ly, "attn", "fp16"), QUANT_FP16);
-        cfg->layers[i].ffn.q = parse_quant(json_get_str(ly, "ffn", "fp16"), QUANT_FP16);
-        cfg->layers[i].ffn.type = d->experts > 0 ? FFN_MOE : FFN_SWIGLU;
-    }
-
-    cfg->expertsVram = json_get_int(qc, "experts_vram", d->experts);
-    if (cfg->expertsVram < 1 || (d->experts > 0 && cfg->expertsVram > d->experts)) {
-        cfg->expertsVram = d->experts;
-    }
-
-    snprintf(cfg->name, sizeof(cfg->name), "%s", json_get_str(qc, "name", "model"));
-    snprintf(cfg->shaderDir, sizeof(cfg->shaderDir), "%s", json_get_str(qc, "shader_dir", ""));
-    json_free(qc);
+    loadQuantConfig(cfg, modelDir, maxCtxOverride, maxPos);
 
     return 0;
 }

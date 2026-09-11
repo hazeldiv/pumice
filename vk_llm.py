@@ -5,11 +5,19 @@ import time
 import random
 from pathlib import Path
 
-from tokenizers import Tokenizer
+from tokenizers import Tokenizer, AddedToken, Regex
+from tokenizers.models import BPE
+from tokenizers.pre_tokenizers import ByteLevel, Sequence, Split
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 
 ROOT = Path(__file__).resolve().parent
 BACKEND = ROOT / "bin" / "main.exe"
 PRUNED_VOCAB = ROOT / "pruned-vocab"
+
+GGUF_PATTERN = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+GGUF_SCALAR = {0: ("B", 1), 1: ("b", 1), 2: ("H", 2), 3: ("h", 2), 4: ("I", 4),
+               5: ("i", 4), 6: ("f", 4), 7: ("B", 1), 10: ("Q", 8), 11: ("q", 8), 12: ("d", 8)}
+
 
 is_sampling = False
 temperature = 0.6
@@ -26,6 +34,100 @@ class LLM:
     pass
 
 
+class _GgufReader:
+    def __init__(self, f):
+        self.f = f
+
+    def read(self, n):
+        b = self.f.read(n)
+        if len(b) != n:
+            raise EOFError("unexpected end of gguf")
+        return b
+
+    def u32(self):
+        return struct.unpack("<I", self.read(4))[0]
+
+    def u64(self):
+        return struct.unpack("<Q", self.read(8))[0]
+
+    def string(self):
+        return self.read(self.u64()).decode("utf-8", errors="replace")
+
+    def skip_string(self):
+        self.f.seek(self.u64(), 1)
+
+    def skip_value(self, vtype):
+        if vtype == 8:
+            self.skip_string()
+        elif vtype == 9:
+            elem = self.u32()
+            count = self.u64()
+            if elem == 8:
+                for _ in range(count):
+                    self.skip_string()
+            else:
+                self.f.seek(count * GGUF_SCALAR[elem][1], 1)
+        else:
+            self.f.seek(GGUF_SCALAR[vtype][1], 1)
+
+    def str_array(self):
+        self.u32()
+        count = self.u64()
+        return [self.string() for _ in range(count)]
+
+    def int_array(self):
+        elem = self.u32()
+        count = self.u64()
+        fmt, size = GGUF_SCALAR[elem]
+        return list(struct.unpack("<%d%s" % (count, fmt), self.read(count * size)))
+
+
+def _gguf_tokenizer_meta(path):
+    with open(path, "rb") as f:
+        r = _GgufReader(f)
+        if r.read(4) != b"GGUF":
+            raise RuntimeError(f"not a gguf file: {path}")
+        r.u32()
+        r.u64()
+        n_kv = r.u64()
+        tokens = merges = token_type = None
+        for _ in range(n_kv):
+            key = r.string()
+            vtype = r.u32()
+            if key == "tokenizer.ggml.tokens":
+                tokens = r.str_array()
+            elif key == "tokenizer.ggml.merges":
+                merges = r.str_array()
+            elif key == "tokenizer.ggml.token_type":
+                token_type = r.int_array()
+            else:
+                r.skip_value(vtype)
+    return tokens, merges, token_type
+
+
+def _tokenizer_from_gguf(path):
+    tokens, merges, token_type = _gguf_tokenizer_meta(path)
+    if not tokens:
+        raise RuntimeError(f"gguf has no tokenizer vocab: {path}")
+    vocab = {tok: i for i, tok in enumerate(tokens)}
+    pairs = []
+    for m in merges or []:
+        parts = m.split(" ", 1)
+        if len(parts) == 2:
+            pairs.append((parts[0], parts[1]))
+    tokenizer = Tokenizer(BPE(vocab, pairs, unk_token=None))
+    tokenizer.pre_tokenizer = Sequence([
+        Split(Regex(GGUF_PATTERN), behavior="isolated"),
+        ByteLevel(add_prefix_space=False, trim_offsets=False, use_regex=False),
+    ])
+    tokenizer.decoder = ByteLevelDecoder()
+    if token_type:
+        specials = [AddedToken(tok, special=True) for tok, t in zip(tokens, token_type) if t in (2, 3, 4)]
+        if specials:
+            tokenizer.add_tokens(specials)
+    return tokenizer
+
+
 def _read_u32(proc):
     raw = proc.stdout.read(4)
     if len(raw) != 4:
@@ -35,28 +137,39 @@ def _read_u32(proc):
 
 def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0):
     import shutil
-    weight_dir = Path(weight_dir).resolve()
-    tokenizer_path = (weight_dir / "vocab" / "tokenizer.json") if prune_vocab else (weight_dir / "tokenizer.json")
+    weight_path = Path(weight_dir).resolve()
+    is_gguf = weight_path.is_file() and weight_path.suffix.lower() == ".gguf"
+    model_dir = weight_path.parent if is_gguf else weight_path
+
+    tokenizer_path = (model_dir / "vocab" / "tokenizer.json") if prune_vocab else (model_dir / "tokenizer.json")
 
     if prune_vocab and not tokenizer_path.exists():
-        vocab_dir = weight_dir / "vocab"
+        vocab_dir = model_dir / "vocab"
         vocab_dir.mkdir(parents=True, exist_ok=True)
         for name in ("tokenizer.json", "tokenizer_config.json", "vocab.json"):
             src = PRUNED_VOCAB / name
             if src.exists():
                 shutil.copy(src, vocab_dir / name)
 
-    tokenizer = Tokenizer.from_file(str(tokenizer_path))
+    if tokenizer_path.exists():
+        tokenizer = Tokenizer.from_file(str(tokenizer_path))
+    elif is_gguf:
+        tokenizer = _tokenizer_from_gguf(weight_path)
+    else:
+        raise FileNotFoundError(f"tokenizer not found: {tokenizer_path}")
+
     eos = tokenizer.token_to_id("<|im_end|>")
     if eos is None:
         eos = 0
 
     cmd = [
         str(BACKEND),
-        "--weights", str(weight_dir),
+        "--weights", str(weight_path),
         "--max-ctx", str(max_ctx),
         "--max-new", str(max_new_tokens),
     ]
+    if is_gguf:
+        cmd += ["--gguf"]
     if dump_dir is not None:
         Path(dump_dir).mkdir(parents=True, exist_ok=True)
         cmd += ["--dump", str(dump_dir), "--dump-layers", str(dump_layers)]
@@ -76,7 +189,7 @@ def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump
 
     llm = LLM()
     llm.proc = proc
-    llm.weight_dir = weight_dir
+    llm.weight_dir = model_dir
     llm.max_ctx = max_ctx
     llm.max_new_tokens = max_new_tokens
     llm.tokenizer = tokenizer

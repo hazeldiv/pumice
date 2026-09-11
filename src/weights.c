@@ -6,6 +6,7 @@
 #include <windows.h>
 #include "weights.h"
 #include "safetensors.h"
+#include "gguf.h"
 
 static int64_t weightBytes = 0;
 static int verboseWeights = 0;
@@ -295,9 +296,25 @@ static int findShards(const char* dir, char out[][512], int max);
 static char g_weightDir[512];
 static safetensors g_shards;
 static int g_shardState = 0;
+static int g_gguf = 0;
 
 static const safetensors* shardSource(void) {
     if (g_shardState != 0) return g_shardState == 1 ? &g_shards : NULL;
+    if (gguf_path_is_file(g_weightDir)) {
+        gguf g;
+        if (gguf_open(&g, g_weightDir) != 0) {
+            g_shardState = -1;
+            return NULL;
+        }
+        int rc = gguf_as_safetensors(&g, &g_shards);
+        gguf_close(&g);
+        if (rc != 0) {
+            g_shardState = -1;
+            return NULL;
+        }
+        g_shardState = 1;
+        return &g_shards;
+    }
     char shardPaths[SA_MAX_FILES][512];
     const char* shardPtrs[SA_MAX_FILES];
     int shardCount = findShards(g_weightDir, shardPaths, SA_MAX_FILES);
@@ -382,8 +399,11 @@ static buffer loadVecBuffer(session s, const char* hfName, int len, const char* 
         int64_t n = 0;
         v = safetensors_load_f32(sf, t, &n);
         if (!v || n != len) fatal("vector length mismatch");
-        if (addOne) {
+        if (addOne && !g_gguf) {
             for (int i = 0; i < len; i++) v[i] += 1.0f;
+        }
+        if (g_gguf && strcmp(label, "aLog") == 0) {
+            for (int i = 0; i < len; i++) v[i] = logf(-v[i]);
         }
         saveVecRaw(cacheName, v, len);
     }
@@ -498,17 +518,29 @@ static void loadEmbedLike(session s, const char* const* candPaths, int candCount
         if (t == NULL && sfUse != NULL) t = safetensors_find(sfUse, hfName);
         if (t == NULL) t = require(sfUse, hfName);
         if (t->ndim < 2 || t->shape[0] != V || t->shape[1] != K) fatal("embedding shape mismatch");
-        uint16_t* raw = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)V * K);
-        FILE* f = sfUse->files[t->fileIndex];
-        _fseeki64(f, t->offset, SEEK_SET);
-        if (fread(raw, sizeof(uint16_t), (size_t)V * K, f) != (size_t)V * K) fatal("embedding read error");
         uint16_t* eng = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)K * V);
-        for (int v = 0; v < V; v++) {
-            for (int k = 0; k < K; k++) {
-                eng[(size_t)k * V + v] = float_to_fp16(bf16_to_float(raw[(size_t)v * K + k]));
+        if (t->dtype == SA_DTYPE_BF16) {
+            uint16_t* raw = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)V * K);
+            FILE* f = sfUse->files[t->fileIndex];
+            _fseeki64(f, t->offset, SEEK_SET);
+            if (fread(raw, sizeof(uint16_t), (size_t)V * K, f) != (size_t)V * K) fatal("embedding read error");
+            for (int v = 0; v < V; v++) {
+                for (int k = 0; k < K; k++) {
+                    eng[(size_t)k * V + v] = float_to_fp16(bf16_to_float(raw[(size_t)v * K + k]));
+                }
             }
+            free(raw);
+        } else {
+            int64_t n = 0;
+            float* src = safetensors_load_f32(sfUse, t, &n);
+            if (!src || n != (int64_t)V * K) fatal("embedding read error");
+            for (int v = 0; v < V; v++) {
+                for (int k = 0; k < K; k++) {
+                    eng[(size_t)k * V + v] = float_to_fp16(src[(size_t)v * K + k]);
+                }
+            }
+            free(src);
         }
-        free(raw);
         uint16_t* tw = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)K * V);
         transpose_block16((uint8_t*)eng, (uint8_t*)tw, K, V, QUANT_FP16);
         free(eng);
@@ -940,12 +972,16 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     cacheClear();
     snprintf(cacheDir, sizeof(cacheDir), "weights/%s", spec->name);
     snprintf(g_weightDir, sizeof(g_weightDir), "%s", weightDir);
+    g_gguf = gguf_path_is_file(weightDir);
+    char modelDir[512];
+    snprintf(modelDir, sizeof(modelDir), "%s", weightDir);
+    if (gguf_path_is_file(weightDir)) gguf_dir_of(weightDir, modelDir, sizeof(modelDir));
     _mkdir("weights");
     _mkdir(cacheDir);
 
     char shardProbe[SA_MAX_FILES][512];
     int shardCount = findShards(weightDir, shardProbe, SA_MAX_FILES);
-    if (shardCount == 0 && !cacheComplete(spec)) {
+    if (!gguf_path_is_file(weightDir) && shardCount == 0 && !cacheComplete(spec)) {
         fatal("no safetensors found and weight cache is incomplete");
     }
 
@@ -972,11 +1008,11 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     w.vocab = V;
     w.layerCount = d->layerCount;
 
-    hasHead = findVocabFile(weightDir, "lm_head", V, headPath, sizeof(headPath));
-    hasEmbed = findVocabFile(weightDir, "embed_tokens", V, embedPath, sizeof(embedPath));
+    hasHead = findVocabFile(modelDir, "lm_head", V, headPath, sizeof(headPath));
+    hasEmbed = findVocabFile(modelDir, "embed_tokens", V, embedPath, sizeof(embedPath));
     if (d->tied) hasHead = 0;
     if (d->tied && !hasEmbed) {
-        hasEmbed = findVocabFile(weightDir, "lm_head", V, embedPath, sizeof(embedPath));
+        hasEmbed = findVocabFile(modelDir, "lm_head", V, embedPath, sizeof(embedPath));
     }
 
     w.layerBufs = (buffer*)calloc((size_t)d->layerCount * 13, sizeof(buffer));

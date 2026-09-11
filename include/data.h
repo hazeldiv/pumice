@@ -29,6 +29,7 @@ uint16_t* getDataFP16(int seed, int M, int N);
 float fp16_to_float(uint16_t h);
 uint16_t float_to_fp16(float f);
 float bf16_to_float(uint16_t h);
+uint16_t float_to_bf16(float f);
 QuantizedData quantizeDataINT8(const float* src, int M, int N);
 QuantizedData quantizeDataINT4(const float* src, int M, int N);
 void transpose(const float* src, float* dest, int m, int n);

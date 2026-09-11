@@ -191,6 +191,14 @@ float bf16_to_float(uint16_t h) {
     return f;
 }
 
+uint16_t float_to_bf16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    uint32_t lsb = (u >> 16) & 1u;
+    u += 0x7FFFu + lsb;
+    return (uint16_t)(u >> 16);
+}
+
 static float clampf(float v, float lo, float hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;

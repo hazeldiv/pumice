@@ -7,6 +7,8 @@
 #include <windows.h>
 #include "prune.h"
 #include "safetensors.h"
+#include "gguf.h"
+#include "data.h"
 
 #define EMBED_NAME "model.language_model.embed_tokens.weight"
 #define HEAD_NAME "lm_head.weight"
@@ -142,7 +144,7 @@ static void writeSafetensorsHeader(FILE* f, const char* name, int rows, int cols
     for (int i = 0; i < pad; i++) fputc(' ', f);
 }
 
-static void gatherRows(FILE* src, FILE* dst, int64_t dataStart, const int32_t* mapping, int V, int K) {
+static void gatherRows(FILE* src, FILE* dst, int64_t dataStart, const int32_t* mapping, int V, int K, sa_dtype dtype) {
     int rowBytes = K * 2;
     uint16_t* chunk = (uint16_t*)malloc((size_t)rowBytes * GATHER_CHUNK);
     if (!chunk) pfatal("out of memory");
@@ -151,7 +153,11 @@ static void gatherRows(FILE* src, FILE* dst, int64_t dataStart, const int32_t* m
         if (stop > V) stop = V;
         for (int v = start; v < stop; v++) {
             _fseeki64(src, dataStart + (int64_t)mapping[v] * rowBytes, SEEK_SET);
-            if (fread(chunk + (size_t)(v - start) * K, rowBytes, 1, src) != 1) pfatal("shard read error");
+            uint16_t* row = chunk + (size_t)(v - start) * K;
+            if (fread(row, rowBytes, 1, src) != 1) pfatal("shard read error");
+            if (dtype == SA_DTYPE_F16) {
+                for (int k = 0; k < K; k++) row[k] = float_to_bf16(fp16_to_float(row[k]));
+            }
         }
         fwrite(chunk, rowBytes, stop - start, dst);
     }
@@ -163,9 +169,11 @@ static void gatherTensor(safetensors* sf, const char* tensorName, const char* ou
     const sa_tensor* t = safetensors_find(sf, tensorName);
     if (!t) {
         if (!required) return;
-        perr("missing tensor in shard", tensorName);
+        perr("missing tensor in source", tensorName);
     }
-    if (t->dtype != SA_DTYPE_BF16 || t->ndim != 2 || t->shape[1] != K) pfatal("tensor shape/dtype mismatch vs config");
+    if ((t->dtype != SA_DTYPE_BF16 && t->dtype != SA_DTYPE_F16) || t->ndim != 2 || t->shape[1] != K) {
+        pfatal("tensor shape/dtype mismatch vs config");
+    }
     int srcRows = (int)t->shape[0];
     for (int i = 0; i < V; i++) {
         if (mapping[i] < 0 || mapping[i] >= srcRows) pfatal("mapping id out of range");
@@ -177,14 +185,19 @@ static void gatherTensor(safetensors* sf, const char* tensorName, const char* ou
     if (!dst) perr("cannot create", dstPath);
     long dataBytes = (long)V * K * 2;
     writeSafetensorsHeader(dst, tensorName, V, K, dataBytes);
-    gatherRows(src, dst, t->offset, mapping, V, K);
+    gatherRows(src, dst, t->offset, mapping, V, K, t->dtype);
     fclose(dst);
     fprintf(stderr, "prune: wrote %s (%.1f MB, %d rows of %d)\n",
             dstPath, dataBytes / (1024.0 * 1024.0), V, srcRows);
 }
 
-int pruneVocab(const char* modelDir, const model_config* spec) {
+int pruneVocab(const char* modelPath, const model_config* spec) {
     const model_dims* d = &spec->dims;
+    int isGguf = gguf_path_is_file(modelPath);
+    char modelDir[512];
+    snprintf(modelDir, sizeof(modelDir), "%s", modelPath);
+    if (isGguf) gguf_dir_of(modelPath, modelDir, sizeof(modelDir));
+
     char vocabDir[512];
     snprintf(vocabDir, sizeof(vocabDir), "%s/vocab", modelDir);
 
@@ -206,14 +219,20 @@ int pruneVocab(const char* modelDir, const model_config* spec) {
     snprintf(path, sizeof(path), "%s/mapping.npy", PRUNED_VOCAB_DIR);
     int32_t* mapping = loadMapping(path, d->vocab);
 
-    char shardPaths[32][512];
-    const char* shardPtrs[32];
-    int shardCount = findShardPaths(modelDir, shardPaths, 32);
-    if (shardCount == 0) pfatal("no model shards found");
-    for (int i = 0; i < shardCount; i++) shardPtrs[i] = shardPaths[i];
-
     safetensors sf;
-    if (safetensors_open(&sf, shardPtrs, shardCount) != 0) pfatal("cannot open shards");
+    if (isGguf) {
+        gguf g;
+        if (gguf_open(&g, modelPath) != 0) pfatal("cannot open gguf");
+        if (gguf_as_safetensors(&g, &sf) != 0) pfatal("cannot map gguf tensors");
+        gguf_close(&g);
+    } else {
+        char shardPaths[32][512];
+        const char* shardPtrs[32];
+        int shardCount = findShardPaths(modelDir, shardPaths, 32);
+        if (shardCount == 0) pfatal("no model shards found");
+        for (int i = 0; i < shardCount; i++) shardPtrs[i] = shardPaths[i];
+        if (safetensors_open(&sf, shardPtrs, shardCount) != 0) pfatal("cannot open shards");
+    }
 
     _mkdir(vocabDir);
     if (needEmbed) {
