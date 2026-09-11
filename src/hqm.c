@@ -66,6 +66,12 @@ void hqm_dir_of(const char* path, char* out, size_t cap) {
     if (sep != NULL) *sep = '\0';
 }
 
+static char g_exportDir[512] = "";
+
+void hqm_set_export_dir(const char* dir) {
+    snprintf(g_exportDir, sizeof(g_exportDir), "%s", dir != NULL ? dir : "");
+}
+
 static int64_t hqm_type_bytes(int type, const int64_t* dims, int ndim) {
     int64_t elems = 1;
     for (int i = 0; i < ndim; i++) elems *= dims[i];
@@ -315,9 +321,13 @@ uint64_t hqm_fingerprint(const model_config* spec) {
 
 void hqm_model_path(const model_config* spec, const char* weightDir, char* out, size_t cap) {
     char dir[512];
-    snprintf(dir, sizeof(dir), "%s", weightDir);
-    if (gguf_path_is_file(weightDir) || hqm_path_is_file(weightDir)) {
-        hqm_dir_of(weightDir, dir, sizeof(dir));
+    if (g_exportDir[0] != '\0') {
+        snprintf(dir, sizeof(dir), "%s", g_exportDir);
+    } else {
+        snprintf(dir, sizeof(dir), "%s", weightDir);
+        if (gguf_path_is_file(weightDir) || hqm_path_is_file(weightDir)) {
+            hqm_dir_of(weightDir, dir, sizeof(dir));
+        }
     }
     double gb = (double)hqm_vram_bytes(spec) / (1024.0 * 1024.0 * 1024.0);
     snprintf(out, cap, "%s/%s%s-%.1fgb.hqm", dir, spec->name, spec->pruned ? "-pruned" : "", gb);
@@ -410,6 +420,12 @@ hqm_writer* hqm_writer_open(const char* path) {
     snprintf(w->path, sizeof(w->path), "%s", path);
     snprintf(w->tmp, sizeof(w->tmp), "%s.tmp", path);
     w->f = fopen(w->tmp, "wb+");
+    if (w->f == NULL) {
+        char dir[512];
+        hqm_dir_of(path, dir, sizeof(dir));
+        if (dir[0] != '\0') CreateDirectoryA(dir, NULL);
+        w->f = fopen(w->tmp, "wb+");
+    }
     if (w->f == NULL) {
         free(w);
         return NULL;

@@ -225,7 +225,7 @@ def _read_u32(proc):
     return struct.unpack("<I", raw)[0]
 
 
-def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0, export=True):
+def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0, export=True, export_dir=None):
     import shutil
     weight_path = Path(weight_dir).resolve()
     is_gguf = weight_path.is_file() and weight_path.suffix.lower() == ".gguf"
@@ -266,6 +266,9 @@ def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump
         cmd += ["--gguf"]
     if not export:
         cmd += ["--no-export"]
+    if export_dir is not None:
+        Path(export_dir).mkdir(parents=True, exist_ok=True)
+        cmd += ["--export-dir", str(Path(export_dir).resolve())]
     if dump_dir is not None:
         Path(dump_dir).mkdir(parents=True, exist_ok=True)
         cmd += ["--dump", str(dump_dir), "--dump-layers", str(dump_layers)]
@@ -370,21 +373,34 @@ def close(llm):
 
 
 def _main():
-    args = [a for a in sys.argv[1:] if a not in ("--think", "--prune", "--no-export") and not a.startswith("--experts-vram")]
-    thinking = "--think" in sys.argv[1:]
-    prune = "--prune" in sys.argv[1:]
-    export = "--no-export" not in sys.argv[1:]
+    argv = sys.argv[1:]
+    thinking = "--think" in argv
+    prune = "--prune" in argv
+    export = "--no-export" not in argv
     evram = 0
-    for i, a in enumerate(sys.argv[1:]):
-        if a == "--experts-vram" and i + 2 < len(sys.argv):
-            evram = int(sys.argv[i + 2])
+    export_dir = None
+    args = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--experts-vram" and i + 1 < len(argv):
+            evram = int(argv[i + 1])
+            i += 2
+            continue
+        if a == "--export-dir" and i + 1 < len(argv):
+            export_dir = argv[i + 1]
+            i += 2
+            continue
+        if a not in ("--think", "--prune", "--no-export"):
+            args.append(a)
+        i += 1
     weight_dir = args[0] if len(args) > 0 else "model/Qwen3.5-9B"
     max_ctx = int(args[1]) if len(args) > 1 else 16384
     text = args[2] if len(args) > 2 else None
     if text is None:
         return
 
-    llm = start_llm(weight_dir, max_ctx=max_ctx, max_new_tokens=16384, prune_vocab=prune, experts_vram=evram, export=export)
+    llm = start_llm(weight_dir, max_ctx=max_ctx, max_new_tokens=16384, prune_vocab=prune, experts_vram=evram, export=export, export_dir=export_dir)
     ids = tokenize(llm, text, thinking)
     decoded_ids = []
     prev = ""

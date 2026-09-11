@@ -58,12 +58,14 @@ void serverMain(int argc, char** argv) {
     const char* dumpHiddenDir = argval(argc, argv, "--dump-hidden", NULL);
     const char* dumpTopPPath = argval(argc, argv, "--dump-topp", NULL);
     int doPrune = argflag(argc, argv, "--prune");
+    const char* exportDir = argval(argc, argv, "--export-dir", NULL);
     dbgSampling = argflag(argc, argv, "--debug-sampling");
     if (maxNew < 1) maxNew = 1;
 
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 
+    hqm_set_export_dir(exportDir);
     static model_config spec;
     loadModelConfig(&spec, weightDir, maxCtxOverride, doPrune);
     char hqmPath[512];

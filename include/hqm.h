@@ -58,6 +58,7 @@ const hqm_tensor* hqm_tensor_find(const hqm* h, const char* name);
 void* hqm_tensor_read(const hqm* h, const hqm_tensor* t, int64_t* outBytes);
 
 void hqm_dir_of(const char* path, char* out, size_t cap);
+void hqm_set_export_dir(const char* dir);
 void hqm_model_path(const model_config* spec, const char* weightDir, char* out, size_t cap);
 int hqm_resolve(const model_config* spec, const char* weightDir, char* out, size_t cap);
 int hqm_file_matches(const char* path, const model_config* spec);
