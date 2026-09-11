@@ -162,10 +162,14 @@ static void validateDims(const model_dims* d) {
     if (d->experts > 0 && d->moeI <= 0) cfg_fatal("moe_intermediate_size missing");
 }
 
-static void loadQuantConfig(model_config* cfg, const char* dir, int maxCtxOverride, int maxPos) {
+static void loadQuantConfig(model_config* cfg, const char* dir, const char* overridePath, int maxCtxOverride, int maxPos) {
     model_dims* d = &cfg->dims;
     char path[512];
-    snprintf(path, sizeof(path), "%s/quant_config.json", dir);
+    if (overridePath != NULL && overridePath[0] != '\0') {
+        snprintf(path, sizeof(path), "%s", overridePath);
+    } else {
+        snprintf(path, sizeof(path), "%s/quant_config.json", dir);
+    }
     json_value* qc = json_parse_file(path);
     if (qc == NULL) cfg_fatal("cannot parse quant_config.json");
 
@@ -204,7 +208,7 @@ static void loadQuantConfig(model_config* cfg, const char* dir, int maxCtxOverri
     json_free(qc);
 }
 
-static void loadGgufConfig(model_config* cfg, const char* ggufPath, int maxCtxOverride, int pruned) {
+static void loadGgufConfig(model_config* cfg, const char* ggufPath, const char* quantConfigPath, int maxCtxOverride, int pruned) {
     memset(cfg, 0, sizeof(model_config));
 
     gguf g;
@@ -256,7 +260,7 @@ static void loadGgufConfig(model_config* cfg, const char* ggufPath, int maxCtxOv
 
     char dir[512];
     gguf_dir_of(ggufPath, dir, sizeof(dir));
-    loadQuantConfig(cfg, dir, maxCtxOverride, maxPos);
+    loadQuantConfig(cfg, dir, quantConfigPath, maxCtxOverride, maxPos);
     gguf_close(&g);
 }
 
@@ -329,13 +333,13 @@ static void loadHqmConfig(model_config* cfg, const char* hqmPath, int maxCtxOver
     hqm_close(&h);
 }
 
-int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride, int pruned) {
+int loadModelConfig(model_config* cfg, const char* modelDir, const char* quantConfigPath, int maxCtxOverride, int pruned) {
     if (hqm_path_is_file(modelDir)) {
         loadHqmConfig(cfg, modelDir, maxCtxOverride);
         return 0;
     }
     if (gguf_path_is_file(modelDir)) {
-        loadGgufConfig(cfg, modelDir, maxCtxOverride, pruned);
+        loadGgufConfig(cfg, modelDir, quantConfigPath, maxCtxOverride, pruned);
         return 0;
     }
 
@@ -406,7 +410,7 @@ int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride,
     if (d->vocab <= 0) cfg_fatal("invalid vocab size");
     cfg->pruned = pruned;
 
-    loadQuantConfig(cfg, modelDir, maxCtxOverride, maxPos);
+    loadQuantConfig(cfg, modelDir, quantConfigPath, maxCtxOverride, maxPos);
 
     return 0;
 }

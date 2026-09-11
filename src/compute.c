@@ -59,6 +59,7 @@ void serverMain(int argc, char** argv) {
     const char* dumpTopPPath = argval(argc, argv, "--dump-topp", NULL);
     int doPrune = argflag(argc, argv, "--prune");
     const char* exportDir = argval(argc, argv, "--export-dir", NULL);
+    const char* quantConfigPath = argval(argc, argv, "--quant-config", NULL);
     dbgSampling = argflag(argc, argv, "--debug-sampling");
     if (maxNew < 1) maxNew = 1;
 
@@ -67,7 +68,7 @@ void serverMain(int argc, char** argv) {
 
     hqm_set_export_dir(exportDir);
     static model_config spec;
-    loadModelConfig(&spec, weightDir, maxCtxOverride, doPrune);
+    loadModelConfig(&spec, weightDir, quantConfigPath, maxCtxOverride, doPrune);
     char hqmPath[512];
     int hqmSource = hqm_resolve(&spec, weightDir, hqmPath, sizeof(hqmPath));
     if (doPrune && !hqmSource) pruneVocab(weightDir, &spec);

@@ -105,6 +105,47 @@ def _gguf_tokenizer_meta(path):
     return tokens, merges, token_type
 
 
+def gguf_meta(path):
+    with open(path, "rb") as f:
+        r = _GgufReader(f)
+        if r.read(4) != b"GGUF":
+            raise RuntimeError(f"not a gguf file: {path}")
+        r.u32()
+        r.u64()
+        n_kv = r.u64()
+        meta = {}
+        for _ in range(n_kv):
+            key = r.string()
+            vtype = r.u32()
+            if vtype == 8:
+                meta[key] = r.string()
+            elif vtype == 4:
+                meta[key] = r.u32()
+            elif vtype == 5:
+                meta[key] = struct.unpack("<i", r.read(4))[0]
+            elif vtype == 6:
+                meta[key] = struct.unpack("<f", r.read(4))[0]
+            elif vtype == 12:
+                meta[key] = struct.unpack("<d", r.read(8))[0]
+            elif vtype == 10:
+                meta[key] = r.u64()
+            elif vtype == 11:
+                meta[key] = struct.unpack("<q", r.read(8))[0]
+            elif vtype == 0:
+                meta[key] = r.read(1)[0]
+            elif vtype == 1:
+                meta[key] = struct.unpack("<b", r.read(1))[0]
+            elif vtype == 2:
+                meta[key] = struct.unpack("<H", r.read(2))[0]
+            elif vtype == 3:
+                meta[key] = struct.unpack("<h", r.read(2))[0]
+            elif vtype == 7:
+                meta[key] = r.read(1)[0] != 0
+            else:
+                r.skip_value(vtype)
+        return meta
+
+
 def _tokenizer_from_parts(tokens, merges, token_type):
     if not tokens:
         raise RuntimeError("tokenizer has no vocab")
@@ -166,6 +207,10 @@ def _hqm_meta(path):
     return kvs, tensors, data_offset
 
 
+def hqm_meta(path):
+    return _hqm_meta(path)
+
+
 def _hqm_read_tensor(path, tensors, data_offset, name):
     ttype, dims, offset = tensors[name]
     size = 1
@@ -186,6 +231,10 @@ def _hqm_read_tensor(path, tensors, data_offset, name):
     with open(path, "rb") as f:
         f.seek(data_offset + offset)
         return f.read(nbytes)
+
+
+def hqm_read_tensor(path, tensors, data_offset, name):
+    return _hqm_read_tensor(path, tensors, data_offset, name)
 
 
 def _read_str_array(raw):
@@ -225,7 +274,7 @@ def _read_u32(proc):
     return struct.unpack("<I", raw)[0]
 
 
-def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0, export=True, export_dir=None):
+def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0, export=True, export_dir=None, quant_config=None):
     import shutil
     weight_path = Path(weight_dir).resolve()
     is_gguf = weight_path.is_file() and weight_path.suffix.lower() == ".gguf"
@@ -269,6 +318,8 @@ def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump
     if export_dir is not None:
         Path(export_dir).mkdir(parents=True, exist_ok=True)
         cmd += ["--export-dir", str(Path(export_dir).resolve())]
+    if quant_config is not None:
+        cmd += ["--quant-config", str(Path(quant_config).resolve())]
     if dump_dir is not None:
         Path(dump_dir).mkdir(parents=True, exist_ok=True)
         cmd += ["--dump", str(dump_dir), "--dump-layers", str(dump_layers)]
@@ -293,6 +344,38 @@ def start_llm(weight_dir, max_ctx=32768, max_new_tokens=128, dump_dir=None, dump
     llm.max_new_tokens = max_new_tokens
     llm.tokenizer = tokenizer
     llm.eos = eos
+    llm.is_sampling = is_sampling
+    llm.temperature = temperature
+    llm.rep_penalty = rep_penalty
+    llm.penalty_len = penalty_len
+    llm.top_k = top_k
+    llm.top_p = top_p
+    llm.min_p = min_p
+    llm.presence_penalty = presence_penalty
+    llm.seed = seed
+    return llm
+
+
+def set_sampling(llm, is_sampling=None, temperature=None, rep_penalty=None, penalty_len=None,
+                 top_k=None, top_p=None, min_p=None, presence_penalty=None, seed=None):
+    if is_sampling is not None:
+        llm.is_sampling = bool(is_sampling)
+    if temperature is not None:
+        llm.temperature = float(temperature)
+    if rep_penalty is not None:
+        llm.rep_penalty = float(rep_penalty)
+    if penalty_len is not None:
+        llm.penalty_len = int(penalty_len)
+    if top_k is not None:
+        llm.top_k = int(top_k)
+    if top_p is not None:
+        llm.top_p = float(top_p)
+    if min_p is not None:
+        llm.min_p = float(min_p)
+    if presence_penalty is not None:
+        llm.presence_penalty = float(presence_penalty)
+    if seed is not None:
+        llm.seed = int(seed) if int(seed) != 0 else None
     return llm
 
 
@@ -326,11 +409,11 @@ def _stream_ids(llm, token_ids):
     if n >= llm.max_ctx:
         raise ValueError(f"prompt length {n} exceeds max_ctx {llm.max_ctx}")
     llm.proc.stdin.write(struct.pack("<I", n))
-    if is_sampling:
-        s = seed if seed is not None else random.getrandbits(32)
+    if llm.is_sampling:
+        s = llm.seed if llm.seed is not None else random.getrandbits(32)
         if s == 0:
             s = 1
-        header = (temperature, rep_penalty, penalty_len, top_k, top_p, min_p, presence_penalty, s)
+        header = (llm.temperature, llm.rep_penalty, llm.penalty_len, llm.top_k, llm.top_p, llm.min_p, llm.presence_penalty, s)
     else:
         header = (0.0, 1.0, 0, 0, 1.0, 0.0, 0.0, 1)
     llm.proc.stdin.write(struct.pack("<ffIIfffI", *header))
@@ -348,14 +431,20 @@ def generate(llm, token_ids):
 
 
 def generate_stream(llm, token_ids):
+    for delta, _ in generate_stream_tokens(llm, token_ids):
+        if delta:
+            yield delta
+
+
+def generate_stream_tokens(llm, token_ids):
     ids = []
     prev = ""
     for tok in _stream_ids(llm, token_ids):
         ids.append(tok)
         text = llm.tokenizer.decode(ids)
-        if len(text) > len(prev):
-            yield text[len(prev):]
+        delta = text[len(prev):] if len(text) > len(prev) else ""
         prev = text
+        yield delta, len(ids)
 
 
 def close(llm):

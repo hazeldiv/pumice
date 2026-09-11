@@ -86,7 +86,7 @@ typedef struct model_config {
     int pruned;
 } model_config;
 
-int loadModelConfig(model_config* cfg, const char* modelDir, int maxCtxOverride, int pruned);
+int loadModelConfig(model_config* cfg, const char* modelDir, const char* quantConfigPath, int maxCtxOverride, int pruned);
 int parseEos(model_dims* d, const char* modelDir, int pruned);
 const char* model_shader(const char* base, QuantType q);
 
