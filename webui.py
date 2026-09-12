@@ -40,6 +40,8 @@ def _model_kind(path):
             return "gguf"
         if suffix == ".hqm":
             return "hqm"
+        if suffix == ".safetensors":
+            return "safetensors"
         return "unknown"
     if p.is_dir():
         return "safetensors"
@@ -247,7 +249,10 @@ def _probe(path):
                 "warnings": [], "layers": 0, "layer_types": []}
     try:
         if kind == "safetensors":
-            info = validate_safetensors(path)
+            p = Path(path)
+            model_dir = p.parent if p.is_file() else p
+            info = validate_safetensors(model_dir)
+            info["selected"] = str(p)
         elif kind == "gguf":
             info = read_gguf_info(path)
         else:
@@ -396,10 +401,6 @@ def pick_model_file():
     return gr.update(value=_native_pick("file"))
 
 
-def pick_model_dir():
-    return gr.update(value=_native_pick("dir"))
-
-
 def pick_export_dir():
     return gr.update(value=_native_pick("dir"))
 
@@ -411,6 +412,9 @@ def load_model(path, vals, rows, max_ctx, prefill_chunk, embed_q, lm_head_q, emb
         if not info.get("ok"):
             return "Validation failed: " + "; ".join(info.get("errors", ["unknown error"]))
         kind = info["kind"]
+        weight_dir = path
+        if kind == "safetensors":
+            weight_dir = str(_resolve_dir(path) or path)
         quant_config = None
         if kind != "hqm":
             if not vals and not rows:
@@ -437,7 +441,7 @@ def load_model(path, vals, rows, max_ctx, prefill_chunk, embed_q, lm_head_q, emb
         out_dir = _resolve_dir(export_dir) or DEFAULT_EXPORT_DIR
         try:
             llm = vk_llm.start_llm(
-                path,
+                weight_dir,
                 max_ctx=int(max_ctx),
                 max_new_tokens=4096,
                 prune_vocab=bool(prune) and kind != "hqm",
@@ -531,8 +535,8 @@ def clear_chat():
 
 def build_ui():
     DEFAULT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    with gr.Blocks(title="VK Engine") as demo:
-        gr.Markdown("# VK Engine")
+    with gr.Blocks(title="VK Compute") as demo:
+        gr.Markdown("# VK Compute")
         layer_rows = gr.State([])
         layer_vals = gr.State([])
         locked = gr.State(False)
@@ -541,7 +545,6 @@ def build_ui():
                 with gr.Row():
                     model_path = gr.Textbox(label="Model path", scale=4)
                     pick_file_btn = gr.Button("Choose file", scale=1)
-                    pick_dir_btn = gr.Button("Choose folder", scale=1)
                 with gr.Accordion("Quantization", open=False):
                     with gr.Row():
                         preset_attn = gr.Dropdown(label="Set all attn", choices=PRESET_CHOICES, value="custom")
@@ -621,12 +624,6 @@ def build_ui():
                     chat_status = gr.Textbox(label="Status", interactive=False, scale=3)
 
         pick_file_btn.click(pick_model_file, outputs=[model_path]).then(
-            on_model_change,
-            inputs=[model_path],
-            outputs=[layer_rows, layer_vals, locked, max_ctx, prefill_chunk, embed_q, lm_head_q,
-                     embed_lm_q, experts_vram, preset_attn, preset_ffn, preset_btn],
-        )
-        pick_dir_btn.click(pick_model_dir, outputs=[model_path]).then(
             on_model_change,
             inputs=[model_path],
             outputs=[layer_rows, layer_vals, locked, max_ctx, prefill_chunk, embed_q, lm_head_q,
