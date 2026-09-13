@@ -24,6 +24,7 @@ typedef struct operation {
 } operation;
 
 void execute(session s, operation ops[], int opCount);
+void dispatchReset(VkDevice device);
 void executeLogged(session s, operation ops[], int opCount, const char* phase, int token);
 void executeRecord(session* s, operation ops[], int opCount);
 void executeSubmitNow(session* s);

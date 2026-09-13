@@ -125,38 +125,43 @@ model_state createState(session s, const model_config* spec, int maxM, int vocab
         st.moeP = createZeroed(s, (int64_t)sizeof(float) * maxM * slots * d->K, "moeP");
     }
 
-    buffer bufs[35 + 6 * MODEL_MAX_LAYERS] = {
-        st.h, st.act, st.embStaged, st.embOut, st.yGated, st.attnOut, st.gAttn, st.qOut,
-        st.qProj, st.kProj, st.vProj, st.zProj, st.aProj, st.bProj,
-        st.maxValue, st.maxIndex, st.result,
-        st.gAct, st.uAct, st.invRms, st.qkvRaw, st.gemvPartial, st.qkvPartial,
-        st.ffnPartial, st.linprojPartial, st.attPartial, st.smSum, st.logits, st.attScores,
-        st.moeIds, st.moeWeights, st.moeSharedW, st.moeXn, st.moeH, st.moeP
+    buffer* bufs[35 + 6 * MODEL_MAX_LAYERS] = {
+        &st.h, &st.act, &st.embStaged, &st.embOut, &st.yGated, &st.attnOut, &st.gAttn, &st.qOut,
+        &st.qProj, &st.kProj, &st.vProj, &st.zProj, &st.aProj, &st.bProj,
+        &st.maxValue, &st.maxIndex, &st.result,
+        &st.gAct, &st.uAct, &st.invRms, &st.qkvRaw, &st.gemvPartial, &st.qkvPartial,
+        &st.ffnPartial, &st.linprojPartial, &st.attPartial, &st.smSum, &st.logits, &st.attScores,
+        &st.moeIds, &st.moeWeights, &st.moeSharedW, &st.moeXn, &st.moeH, &st.moeP
     };
     int nb = 35;
     for (int L = 0; L < d->layerCount; L++) {
         if (spec->layers[L].attn.type == ATTENTION_FULL) {
-            bufs[nb++] = st.kCache[L];
-            bufs[nb++] = st.vCache[L];
-            bufs[nb++] = st.kScale[L];
-            bufs[nb++] = st.kZero[L];
-            bufs[nb++] = st.vScale[L];
-            bufs[nb++] = st.vZero[L];
+            bufs[nb++] = &st.kCache[L];
+            bufs[nb++] = &st.vCache[L];
+            bufs[nb++] = &st.kScale[L];
+            bufs[nb++] = &st.kZero[L];
+            bufs[nb++] = &st.vScale[L];
+            bufs[nb++] = &st.vZero[L];
         }
     }
-    createTransferAndCopy(s.dev.device, s.dev.queue, bufs, nb);
-    for (int i = 0; i < nb; i++) releaseStaging(s.dev.device, &bufs[i]);
+    buffer transfer[35 + 6 * MODEL_MAX_LAYERS];
+    for (int i = 0; i < nb; i++) transfer[i] = *bufs[i];
+    createTransferAndCopy(s.dev.device, s.dev.queue, transfer, nb);
+    for (int i = 0; i < nb; i++) releaseStaging(s.dev.device, bufs[i]);
 
-    buffer persist[2 * MODEL_MAX_LAYERS + 1];
+    buffer* persist[2 * MODEL_MAX_LAYERS + 1];
     int np = 0;
     for (int L = 0; L < d->layerCount; L++) {
         if (spec->layers[L].attn.type == ATTENTION_DELTA) {
-            persist[np++] = st.stateS[L];
-            persist[np++] = st.convHist[L];
+            persist[np++] = &st.stateS[L];
+            persist[np++] = &st.convHist[L];
         }
     }
-    persist[np++] = st.sampleHistory;
-    createTransferAndCopy(s.dev.device, s.dev.queue, persist, np);
+    persist[np++] = &st.sampleHistory;
+    buffer persistTransfer[2 * MODEL_MAX_LAYERS + 1];
+    for (int i = 0; i < np; i++) persistTransfer[i] = *persist[i];
+    createTransferAndCopy(s.dev.device, s.dev.queue, persistTransfer, np);
+    for (int i = 0; i < np; i++) releaseStaging(s.dev.device, persist[i]);
 
     return st;
 }

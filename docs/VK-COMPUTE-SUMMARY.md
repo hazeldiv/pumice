@@ -1,12 +1,13 @@
 # VK Compute — Complete Technical Summary
 
-A Vulkan-based GPU compute engine for running LLM inference — **multi-model** (any Qwen3.5/3.6-family checkpoint, currently **Qwen3.6-35B-A3B** (MoE), **Qwen3.5 9B**, and **Qwen3.5 2B**), all model dimensions **read at runtime from config files** (no per-model recompile) — with per-layer **hybrid quantization** (INT4, INT8, FP16) and **MoE expert offloading** (per-layer expert pools split between VRAM and host-visible RAM) on AMD RDNA1-class GPUs (RX 580: 36 CUs, wave64). Three entry points, all gated by `main.exe`:
+A Vulkan-based GPU compute engine for running LLM inference — **multi-model** (any Qwen3.5/3.6-family checkpoint, currently **Qwen3.6-35B-A3B** (MoE), **Qwen3.5 9B**, and **Qwen3.5 2B**), all model dimensions **read at runtime from config files** (no per-model recompile) — with per-layer **hybrid quantization** (INT4, INT8, FP16) and **MoE expert offloading** (per-layer expert pools split between VRAM and host-visible RAM) on AMD RDNA1-class GPUs (RX 580: 36 CUs, wave64). Four entry points — three gated by `main.exe` plus a **Node.js native addon** (`bin/vk_compute.node`) that backs the React web UI:
 
-- **Server mode** (`main.exe`, default): a **persistent** inference daemon. It loads the real safetensors weights once (Â§4.7), then serves repeated "tokenize — generate" requests over a length-prefixed binary protocol on stdin/stdout (`[uint32 n][nÃ—uint32 ids]` in — a stream of `[uint32 id]` tokens terminated by a `0xFFFFFFFF` sentinel; `n == 0` shuts down). Tokens are emitted **one at a time** as they are generated. The Python frontend `vk_llm.py` (repo root, run under `.venv` via **uv**) tokenizes text, drives the daemon, and detokenizes output.
+- **Server mode** (`main.exe`, default): a **persistent** inference daemon. It loads the real safetensors weights once (§4.7), then serves repeated "tokenize — generate" requests over a length-prefixed binary protocol on stdin/stdout (`[uint32 n][n×uint32 ids]` in — a stream of `[uint32 id]` tokens terminated by a `0xFFFFFFFF` sentinel; `n == 0` shuts down). Tokens are emitted **one at a time** as they are generated. The Python frontend `vk_llm.py` (repo root, run under `.venv` via **uv**) tokenizes text, drives the daemon, and detokenizes output.
 - **Validation mode** (`main.exe val`): the original shader harness — randomized test data, weight transpose/quantize/upload, GPU dispatch, comparison against single-threaded CPU references.
-- **Memory-info mode** (`main.exe meminfo`): dumps the device memory heaps/types (Â§3.2) and exits — used to diagnose the VRAM budget (Â§12).
+- **Memory-info mode** (`main.exe meminfo`): dumps the device memory heaps/types (§3.2) and exits — used to diagnose the VRAM budget (§12).
+- **Node addon mode** (`bin/vk_compute.node`, §14): the same engine core compiled into an N-API shared library. It owns the model, tokenizer (via the vendored `tokenizers-c` static lib, §14.2), and generation loop in-process, streaming tokens to JavaScript through a threadsafe function. The `webui/` React + Vite frontend talks to a small Node server that exposes model probe/load/unload and SSE chat endpoints.
 
-Both the server and the harness share the same `operation` dispatch core (Â§3.3).
+Both the server and the harness share the same `operation` dispatch core (§3.3); the Node addon reuses the same `createGenerator`/`generateTokens` core through `src/engine.c`.
 
 > **Model status.** The engine runs the **text stack only** (the `mtp.*` and `model.visual.*` tensors are ignored) — and it runs it **perfectly** against the real Qwen3.5 weights, both 9B and 2B, and the **Qwen3.6-35B-A3B MoE** (40 layers: 30 gated delta-net + 10 full-attention, every FFN a 256-expert top-8 MoE with a shared expert — §7.8). The **gated delta-net** is HF-identical to the Qwen3.5 block (§7.3), and the full-attention / FFN layers match the reference, including the **runtime-generalized GQA head mapping** (`kvh = head / gqa`, `gqa = heads/kv_heads` — any ratio, not just 16/4), the attention `1/sqrt(head_dim)` scaling, partial RoPE (64/256), and the `Qwen3_5RMSNorm` `1+weight` convention. Prefill layers track the HF reference at 0.96–0.9999 cosine correlation, and the decode trajectory matches the pruned-vocab-constrained HF greedy exactly, token-for-token (§13). Both **thinking** and **non-thinking** modes produce coherent, correct output (see §13). The 2B additionally validated greedy token-for-token against HF through long-context decode (past the split-K threshold at ctx 256). The 35B-A3B runs with 32 experts/layer in VRAM + 224 in host RAM at ~10.7 tok/s decode (pruned vocab, gqa 8 verified layer-by-layer against a CPU safetensors reference: delta L0 corr 0.9999, attention L3 corr 0.998, all 9 MoE slots >= 0.986).
 
@@ -56,17 +57,32 @@ The per-layer spec (attention type from `layer_types[]`, quant from `quant_confi
 
 ```
 vk-compute/
-       vk_llm.py                 # Python frontend: start_llm/tokenize/generate (uv venv, drvies main.exe server)
+       vk_llm.py                 # Python frontend: start_llm/tokenize/generate (uv venv, drives main.exe server)
+       webui.py                  # (legacy) Gradio web UI on top of vk_llm.py
+       test_webui.mjs            # Node end-to-end test for the addon + webui server
        tools/tokenize_cli.py  tools/detokenize.py   # standalone tokenize/detokenize helpers
        tools/json_reader.py  tools/cmp_layers.py    # vocab / HF layer-comparison helpers
        tools/run_dump.py             # drives --dump layer-differential runs
-        tools/setup_2b.py            # (legacy) 2B prep: checks tokenizer parity, runs the pruner
+       tools/gen_node_lib.ps1        # builds build/libnode.a from the running node.exe (N-API imports)
+       tools/setup_2b.py            # (legacy) 2B prep: checks tokenizer parity, runs the pruner
         tools/pruner/                # vocab pruner (Wikipedia corpus, chat-token protection)
              pruner.py  vocab_select.py  emit.py  gather_weights.py  check.py
              engine_harness.py  compare_hf.py  cmp_hidden.py  (.venv with torch/transformers)
         tools/vocab_collect/         # top-p token collection + vocab growth (2026-09)
              prompts.py  collect.py  build_vocab.py  (uses .venv: tokenizers + numpy)
-       Makefile                    # recursive shader build -> bin/shader/*.spv
+       tokenizers/                  # vendored tokenizers-cpp (Rust) static libs + C API header
+            include/tokenizers_c.h   # C API (new_from_str / encode / decode / id_to_token ...)
+            include/tokenizers_cpp.h # C++ wrapper (unused; the addon uses the C API)
+            lib/libtokenizers_c.a    # MinGW (x86_64-pc-windows-gnu) Rust static lib, 29 MB
+            lib/libtokenizers_cpp.a  # C++ wrapper static lib (unused)
+       webui/                       # React + Vite frontend and Node/Express server (§14)
+            package.json  vite.config.ts  tsconfig.json  index.html
+            server/index.ts          # Express API: probe/load/unload/chat(SSE) + static dist
+            server/engine.ts         # EngineManager: wraps the addon, chat template, streaming
+            server/probe.ts          # model probe: safetensors shard/config checks, gguf+hqm meta
+            server/types.ts          # shared API types
+            src/App.tsx  src/api.ts  src/components/*  src/styles.css
+       Makefile                    # recursive shader build -> bin/shader/*.spv; builds main.exe + vk_compute.node
        include/                    # C headers
             buffer.h  data.h  descriptor.h  device.h  dispatch.h
             fence.h  pipeline.h  session.h  validation.h
@@ -77,6 +93,7 @@ vk-compute/
             weights.h               # weight tensors (block-transposed, quantized)
             state.h                 # activation / KV-cache / scratch buffers
             generate.h              # generator struct + prefill/generateTokens/reset
+            engine.h                # engine lifecycle shared by the addon (engineOpen/Close/Generate)
        src/
             main.c                  # arg dispatch: default=server, `val`=harness, `meminfo`
             compute.c               # serverMain (server loop) + memInfo
@@ -87,6 +104,8 @@ vk-compute/
             validation.c            # CPU reference impls + all validate* functions
             generate.c              # op compiler: chunked prefill, decode groups, lm head
             weights.c  state.c      # cache-first weight upload, state buffers (all dims runtime)
+            engine.c                # engineOpen/Tokenize/Decode/Generate/Close + tokenizer loading
+            addon.c                 # N-API bindings (createEngine/tokenize/decode/generate/destroy)
             session.c device.c buffer.c command.c fence.c   # Vulkan setup
             descriptor.c pipeline.c dispatch.c              # descriptors, pipelines (spec constants), dispatch
             data.c                  # pseudo-random data, fp16/bf16 conversion, transpose_block16, quantize
@@ -271,7 +290,7 @@ Loading is **cache-first and lazy at every level, for every weight class** (matr
 
 **Config & pruning pipeline** (runs before weights, in `serverMain`):
 
-1. `loadModelConfig` (src/model.c) parses `<modelDir>/config.json` (HF: hidden_size, layer count, layer_types, head counts, head_dim, intermediate_size, linear_* geometry, rope_parameters, tie_word_embeddings, vocab_size) with the generic JSON DOM parser (src/json.c) and derives `qkvN`, `projN`, `zqkvN`, `kvRows`, offsets, `rotaryDim`. It then parses `quant_config.json` (name, max_ctx, prefill_chunk, per-layer attn/ffn quant, embed/lm_head quant). **`vocab` is mode-dependent**: `--prune` → the hardcoded pruned size `MODEL_VOCAB` = 102400 (include/generated_vocab.h); no `--prune` → `config.json`'s original `vocab_size` (248320). `vocab_size` must be read **before** `json_free(hf)` — after the free the pointer dangles (gotcha 35's use-after-free trap, hit again here).
+1. `loadModelConfig` (src/model.c) parses `<modelDir>/config.json` (HF: hidden_size, layer count, layer_types, head counts, head_dim, intermediate_size, linear_* geometry, rope_parameters, tie_word_embeddings, vocab_size) with the generic JSON DOM parser (src/json.c) and derives `qkvN`, `projN`, `zqkvN`, `kvRows`, offsets, `rotaryDim`. It then parses `quant_config.json` (name, max_ctx, prefill_chunk, per-layer attn/ffn quant, embed/lm_head quant). **`--quant-config <path>`** overrides the per-directory file for both safetensors and GGUF models (the web UI uses it to pass a UI-generated quant config without touching the model dir; HQM ignores it — quant is baked in). **`vocab` is mode-dependent**: `--prune` → the hardcoded pruned size `MODEL_VOCAB` = 102400 (include/generated_vocab.h); no `--prune` → `config.json`'s original `vocab_size` (248320). `vocab_size` must be read **before** `json_free(hf)` — after the free the pointer dangles (gotcha 35's use-after-free trap, hit again here).
 2. `pruneVocab(modelDir, spec)` (src/prune.c, gated by the `--prune` flag) resolves vocab weights in cache-first order:
    - **weight cache**: if `bin/weights/<name>/embed_<V>_FP16.bin` (and `lmHead_<V>_FP16.bin` for untied models) exists with a matching `{magic, K, V, FP16}` header, skip the gather entirely;
    - **vocab folder**: if `<modelDir>/vocab/embed_tokens.<V>.safetensors` (and `lm_head.<V>` for untied) exists, skip the gather;
@@ -349,7 +368,27 @@ endef
 $(foreach f,$(SHADERS),$(eval $(call COMPILE_SHADER,$(f))))
 ```
 
-Run: `make` builds shaders + `bin/main.exe`; the executable is normally launched by the server/Python path (Â§11). `make clean` removes `bin/` and `build/` recursively.
+Run: `make` builds shaders + `bin/main.exe` + `bin/vk_compute.node`; the executable is normally launched by the server/Python path (§11), the addon by the Node server (§14). `make clean` removes `bin/` and `build/` recursively.
+
+**Node addon target** (`bin/vk_compute.node`): the Makefile compiles `src/*.c` except `main.c`/`addon.c`/`engine.c` into `CORE_OBJS`, then links `build/addon.o build/engine.o $(CORE_OBJS)` against the tokenizers static lib and an N-API import library:
+
+```makefile
+CORE_SRCS    := $(filter-out $(SRC_DIR)/main.c $(SRC_DIR)/addon.c $(SRC_DIR)/engine.c,$(SRCS))
+NODE_EXE     := $(shell node -p "process.execPath")
+NODE_INC     ?= $(firstword $(wildcard $(LOCALAPPDATA)/node-gyp/Cache/*/include/node))
+NODE_LIB     := $(BUILD_DIR)/libnode.a
+
+$(BUILD_DIR)/libnode.a:
+	powershell -NoProfile -ExecutionPolicy Bypass -File tools/gen_node_lib.ps1 -NodeExe "$(NODE_EXE)" -OutLib "$(NODE_LIB)"
+
+$(BIN_DIR)/$(NODE_MODULE): $(ADDON_OBJS) $(NODE_LIB) $(TOKENIZERS)/lib/libtokenizers_c.a
+	$(CC) $(CFLAGS) $^ -o $@ $(NODE_LDFLAGS)
+```
+
+- `tools/gen_node_lib.ps1` lists the `napi_*` exports of the **running** `node.exe` with `objdump -p`, writes a `.def`, and runs `dlltool` to produce a GNU import library — this avoids depending on an MSVC `node.lib` (MinGW's `ld` cannot consume the MSVC import records) and always matches the active Node version.
+- N-API headers come from the node-gyp cache (`%LOCALAPPDATA%/node-gyp/Cache/<ver>/include/node`); N-API is ABI-stable, so headers from an older version link/run against a newer Node.
+- `NODE_LDFLAGS` adds `-shared` plus the Rust runtime deps (`-lws2_32 -luserenv -lbcrypt -lntdll -ladvapi32 -lole32 -loleaut32 -lpsapi -lshell32 -lshlwapi -lcrypt32`). The tokenizers lib is a MinGW (`x86_64-pc-windows-gnu`) Rust staticlib (identified by its `___chkstk_ms` references), so it links with the same gcc toolchain as the rest of the engine; `libtokenizers_cpp.a` is not needed (the C API is used directly).
+- Rust staticlibs emit `.drectve` `-exclude-symbols` records that MinGW `ld` reports as `unrecognized` warnings; they are harmless.
 
 > **Windows quirks** (important): the effective recipe shell is `cmd.exe`, so `mkdir`/`if exist` must use **backslashes** (`bin\shader`) — cmd treats `/` as a switch prefix — and folder names must not contain spaces (GNU make word-splits `$(wildcard)`/`$(foreach)` output on spaces, hence `Full-Attention/` and `Linear-Attention/` rather than `Full Attention/`).
 
@@ -1486,7 +1525,7 @@ The table above is the **validation harness** (M=64). The engine additionally se
 
 ```bash
 make clean          # removes bin/ and build/  (required after ANY header edit — see gotcha 12)
-make                # compiles all shader/**/*.comp -> bin/shader/*.spv, builds bin/main.exe
+make                # shaders -> bin/shader/*.spv, builds bin/main.exe + bin/vk_compute.node
 
 cd bin && main.exe val       # validation harness (every validate* + max_err + timing)
 cd bin && main.exe meminfo   # dump memory heaps/types (device-local vs host-visible) and exit
@@ -1638,4 +1677,167 @@ probability) is the path to the all-VRAM ~25 tok/s.
     under the old decode cap) is retrieved correctly, short-prompt runs are unchanged at 32768 and
     8192, and `main.exe val` is fully green.
 
-.
+---
+
+## 14. Node addon & Web UI
+
+The React web UI runs on top of the same C engine, compiled into a Node native addon instead of the
+stdin/stdout daemon. The Python frontend (`vk_llm.py`, `webui.py`) is kept and still works — both
+frontends share `createGenerator`/`generateTokens`.
+
+### 14.1 Layout
+
+```
+bin/vk_compute.node        # N-API addon (make target)
+include/engine.h           # engine_options, engine_* API
+src/engine.c               # engineOpen/Close/Tokenize/Decode/Generate + tokenizer loading
+src/addon.c                # N-API bindings (C only, no C++ wrapper)
+tools/gen_node_lib.ps1     # node.exe -> build/libnode.a (napi_* import lib)
+tokenizers/                # vendored tokenizers-cpp (Rust staticlib + C API header)
+webui/                     # React + Vite frontend + Express/TypeScript server
+test_webui.mjs             # Node end-to-end test (spawns the server, probes/loads/chats/unloads)
+```
+
+### 14.2 Tokenizer integration (`tokenizers/`, `src/engine.c`)
+
+Tokenization moved into C via the vendored **tokenizers-cpp** C API
+(`tokenizers/include/tokenizers_c.h`): `tokenizers_new_from_str` (HF `tokenizer.json`),
+`byte_level_bpe_tokenizers_new_from_str` (BPE from vocab/merges), `tokenizers_encode`,
+`tokenizers_decode` + `tokenizers_get_decode_str`, `tokenizers_free`. The static lib
+`tokenizers/lib/libtokenizers_c.a` is a MinGW (`x86_64-pc-windows-gnu`) Rust build, linkable with
+the project's gcc (see §5).
+
+`loadTokenizer` in `src/engine.c` resolves the tokenizer exactly like the Python frontend, in this
+order:
+
+1. **HQM** — an embedded `tokenizer.json` tensor (`tokenizers_new_from_str`); otherwise the
+   `tokenizer.tokens`/`tokenizer.merges`/`tokenizer.token_type` tensors, turned into byte-level BPE
+   blobs.
+2. **GGUF** — `tokenizer.ggml.tokens`/`.merges`/`.token_type` from the GGUF KV metadata.
+3. **Safetensors** — `<dir>/vocab/tokenizer.json` when `--prune`, else `<dir>/tokenizer.json`.
+
+The byte-level BPE blobs follow tokenizers-cpp's exact expectations (verified against the Rust
+source): **vocab = JSON object `{token: id}`**, **merges = newline-separated `"a b"` lines** (not a
+JSON array), and **added_tokens = JSON object `{token: id}`** for token types 2/3/4 (control/user/
+unused specials). A wrong format makes the Rust side panic (`Invalid added_tokens.json file.`), which
+aborts the process — hence the format is exact.
+
+`engineGenerate` accumulates generated ids and, per token, calls `tokenizers_decode` on the full
+list, computes the suffix delta against the previous decode, and hands `(token, delta)` to the emit
+callback. This mirrors `vk_llm.generate_stream_tokens`.
+
+### 14.3 Engine layer (`src/engine.c`)
+
+```c
+typedef struct { const char* weights; const char* quantConfig; int maxCtx; int prune;
+                 int expertsVram; int exportModel; const char* exportDir; } engine_options;
+
+engine* engineOpen(const engine_options* opts, char* err, size_t errCap);
+int  engineTokenize(engine* e, const char* text, int addSpecial, uint32_t** out, size_t* n);
+char* engineDecode(engine* e, const uint32_t* ids, size_t n);
+void engineGenerate(engine* e, const uint32_t* prompt, size_t n, const sample_params* p,
+                    uint32_t seed, int maxNew, engine_emit emit, void* ctx);
+void engineClose(engine* e);
+```
+
+`engineOpen` runs the same startup sequence as `serverMain` — `loadModelConfig` (with the optional
+`--quant-config` override, §4.7) → `hqm_resolve` → `pruneVocab` → `parseEos` → `createSession` →
+`createGenerator` → `loadTokenizer`. `engineGenerate` wraps `generatorSetSampling` + `resetGenerator`
++ `generateTokens` with the per-token decode callback.
+
+### 14.4 N-API addon (`src/addon.c`)
+
+Exports an object with `createEngine`, `destroyEngine`, `engineInfo`, `tokenize`, `decode`,
+`generate` (pure N-API C, no `node-addon-api`). `createEngine` and `generate` run on
+`napi_async_work` worker threads so the JS event loop stays free; `generate` streams tokens through a
+`napi_threadsafe_function` whose JS callback receives `{ token, delta }`. A single-generation guard
+rejects concurrent calls. `createEngine` returns a Promise; the engine handle is a
+`napi_create_external` with a finalizer that calls `engineClose`.
+
+### 14.5 Web server (`webui/server/`)
+
+A small Express + TypeScript server (default `127.0.0.1:8787`) that loads the addon and serves the
+built React app:
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/api/status` | GET | `{ loaded, info, engine }` |
+| `/api/models` | GET | scan `model/` for safetensors dirs + `.gguf`/`.hqm` files (dropdown source) |
+| `/api/probe` | POST | validate + summarize a model (see below) |
+| `/api/load` | POST | write the UI quant config to `bin/webui_quant.json`, `createEngine`, load |
+| `/api/unload` | POST | `destroyEngine` |
+| `/api/chat` | POST | build the Qwen chat template, tokenize, generate; **SSE** stream of `{delta}` then `{done,tokens,elapsedMs}` |
+
+`probe.ts` mirrors the Gradio validation: for **safetensors** it reads `config.json` (required
+`text_config` fields, `layer_types` count, `max_position_embeddings`, `num_experts`,
+`tie_word_embeddings`), resolves the shard list from `model.safetensors.index.json` or the
+`model*.safetensors` glob, and verifies every shard (including the `%05d-of-%05d` sequence) exists;
+for **GGUF** it walks the KV metadata (tolerant `Reader` that streams from the file descriptor, so
+multi-GB files never load into memory) for `block_count`/`full_attention_interval`/`expert_count`/
+`context_length`; for **HQM** it parses the header (KV pairs + tensor directory) and reads the
+`config.layer_type`/`layer_attn_quant`/`layer_ffn_quant` int32 tensors. An existing
+`quant_config.json` next to the model pre-fills the per-layer quant table.
+
+The quant config written by `/api/load` has the same shape as `quant_config.json`
+(`name`, `max_ctx`, `prefill_chunk`, `embed`, `lm_head`, optional `experts_vram`, `layers[]`) and is
+passed to the engine through `--quant-config`; the model directory is never modified. HQM models
+ignore the quant config (quant is baked into the file) and the UI locks the editor.
+
+### 14.6 React UI (`webui/src/`)
+
+Three tabs, matching the Gradio feature set:
+
+- **Model** — a `model/` dropdown (A1111-style) plus a free-text path field; probe/validation
+  status; a collapsible **Quantization** accordion with a per-layer `attn`/`ffn` `FP16`/`INT8`/
+  `INT4` selector and "set all" presets (disabled + dimmed for HQM); max context (bounded by
+  `max_position_embeddings`), prefill chunk; `Embed quant`/`LM head quant` for untied models or a
+  single `Embed/LM head quant` for tied models; `Experts in VRAM` only for MoE models; prune-vocab
+  and export-HQM toggles with an export dir. **Load / Export HQM** writes the `.hqm`.
+- **Sampling** — a `Sampling` checkbox reveals temperature / top-k / top-p / min-p / repetition
+  penalty / penalty length / presence penalty / seed; a `Max new tokens` checkbox reveals a slider
+  capped at the context size; thinking + hide-thinking toggles; system prompt.
+- **Chat** — single-session streaming chat (SSE deltas), token/s status, and a Clear button.
+
+### 14.7 Build, run, test
+
+```bash
+make                       # also builds bin/vk_compute.node
+
+cd webui
+npm install                # once
+npm run build              # vite -> webui/dist
+npm start                  # Express server on 127.0.0.1:8787 (serves dist + /api)
+# development: npm run dev  (vite on :5173 proxying /api -> :8787)
+
+node test_webui.mjs        # from the repo root: spawns the server and runs the end-to-end test
+```
+
+`test_webui.mjs` starts `webui/server/index.ts` via the local `tsx`, waits for `/api/status`, then
+checks the model scan, probes for HQM/GGUF/safetensors (and a missing-shard rejection), loads the
+pruned 2B HQM, streams a chat reply, serves the built UI, and unloads.
+
+### 14.8 In-process reload fixes (2026-09)
+
+The addon is the first consumer to load, destroy, and reload models **in one process** (`main.exe`
+never did), and it exposed two long-standing bugs that the old exit-immediately lifecycle had masked.
+
+1. **Teardown double-free.** `createState` copied its buffer list into a local array and called
+   `releaseStaging` on the **copies**, so the staging Vulkan buffer/memory was destroyed early while
+   the real state buffers still held the handles — `destroyState` then freed them a second time
+   (`STATUS_HEAP_CORRUPTION`, exit `0xC0000374`). The tied-embedding path had the same shape:
+   `w.lmHead = w.embed` was assigned *before* `weightFlush()` released the embed staging, leaving
+   `w.lmHead` with a stale staging handle that `destroyWeights` freed again. Fixes: `createState`
+   tracks `buffer*` pointers and releases staging through them (including the persistent
+   `stateS`/`convHist`/`sampleHistory` staging); `createWeights` re-aliases `w.lmHead = w.embed`
+   **after** `weightFlush()`.
+2. **Stale device-scoped caches.** `pipeCache`, `descPool`/`descCache` (src/dispatch.c) and the
+   spec-constant values (src/pipeline.c) are process-global and keyed only by shader/descriptor
+   shape, but `createSession` builds a **new `VkDevice`** per engine load. The second engine reused
+   pipelines and a descriptor pool created on the destroyed device, hanging or crashing during the
+   next load. Fix: `dispatchReset(VkDevice)` destroys every cached pipeline/layout/set-layout and the
+   descriptor pool, clears the caches, and calls `pipelineClearSpec()`; `destroySession` calls it
+   (via `dispatch.h`) before tearing down the device.
+
+`main.exe` and the addon now tear down cleanly (exit 0) for HQM, GGUF, and safetensors, and the web
+UI can load/unload/reload models repeatedly — `test_webui.mjs` covers HQM → chat → unload →
+safetensors(+UI quant+prune) → chat → unload.

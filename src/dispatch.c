@@ -67,6 +67,19 @@ int isTimingEnabled(void) {
     return timingEnabled;
 }
 
+void dispatchReset(VkDevice device) {
+    for (int i = 0; i < pipeCacheCount; i++) {
+        if (pipeCache[i].pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeCache[i].pipeline, NULL);
+        if (pipeCache[i].layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, pipeCache[i].layout, NULL);
+        if (pipeCache[i].setLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, pipeCache[i].setLayout, NULL);
+    }
+    pipeCacheCount = 0;
+    if (descPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, descPool, NULL);
+    descPool = VK_NULL_HANDLE;
+    descCacheCount = 0;
+    pipelineClearSpec();
+}
+
 static VkDescriptorSet getDescriptorSet(session s, VkDescriptorSetLayout layout, const operation* op) {
     for (int i = 0; i < descCacheCount; i++) {
         desc_entry* e = &descCache[i];

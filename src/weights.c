@@ -1120,6 +1120,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     }
 
     weightFlush();
+    if (d->tied) w.lmHead = w.embed;
 
     if (!verboseWeights) {
         fprintf(stderr, "\r[OK] loaded weights: %.2f MB             \n",
