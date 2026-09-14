@@ -1,20 +1,11 @@
 import express from "express";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import { EngineManager, type LoadOptions } from "./engine";
+import { addonPath, distDir, exportRoot, launchCwd, modelRoot, quantTmp } from "./paths";
 import { probeModel, scanModels } from "./probe";
 import type { ChatMessage, Quant, QuantConfig, Sampling } from "./types";
-
-const here = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(here, "..", "..");
-const binDir = path.join(repoRoot, "bin");
-const distDir = path.join(repoRoot, "webui", "dist");
-const modelRoot = path.join(repoRoot, "model");
-const addonPath = path.join(binDir, "vk_compute.node");
-const quantTmp = path.join(binDir, "webui_quant.json");
-
-process.chdir(binDir);
 
 const engine = new EngineManager(addonPath, quantTmp);
 const app = express();
@@ -22,7 +13,7 @@ app.use(express.json({ limit: "4mb" }));
 
 function resolveInput(target: string): string {
   if (!target) return target;
-  return path.isAbsolute(target) ? target : path.resolve(repoRoot, target);
+  return path.isAbsolute(target) ? target : path.resolve(launchCwd, target);
 }
 
 const QUANT_VALUES = new Set(["fp16", "int8", "int4"]);
@@ -83,7 +74,7 @@ app.post("/api/load", async (req, res) => {
     quant,
     prune: Boolean(body.prune) && info.kind !== "hqm",
     exportModel: Boolean(body.exportModel),
-    exportDir: resolveInput(String(body.exportDir ?? path.join(repoRoot, "exported"))),
+    exportDir: resolveInput(String(body.exportDir ?? exportRoot)),
     maxCtx,
     expertsVram: info.experts > 0 ? expertsVram : 0,
   };
@@ -162,9 +153,23 @@ if (fs.existsSync(distDir)) {
 const port = Number(process.env.PORT ?? 8787);
 process.on("uncaughtException", (e) => console.error("uncaught:", e));
 process.on("unhandledRejection", (e) => console.error("unhandled:", e));
+
+function openBrowser(url: string): void {
+  const [cmd, args] = process.platform === "win32"
+    ? ["cmd", ["/c", "start", "", url]]
+    : process.platform === "darwin"
+      ? ["open", [url]]
+      : ["xdg-open", [url]];
+  try {
+    spawn(cmd, args, { detached: true, stdio: "ignore" }).unref();
+  } catch {}
+}
+
 app.listen(port, "127.0.0.1", () => {
-  console.log(`vk-compute webui server on http://127.0.0.1:${port}`);
+  const url = `http://127.0.0.1:${port}`;
+  console.log(`vk-compute webui server on ${url}`);
   if (!fs.existsSync(addonPath)) {
     console.warn(`missing addon: ${addonPath} (run make)`);
   }
+  if (process.env.VK_COMPUTE_OPEN === "1") openBrowser(url);
 });

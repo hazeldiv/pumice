@@ -6,26 +6,69 @@ The engine implements the model's full text stack: 32 transformer layers with hy
 
 To fit the vocabulary in VRAM, the model's 248,320-token head is pruned to 86,016 rows.
 
+The engine ships with a local web UI (`npm install -g @h4zel/vk-compute`, then run `vk-compute` — see [Web UI](#web-ui)) and a Python CLI frontend.
+
 ## Project Layout
 
 | Path | Contents |
 |---|---|
-| `src/`, `include/` | C engine: weight loading, op dispatch, token server |
+| `src/`, `include/` | C engine: weight loading, op dispatch, token server, Node addon |
 | `shader/` | 121 GLSL compute shaders (GEMV/GEMM, attention, sampler) |
 | `vk_llm.py` | Python frontend: chat template, tokenization, streaming, sampling config |
+| `webui/` | React + Vite frontend and Express server on top of the Node addon |
+| `cli.js`, `pack.mjs`, `release.mjs`, `platform/win32-x64/` | npm packaging (`@h4zel/vk-compute`) |
 | `docs/VK-COMPUTE-SUMMARY.md` | Full technical documentation |
 | `model/` | Weights (not in git) |
 | `pruned-vocab/` | Pruned-vocab artifacts: mapping.npy, pruned tokenizer (not in git) |
 
-## Requirements
+## Web UI
+
+The easiest way to run the engine is the npm package — a local web server with a model loader, per-layer quantization editor, sampling controls, and a streaming chat playground. No build step, no Python.
+
+```bash
+npm install -g @h4zel/vk-compute
+```
+
+Run it from a folder that contains your models and the pruned-vocab artifacts:
+
+```
+my-models/
+   model/          # safetensors dirs, .gguf, or .hqm files
+   pruned-vocab/   # mapping.npy + pruned tokenizer
+```
+
+```bash
+cd my-models
+vk-compute
+```
+
+The UI opens automatically at `http://127.0.0.1:8787`. Options:
+
+| Option | Description |
+|---|---|
+| `-p, --port <port>` | port to listen on (default 8787) |
+| `-m, --models <dir>` | model directory to scan (default `./model`) |
+| `--no-open` | do not open the browser |
+
+Web UI requirements:
+
+- Windows x64
+- Node.js 18 or newer
+- A Vulkan-capable GPU with a current driver (built and tuned for the RX 580 8 GB)
+- A models folder as shown above
+
+To run the web UI from a source checkout instead: `make`, then in `webui/`: `npm install`, `npm run build`, `npm start`. End-to-end test: `node test_webui.mjs` from the repo root.
+
+## Requirements (building from source)
 
 - Windows with MinGW-w64 / MSYS2 UCRT64 (`gcc`, `make`)
 - Vulkan SDK (tested with 1.4.350)
-- Python 3.9+ with [uv](https://docs.astral.sh/uv/), plus `tokenizers`
+- Node.js 18+ (for the web UI / addon build)
+- Python 3.9+ with [uv](https://docs.astral.sh/uv/), plus `tokenizers` (for the Python frontend)
 - A GPU with 8 GB VRAM (built and tuned for the RX 580)
 - Qwen3.5 safetensors under `model/Qwen3.5-9B/` (or `model/Qwen3.5-2B/`), with the pruned-vocab artifacts (mapping, pruned tokenizer) under `pruned-vocab/`
 
-## Build & Run
+## Build & Run (Python frontend)
 
 ```bash
 # Python deps (once)

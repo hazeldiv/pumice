@@ -1,0 +1,37 @@
+{
+  "name": "@h4zel/vk-compute",
+  "version": "1.0.1",
+  "description": "Vulkan LLM inference engine with a local web UI",
+  "type": "module",
+  "main": "cli.js",
+  "bin": {
+    "vk-compute": "cli.js"
+  },
+  "files": [
+    "cli.js",
+    "webui/dist",
+    "webui/dist-server"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@h4zel/vk-compute-win32-x64": "1.0.1"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "scripts": {
+    "build:webui": "npm --prefix webui run build:all",
+    "pack": "node pack.mjs",
+    "prepack": "node pack.mjs",
+    "release": "node release.mjs"
+  },
+  "license": "MIT"
+}

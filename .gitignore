@@ -5,9 +5,14 @@ tools/pruner/__pycache__
 tools/pruner/.venv
 __pycache__
 .venv
+node_modules
 tools
 data
 bin
 build
 model
+exported
 tokenizers-cpp
+platform/win32-x64/vk_compute.node
+platform/win32-x64/shader
+webui/dist-server

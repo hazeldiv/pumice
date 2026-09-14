@@ -5,7 +5,7 @@ A Vulkan-based GPU compute engine for running LLM inference — **multi-model** 
 - **Server mode** (`main.exe`, default): a **persistent** inference daemon. It loads the real safetensors weights once (§4.7), then serves repeated "tokenize — generate" requests over a length-prefixed binary protocol on stdin/stdout (`[uint32 n][n×uint32 ids]` in — a stream of `[uint32 id]` tokens terminated by a `0xFFFFFFFF` sentinel; `n == 0` shuts down). Tokens are emitted **one at a time** as they are generated. The Python frontend `vk_llm.py` (repo root, run under `.venv` via **uv**) tokenizes text, drives the daemon, and detokenizes output.
 - **Validation mode** (`main.exe val`): the original shader harness — randomized test data, weight transpose/quantize/upload, GPU dispatch, comparison against single-threaded CPU references.
 - **Memory-info mode** (`main.exe meminfo`): dumps the device memory heaps/types (§3.2) and exits — used to diagnose the VRAM budget (§12).
-- **Node addon mode** (`bin/vk_compute.node`, §14): the same engine core compiled into an N-API shared library. It owns the model, tokenizer (via the vendored `tokenizers-c` static lib, §14.2), and generation loop in-process, streaming tokens to JavaScript through a threadsafe function. The `webui/` React + Vite frontend talks to a small Node server that exposes model probe/load/unload and SSE chat endpoints.
+- **Node addon mode** (`bin/vk_compute.node`, §14): the same engine core compiled into an N-API shared library. It owns the model, tokenizer (via the vendored `tokenizers-c` static lib, §14.2), and generation loop in-process, streaming tokens to JavaScript through a threadsafe function. The `webui/` React + Vite frontend talks to a small Node server that exposes model probe/load/unload and SSE chat endpoints. The whole thing is published to npm as **`@h4zel/vk-compute`** (§14.9): `npm i -g @h4zel/vk-compute` then run `vk-compute` from a folder containing `model/` and `pruned-vocab/`.
 
 Both the server and the harness share the same `operation` dispatch core (§3.3); the Node addon reuses the same `createGenerator`/`generateTokens` core through `src/engine.c`.
 
@@ -57,13 +57,17 @@ The per-layer spec (attention type from `layer_types[]`, quant from `quant_confi
 
 ```
 vk-compute/
+       package.json              # npm package @h4zel/vk-compute (bin: vk-compute -> cli.js)
+       cli.js                    # CLI entry: args, platform-binary resolution, browser open
+       pack.mjs                  # prepack: vite build + esbuild server bundle + runtime staging
+       release.mjs               # version bump + publish (platform package, then main)
        vk_llm.py                 # Python frontend: start_llm/tokenize/generate (uv venv, drives main.exe server)
        webui.py                  # (legacy) Gradio web UI on top of vk_llm.py
        test_webui.mjs            # Node end-to-end test for the addon + webui server
        tools/tokenize_cli.py  tools/detokenize.py   # standalone tokenize/detokenize helpers
        tools/json_reader.py  tools/cmp_layers.py    # vocab / HF layer-comparison helpers
        tools/run_dump.py             # drives --dump layer-differential runs
-       tools/gen_node_lib.ps1        # builds build/libnode.a from the running node.exe (N-API imports)
+       gen_node_lib.ps1               # builds build/libnode.a from the running node.exe (N-API imports)
        tools/setup_2b.py            # (legacy) 2B prep: checks tokenizer parity, runs the pruner
         tools/pruner/                # vocab pruner (Wikipedia corpus, chat-token protection)
              pruner.py  vocab_select.py  emit.py  gather_weights.py  check.py
@@ -75,9 +79,12 @@ vk-compute/
             include/tokenizers_cpp.h # C++ wrapper (unused; the addon uses the C API)
             lib/libtokenizers_c.a    # MinGW (x86_64-pc-windows-gnu) Rust static lib, 29 MB
             lib/libtokenizers_cpp.a  # C++ wrapper static lib (unused)
+       platform/win32-x64/          # npm platform package @h4zel/vk-compute-win32-x64 (§14.9)
+            package.json             # os/cpu restricted; ships vk_compute.node + shader/ (staged by pack.mjs)
        webui/                       # React + Vite frontend and Node/Express server (§14)
-            package.json  vite.config.ts  tsconfig.json  index.html
+            package.json  vite.config.ts  tsconfig.json  index.html  .npmignore
             server/index.ts          # Express API: probe/load/unload/chat(SSE) + static dist
+            server/paths.ts          # runtime/dist/models/export/pruned-vocab path resolution + chdir
             server/engine.ts         # EngineManager: wraps the addon, chat template, streaming
             server/probe.ts          # model probe: safetensors shard/config checks, gguf+hqm meta
             server/types.ts          # shared API types
@@ -163,7 +170,7 @@ model/<name>/
            tokenizer.json  tokenizer_config.json  vocab.json
            mapping.npy                   # new-id — original-id int32[V]
 
-pruned-vocab/                            # repo root, hardcoded in C (PRUNED_VOCAB_DIR)
+pruned-vocab/                            # repo root by default (PRUNED_VOCAB_DIR); VK_PRUNED_VOCAB_DIR overrides
        mapping.npy                       # new-id — original-id int32[102400]
        tokenizer.json  tokenizer_config.json  vocab.json   # pruned tokenizer (renumbered ids)
        topp_tokens.json                  # union of top-p nuclei from the coding-token collection run
@@ -295,7 +302,7 @@ Loading is **cache-first and lazy at every level, for every weight class** (matr
    - **weight cache**: if `bin/weights/<name>/embed_<V>_FP16.bin` (and `lmHead_<V>_FP16.bin` for untied models) exists with a matching `{magic, K, V, FP16}` header, skip the gather entirely;
    - **vocab folder**: if `<modelDir>/vocab/embed_tokens.<V>.safetensors` (and `lm_head.<V>` for untied) exists, skip the gather;
    - **auto-prune**: open all shards (`model.safetensors*.safetensors` glob), read `pruned-vocab/mapping.npy` (int32[V], new-id — original-id; the npy header's version bytes must be skipped — gotcha 36; its length must equal V), and gather `row v` = source row `mapping[v]` from `embed_tokens` (and `lm_head` for untied models — the lm-head tensor can live in a different shard, so the multi-shard `safetensors_open` is required) into `vocab/embed_tokens.<V>.safetensors` / `vocab/lm_head.<V>.safetensors` (BF16, proper safetensors header).
-   - In every outcome the tokenizer files (`tokenizer.json`/`tokenizer_config.json`/`vocab.json`/`mapping.npy`) are ensured in `vocab/` from the hardcoded root `pruned-vocab/` dir (`PRUNED_VOCAB_DIR`, include/prune.h) — both `parseEos` and the Python frontend need them regardless of the gather decision.
+   - In every outcome the tokenizer files (`tokenizer.json`/`tokenizer_config.json`/`vocab.json`/`mapping.npy`) are ensured in `vocab/` from the root `pruned-vocab/` dir (`prunedVocabDir()` in src/prune.c — `VK_PRUNED_VOCAB_DIR` if set, else `PRUNED_VOCAB_DIR` `"../pruned-vocab"` from include/prune.h) — both `parseEos` and the Python frontend need them regardless of the gather decision.
 3. `parseEos(&spec.dims, modelDir, pruned)` (src/model.c, public) derives **EOS from the tokenizer files** so it can never drift (gotcha 35: a hardcoded id from a stale header once made generation never stop). Pruned mode reads `vocab/tokenizer_config.json`'s `eos_token` name and resolves it in `vocab/vocab.json` (85992). Original mode reads the model-root `tokenizer_config.json` and resolves the name in the root `vocab.json` — but the original `vocab.json` contains **no special tokens**, so on miss it falls back to `tokenizer.json`'s `added_tokens` array (id 248046 for `<|im_end|>`). It runs *after* pruning (pruning is what materializes the vocab files on a fresh model dir) and before `createGenerator`.
 4. Weight tensor discovery globs `model.safetensors*.safetensors` (any shard count) instead of hardcoding 4 shards. Vocab-file discovery is V-exact: `findVocabFile` matches `embed_tokens.<V>.safetensors` by name, so a 248320 run ignores the 86016 files in `vocab/` and loads the full-size tensors straight from the shards (the pruned files are the wrong shape and must not be candidates).
 
@@ -379,13 +386,13 @@ NODE_INC     ?= $(firstword $(wildcard $(LOCALAPPDATA)/node-gyp/Cache/*/include/
 NODE_LIB     := $(BUILD_DIR)/libnode.a
 
 $(BUILD_DIR)/libnode.a:
-	powershell -NoProfile -ExecutionPolicy Bypass -File tools/gen_node_lib.ps1 -NodeExe "$(NODE_EXE)" -OutLib "$(NODE_LIB)"
+	powershell -NoProfile -ExecutionPolicy Bypass -File gen_node_lib.ps1 -NodeExe "$(NODE_EXE)" -OutLib "$(NODE_LIB)"
 
 $(BIN_DIR)/$(NODE_MODULE): $(ADDON_OBJS) $(NODE_LIB) $(TOKENIZERS)/lib/libtokenizers_c.a
 	$(CC) $(CFLAGS) $^ -o $@ $(NODE_LDFLAGS)
 ```
 
-- `tools/gen_node_lib.ps1` lists the `napi_*` exports of the **running** `node.exe` with `objdump -p`, writes a `.def`, and runs `dlltool` to produce a GNU import library — this avoids depending on an MSVC `node.lib` (MinGW's `ld` cannot consume the MSVC import records) and always matches the active Node version.
+- `gen_node_lib.ps1` (repo root, so it is not swallowed by the gitignored `tools/`) lists the `napi_*` exports of the **running** `node.exe` with `objdump -p`, writes a `.def`, and runs `dlltool` to produce a GNU import library — this avoids depending on an MSVC `node.lib` (MinGW's `ld` cannot consume the MSVC import records) and always matches the active Node version.
 - N-API headers come from the node-gyp cache (`%LOCALAPPDATA%/node-gyp/Cache/<ver>/include/node`); N-API is ABI-stable, so headers from an older version link/run against a newer Node.
 - `NODE_LDFLAGS` adds `-shared` plus the Rust runtime deps (`-lws2_32 -luserenv -lbcrypt -lntdll -ladvapi32 -lole32 -loleaut32 -lpsapi -lshell32 -lshlwapi -lcrypt32`). The tokenizers lib is a MinGW (`x86_64-pc-windows-gnu`) Rust staticlib (identified by its `___chkstk_ms` references), so it links with the same gcc toolchain as the rest of the engine; `libtokenizers_cpp.a` is not needed (the C API is used directly).
 - Rust staticlibs emit `.drectve` `-exclude-symbols` records that MinGW `ld` reports as `unrecognized` warnings; they are harmless.
@@ -1688,11 +1695,16 @@ frontends share `createGenerator`/`generateTokens`.
 ### 14.1 Layout
 
 ```
+package.json               # npm package @h4zel/vk-compute (bin: vk-compute)
+cli.js                     # CLI: args, platform-package resolution, browser open
+pack.mjs                   # prepack: build webui + stage runtime into platform/win32-x64
+release.mjs                # version bump + publish both packages
+platform/win32-x64/        # @h4zel/vk-compute-win32-x64: vk_compute.node + shader/ (staged)
 bin/vk_compute.node        # N-API addon (make target)
 include/engine.h           # engine_options, engine_* API
 src/engine.c               # engineOpen/Close/Tokenize/Decode/Generate + tokenizer loading
 src/addon.c                # N-API bindings (C only, no C++ wrapper)
-tools/gen_node_lib.ps1     # node.exe -> build/libnode.a (napi_* import lib)
+gen_node_lib.ps1           # node.exe -> build/libnode.a (napi_* import lib)
 tokenizers/                # vendored tokenizers-cpp (Rust staticlib + C API header)
 webui/                     # React + Vite frontend + Express/TypeScript server
 test_webui.mjs             # Node end-to-end test (spawns the server, probes/loads/chats/unloads)
@@ -1757,14 +1769,19 @@ rejects concurrent calls. `createEngine` returns a Promise; the engine handle is
 ### 14.5 Web server (`webui/server/`)
 
 A small Express + TypeScript server (default `127.0.0.1:8787`) that loads the addon and serves the
-built React app:
+built React app. `paths.ts` centralizes path resolution so the server works both from the repo and
+from an npm install: the runtime dir (addon + `shader/`, `VK_COMPUTE_RUNTIME`), the served `dist`,
+and the model root are environment-driven, and `process.chdir(runtimeDir)` is done before any engine
+use (the engine's shader lookup is cwd-relative). The model root defaults to the launch cwd's
+`model/`, `pruned-vocab/` to the launch cwd's (passed to C through `VK_PRUNED_VOCAB_DIR`, §4.7), the
+quant temp file to the OS temp dir, and exports to the launch cwd's `exported/`.
 
 | Route | Method | Purpose |
 |---|---|---|
 | `/api/status` | GET | `{ loaded, info, engine }` |
-| `/api/models` | GET | scan `model/` for safetensors dirs + `.gguf`/`.hqm` files (dropdown source) |
+| `/api/models` | GET | scan the model root for safetensors dirs + `.gguf`/`.hqm` files (dropdown source) |
 | `/api/probe` | POST | validate + summarize a model (see below) |
-| `/api/load` | POST | write the UI quant config to `bin/webui_quant.json`, `createEngine`, load |
+| `/api/load` | POST | write the UI quant config to a temp file, `createEngine`, load |
 | `/api/unload` | POST | `destroyEngine` |
 | `/api/chat` | POST | build the Qwen chat template, tokenize, generate; **SSE** stream of `{delta}` then `{done,tokens,elapsedMs}` |
 
@@ -1800,6 +1817,8 @@ Three tabs, matching the Gradio feature set:
 
 ### 14.7 Build, run, test
 
+From the repo:
+
 ```bash
 make                       # also builds bin/vk_compute.node
 
@@ -1815,6 +1834,14 @@ node test_webui.mjs        # from the repo root: spawns the server and runs the 
 `test_webui.mjs` starts `webui/server/index.ts` via the local `tsx`, waits for `/api/status`, then
 checks the model scan, probes for HQM/GGUF/safetensors (and a missing-shard rejection), loads the
 pruned 2B HQM, streams a chat reply, serves the built UI, and unloads.
+
+Installed as a global command (see §14.9):
+
+```bash
+npm install -g @h4zel/vk-compute
+vk-compute                 # from a folder containing model/ and pruned-vocab/
+vk-compute --port 9000 --models D:\models --no-open
+```
 
 ### 14.8 In-process reload fixes (2026-09)
 
@@ -1841,3 +1868,54 @@ never did), and it exposed two long-standing bugs that the old exit-immediately 
 `main.exe` and the addon now tear down cleanly (exit 0) for HQM, GGUF, and safetensors, and the web
 UI can load/unload/reload models repeatedly — `test_webui.mjs` covers HQM → chat → unload →
 safetensors(+UI quant+prune) → chat → unload.
+
+### 14.9 npm packaging (`@h4zel/vk-compute`)
+
+The web UI ships as a global npm command. The native binary cannot be built by `node-gyp` (the
+tokenizers staticlib is MinGW-only), so the package follows the esbuild/better-sqlite3 pattern:
+a **pure-JS main package** plus a **platform companion package** pulled in through
+`optionalDependencies`.
+
+```
+@h4zel/vk-compute              # main (JS only): cli.js, webui/dist, webui/dist-server
+  optionalDependencies:
+    @h4zel/vk-compute-win32-x64  # prebuilt: vk_compute.node + shader/*.spv (~14.7 MB unpacked)
+```
+
+- **`cli.js`** parses `--port` / `--models` / `--no-open`, resolves the platform package with
+  `require.resolve("@h4zel/vk-compute-win32-x64/package.json")` (clear error if the platform is
+  unsupported or the optional dep failed to install), exports `VK_COMPUTE_RUNTIME`,
+  `VK_COMPUTE_CWD`, `VK_COMPUTE_MODELS`, `VK_PRUNED_VOCAB_DIR`, `VK_COMPUTE_EXPORT_DIR`,
+  `VK_COMPUTE_QUANT_TMP`, `VK_COMPUTE_OPEN` and `PORT`, then imports the bundled server. Models
+  default to `./model` and pruned-vocab to `./pruned-vocab` **relative to the directory where the
+  command was run** (not the install dir); the browser is opened on listen unless `--no-open`.
+- **Server bundling.** `webui/package.json`'s `build:server` runs esbuild
+  (`--bundle --platform=node --format=esm --packages=external`) to produce
+  `webui/dist-server/index.mjs`; the only runtime dependency is `express`, so the installed CLI needs
+  no TypeScript toolchain.
+- **`pack.mjs`** (the `prepack` hook) verifies the main and platform versions match and the engine
+  artifacts exist, runs `build:all`, then stages `bin/vk_compute.node` + `bin/shader/` into
+  `platform/win32-x64/`. `files` whitelists in both `package.json`s (plus `webui/.npmignore`, which
+  overrides the nested `dist/` gitignore rule) control the tarball contents.
+- **`release.mjs <major|minor|patch|x.y.z>`** bumps both versions in lockstep (and the
+  `optionalDependencies` pin), runs `pack.mjs`, then publishes the platform package **before** the
+  main package so the pinned dependency already exists.
+
+```bash
+node release.mjs patch               # bump + build + publish both packages
+node release.mjs patch --otp 123456  # when the npm account has 2FA enabled
+```
+
+Publishing uses the `@h4zel` scope (the npm username). If the account enforces 2FA, pass a fresh
+one-time password with `--otp` (or set `NPM_OTP`), or configure an npm **Automation** access token
+in `.npmrc` to bypass the OTP prompt.
+
+Install and run:
+
+```bash
+npm install -g @h4zel/vk-compute
+cd D:\models\my-project       # contains model/ and pruned-vocab/
+vk-compute                    # http://127.0.0.1:8787 opens automatically
+```
+
+Requirements: Windows x64, a Vulkan-capable GPU with a current driver, and Node ≥ 18.

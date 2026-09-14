@@ -1,0 +1,16 @@
+{
+  "name": "@h4zel/vk-compute-win32-x64",
+  "version": "1.0.1",
+  "description": "Prebuilt VK Compute engine binary for Windows x64",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "vk_compute.node",
+    "shader"
+  ],
+  "license": "MIT"
+}

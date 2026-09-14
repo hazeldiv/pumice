@@ -45,7 +45,7 @@ $(BIN_DIR)/$(TARGET): $(MAIN_OBJS)
 
 $(BUILD_DIR)/libnode.a:
 	@if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
-	powershell -NoProfile -ExecutionPolicy Bypass -File tools/gen_node_lib.ps1 -NodeExe "$(NODE_EXE)" -OutLib "$(NODE_LIB)"
+	powershell -NoProfile -ExecutionPolicy Bypass -File gen_node_lib.ps1 -NodeExe "$(NODE_EXE)" -OutLib "$(NODE_LIB)"
 
 $(BIN_DIR)/$(NODE_MODULE): $(ADDON_OBJS) $(NODE_LIB) $(TOKENIZERS)/lib/libtokenizers_c.a
 	@if not exist $(BIN_DIR) mkdir $(BIN_DIR)

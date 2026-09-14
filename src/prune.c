@@ -14,6 +14,11 @@
 #define HEAD_NAME "lm_head.weight"
 #define GATHER_CHUNK 8192
 
+const char* prunedVocabDir(void) {
+    const char* dir = getenv("VK_PRUNED_VOCAB_DIR");
+    return (dir && dir[0]) ? dir : PRUNED_VOCAB_DIR;
+}
+
 static void pfatal(const char* msg) {
     fprintf(stderr, "prune: %s\n", msg);
     exit(1);
@@ -180,12 +185,12 @@ int pruneVocab(const char* modelPath, const model_config* spec) {
     int needEmbed = !vocabFileExists(modelDir, "embed_tokens");
     int needHead = !d->tied && !vocabFileExists(modelDir, "lm_head");
     if (!needEmbed && !needHead) {
-        ensureTokenizerFiles(vocabDir, PRUNED_VOCAB_DIR);
+        ensureTokenizerFiles(vocabDir, prunedVocabDir());
         return 0;
     }
 
     char path[512];
-    snprintf(path, sizeof(path), "%s/mapping.npy", PRUNED_VOCAB_DIR);
+    snprintf(path, sizeof(path), "%s/mapping.npy", prunedVocabDir());
     int32_t* mapping = loadMapping(path, d->vocab);
 
     safetensors sf;
@@ -213,6 +218,6 @@ int pruneVocab(const char* modelPath, const model_config* spec) {
 
     safetensors_close(&sf);
     free(mapping);
-    ensureTokenizerFiles(vocabDir, PRUNED_VOCAB_DIR);
+    ensureTokenizerFiles(vocabDir, prunedVocabDir());
     return 1;
 }

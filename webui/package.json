@@ -8,6 +8,8 @@
     "dev:server": "tsx watch server/index.ts",
     "dev:web": "vite",
     "build": "vite build",
+    "build:server": "esbuild server/index.ts --bundle --platform=node --format=esm --target=node18 --packages=external --outfile=dist-server/index.mjs",
+    "build:all": "npm run build && npm run build:server",
     "start": "tsx server/index.ts",
     "typecheck": "tsc --noEmit"
   },
@@ -23,6 +25,7 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "concurrently": "^9.1.0",
+    "esbuild": "^0.24.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^5.4.11"
