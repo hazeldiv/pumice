@@ -76,6 +76,10 @@ button.secondary {
   color: var(--text);
 }
 
+button.stop {
+  background: var(--error);
+}
+
 button:disabled {
   opacity: 0.5;
   cursor: default;
@@ -127,6 +131,14 @@ textarea {
 
 .field.slider b {
   color: var(--text);
+}
+
+.slider-num {
+  width: 110px;
+}
+
+.chat-options {
+  margin-bottom: 10px;
 }
 
 .check {

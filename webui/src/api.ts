@@ -74,11 +74,13 @@ export interface ChatDone {
 export async function chatStream(
   payload: ChatPayload,
   onDelta: (delta: string) => void,
+  signal?: AbortSignal,
 ): Promise<ChatDone> {
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    signal,
   });
   if (!res.ok || !res.body) throw new Error(`chat failed (${res.status})`);
 

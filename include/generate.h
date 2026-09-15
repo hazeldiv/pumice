@@ -38,12 +38,14 @@ typedef struct generator {
     char dumpTopPPath[512];
     FILE* dumpTopPFile;
     uint32_t dumpTopPStep;
+    volatile int stop;
 } generator;
 
 generator* createGenerator(session s, const model_config* spec, const char* weightDir, int verboseWeights);
 void destroyGenerator(generator* g);
 uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens);
 void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNewTokens, void (*emit)(uint32_t token, void* ctx), void* ctx);
+void generatorRequestStop(generator* g);
 void resetGenerator(generator* g);
 void generatorSetDumpDir(generator* g, const char* dir);
 void generatorDumpPrefill(generator* g, int rows);

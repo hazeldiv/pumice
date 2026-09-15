@@ -361,6 +361,17 @@ static napi_value generate(napi_env env, napi_callback_info info) {
     return promise;
 }
 
+static napi_value requestStop(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+    if (argc >= 1) {
+        engine* e = unwrap(env, argv[0]);
+        if (e != NULL) engineRequestStop(e);
+    }
+    return NULL;
+}
+
 NAPI_MODULE_INIT() {
     napi_value fn;
     napi_create_function(env, "createEngine", NAPI_AUTO_LENGTH, createEngine, NULL, &fn);
@@ -375,5 +386,7 @@ NAPI_MODULE_INIT() {
     napi_set_named_property(env, exports, "decode", fn);
     napi_create_function(env, "generate", NAPI_AUTO_LENGTH, generate, NULL, &fn);
     napi_set_named_property(env, exports, "generate", fn);
+    napi_create_function(env, "requestStop", NAPI_AUTO_LENGTH, requestStop, NULL, &fn);
+    napi_set_named_property(env, exports, "requestStop", fn);
     return exports;
 }

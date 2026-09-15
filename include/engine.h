@@ -31,5 +31,6 @@ void engineGenerate(engine* e, const uint32_t* prompt, size_t count, const sampl
 int engineVocab(const engine* e);
 int engineEos(const engine* e);
 int engineMaxCtx(const engine* e);
+void engineRequestStop(engine* e);
 
 #endif

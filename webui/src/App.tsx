@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { chatStream, listModels, loadModel, probeModel, unloadModel, type ModelEntry } from "./api";
 import type { ChatMessage, LayerRow, ProbeInfo, Quant } from "../server/types";
 import { ModelTab, type ModelForm } from "./components/ModelTab";
@@ -6,7 +6,6 @@ import { SamplingTab, type SamplingState } from "./components/SamplingTab";
 import { ChatTab } from "./components/ChatTab";
 
 type Tab = "model" | "sampling" | "chat";
-
 const DEFAULT_FORM: ModelForm = {
   path: "",
   maxCtx: 32768,
@@ -38,13 +37,6 @@ const DEFAULT_SAMPLING: SamplingState = {
   maxCtx: 32768,
 };
 
-function visible(text: string, hide: boolean): string {
-  if (!hide) return text;
-  const closed = text.replace(/<think>[\s\S]*?<\/think>/g, "");
-  const open = closed.indexOf("<think>");
-  return open >= 0 ? closed.slice(0, open) : closed;
-}
-
 export default function App() {
   const [tab, setTab] = useState<Tab>("model");
   const [models, setModels] = useState<ModelEntry[]>([]);
@@ -58,6 +50,7 @@ export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [chatStatus, setChatStatus] = useState("");
+  const abortRef = useRef<AbortController | null>(null);
 
   const refreshModels = async () => {
     try {
@@ -149,6 +142,8 @@ export default function App() {
     setStreaming(true);
     setChatStatus("generating...");
     let acc = "";
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       const done = await chatStream(
         {
@@ -169,17 +164,27 @@ export default function App() {
         },
         (delta) => {
           acc += delta;
-          setMessages([...history, { role: "assistant", content: visible(acc, sampling.hideThinking) }]);
+          setMessages([...history, { role: "assistant", content: acc }]);
         },
+        controller.signal,
       );
       const rate = done.elapsedMs > 0 ? (done.tokens / (done.elapsedMs / 1000)).toFixed(1) : "0";
       setChatStatus(`${done.tokens} tokens, ${rate} tok/s`);
     } catch (e) {
-      setChatStatus(String(e));
-      setMessages([...history, { role: "assistant", content: `Error: ${e}` }]);
+      if ((e as Error)?.name === "AbortError") {
+        setChatStatus("stopped");
+      } else {
+        setChatStatus(String(e));
+        setMessages([...history, { role: "assistant", content: `Error: ${e}` }]);
+      }
     } finally {
+      abortRef.current = null;
       setStreaming(false);
     }
+  };
+
+  const stop = () => {
+    abortRef.current?.abort();
   };
 
   const clearChat = () => {
@@ -217,14 +222,22 @@ export default function App() {
           />
         )}
         {tab === "sampling" && (
-          <SamplingTab state={sampling} onChange={(patch) => setSampling((s) => ({ ...s, ...patch }))} />
+          <SamplingTab
+            state={sampling}
+            onChange={(patch) => setSampling((s) => ({ ...s, ...patch }))}
+            onReset={() => setSampling((s) => ({ ...DEFAULT_SAMPLING, maxCtx: s.maxCtx }))}
+          />
         )}
         {tab === "chat" && (
           <ChatTab
             messages={messages}
             streaming={streaming}
             status={chatStatus}
+            thinking={sampling.thinking}
+            hideThinking={sampling.hideThinking}
+            onOptions={(patch) => setSampling((s) => ({ ...s, ...patch }))}
             onSend={send}
+            onStop={stop}
             onClear={clearChat}
           />
         )}

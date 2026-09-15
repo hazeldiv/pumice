@@ -19,6 +19,7 @@ export interface SamplingState {
 interface Props {
   state: SamplingState;
   onChange: (patch: Partial<SamplingState>) => void;
+  onReset: () => void;
 }
 
 function Num({ label, value, min, max, step, onChange, disabled }: {
@@ -34,19 +35,27 @@ function Num({ label, value, min, max, step, onChange, disabled }: {
   );
 }
 
-function Slider({ label, value, min, max, step, onChange }: {
+function Slider({ label, value, min, max, step, onChange, editable }: {
   label: string; value: number; min: number; max: number; step: number; onChange: (v: number) => void;
+  editable?: boolean;
 }) {
   return (
     <label className="field slider">
       <span>{label} <b>{value}</b></span>
       <input type="range" min={min} max={max} step={step} value={value}
         onChange={(e) => onChange(Number(e.target.value))} />
+      {editable && (
+        <input type="number" className="slider-num" min={min} max={max} step={step} value={value}
+          onChange={(e) => {
+            const v = Number(e.target.value);
+            if (Number.isFinite(v)) onChange(Math.min(max, Math.max(min, Math.round(v))));
+          }} />
+      )}
     </label>
   );
 }
 
-export function SamplingTab({ state, onChange }: Props) {
+export function SamplingTab({ state, onChange, onReset }: Props) {
   return (
     <div className="sampling">
       <div className="row">
@@ -55,16 +64,7 @@ export function SamplingTab({ state, onChange }: Props) {
             onChange={(e) => onChange({ enabled: e.target.checked })} />
           Sampling
         </label>
-        <label className="check">
-          <input type="checkbox" checked={state.thinking}
-            onChange={(e) => onChange({ thinking: e.target.checked })} />
-          Thinking
-        </label>
-        <label className="check">
-          <input type="checkbox" checked={state.hideThinking}
-            onChange={(e) => onChange({ hideThinking: e.target.checked })} />
-          Hide thinking in chat
-        </label>
+        <button className="secondary" onClick={onReset}>Reset to defaults</button>
       </div>
 
       {state.enabled && (
@@ -95,7 +95,7 @@ export function SamplingTab({ state, onChange }: Props) {
       </label>
       {state.limitMaxNew && (
         <Slider label="Max new tokens" value={state.maxNew} min={1} max={state.maxCtx} step={1}
-          onChange={(v) => onChange({ maxNew: v })} />
+          editable onChange={(v) => onChange({ maxNew: v })} />
       )}
 
       <label className="field">

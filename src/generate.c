@@ -978,7 +978,12 @@ uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens) {
     return results[0];
 }
 
+void generatorRequestStop(generator* g) {
+    if (g != NULL) g->stop = 1;
+}
+
 void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNewTokens, void (*emit)(uint32_t token, void* ctx), void* ctx) {
+    g->stop = 0;
     if (nPrompt >= g->maxCtx) {
         fprintf(stderr, "prompt length %d exceeds max ctx %d\n", nPrompt, g->maxCtx);
         return;
@@ -1058,7 +1063,7 @@ void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNe
     int eos = 0;
     int units = fullGroups + (rem > 0 ? 1 : 0);
     double prevDelay = FIRST_TOKEN_DELAY_MS;
-    for (int u = 0; u < units && !eos; u++) {
+    for (int u = 0; u < units && !eos && !g->stop; u++) {
         int cur = (u == fullGroups) ? rem : DECODE_GROUP;
         int next = ((rem > 0) && (u + 1 == fullGroups)) ? rem : DECODE_GROUP;
 
@@ -1087,6 +1092,7 @@ void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNe
                 eos = 1;
                 break;
             }
+            if (g->stop) break;
             sleepMs(prevDelay);
         }
 

@@ -92,6 +92,11 @@ app.post("/api/unload", (_req, res) => {
   res.json({ ok: true });
 });
 
+app.post("/api/chat/stop", (_req, res) => {
+  engine.stopGeneration();
+  res.json({ ok: true });
+});
+
 app.post("/api/chat", async (req, res) => {
   const body = req.body ?? {};
   const messages: ChatMessage[] = Array.isArray(body.messages)
@@ -115,7 +120,10 @@ app.post("/api/chat", async (req, res) => {
   res.flushHeaders?.();
 
   let closed = false;
-  res.on("close", () => { closed = true; });
+  res.on("close", () => {
+    closed = true;
+    engine.stopGeneration();
+  });
   res.on("error", () => { closed = true; });
   const send = (event: unknown) => {
     if (closed || res.writableEnded) return;

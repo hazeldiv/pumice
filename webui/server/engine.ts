@@ -77,6 +77,10 @@ export class EngineManager {
     return this.engine ? this.vk.engineInfo(this.engine) : null;
   }
 
+  stopGeneration(): void {
+    if (this.engine) this.vk.requestStop(this.engine);
+  }
+
   async chat(
     messages: ChatMessage[],
     system: string,

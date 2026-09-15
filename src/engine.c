@@ -393,3 +393,7 @@ int engineEos(const engine* e) {
 int engineMaxCtx(const engine* e) {
     return e->spec.dims.maxCtx;
 }
+
+void engineRequestStop(engine* e) {
+    if (e != NULL && e->g != NULL) generatorRequestStop(e->g);
+}
