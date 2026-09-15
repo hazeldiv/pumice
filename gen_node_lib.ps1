@@ -7,8 +7,9 @@ $ErrorActionPreference = "Stop"
 
 $defPath = [System.IO.Path]::ChangeExtension($OutLib, ".def")
 $names = & objdump -p $NodeExe |
-    Select-String -Pattern '^\s*\[\s*\d+\]\s+(napi_\w+)\s*$' |
-    ForEach-Object { $_.Matches[0].Groups[1].Value }
+    Select-String -Pattern '\[\s*\d+\][^\r\n]*?\b(napi_\w+)\s*$' |
+    ForEach-Object { $_.Matches[0].Groups[1].Value } |
+    Select-Object -Unique
 
 if ($names.Count -eq 0) {
     throw "no napi exports found in $NodeExe"

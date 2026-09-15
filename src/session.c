@@ -1,6 +1,7 @@
 #include <vulkan/vulkan.h>
 #include "session.h"
 #include "device.h"
+#include "dispatch.h"
 #include <stdio.h>
 #include <stdlib.h>
 
