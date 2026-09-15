@@ -109,4 +109,78 @@ export async function chatStream(
   return done ?? { tokens: 0, elapsedMs: 0 };
 }
 
+export interface ScorePayload {
+  text: string;
+  prefill: number;
+  decode: number;
+  sizePct: number;
+}
+
+export interface ScoreProgress {
+  done: number;
+  total: number;
+  loss: number;
+  count: number;
+  ppl: number;
+}
+
+export interface ScoreDone {
+  ppl: number;
+  loss: number;
+  count: number;
+  chunks: number;
+  tokens: number;
+  elapsedMs: number;
+}
+
+export async function scoreStream(
+  payload: ScorePayload,
+  onProgress: (p: ScoreProgress) => void,
+  signal?: AbortSignal,
+): Promise<ScoreDone> {
+  const res = await fetch("/api/score", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    let msg = `score failed (${res.status})`;
+    try {
+      const data = await res.json();
+      if (data?.error) msg = data.error;
+    } catch {}
+    throw new Error(msg);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let done: ScoreDone | null = null;
+  let error: string | null = null;
+
+  for (;;) {
+    const { value, done: streamDone } = await reader.read();
+    if (streamDone) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const event = JSON.parse(line.slice(6));
+      if (event.progress) onProgress(event.progress as ScoreProgress);
+      if (event.done) done = event as ScoreDone;
+      if (event.error) error = event.error;
+    }
+  }
+
+  if (error) throw new Error(error);
+  if (!done) throw new Error("scoring ended without result");
+  return done;
+}
+
+export async function stopScore(): Promise<void> {
+  await fetch("/api/score/stop", { method: "POST" });
+}
+
 export type { ChatMessage, ProbeInfo, Quant, QuantConfig, Sampling };

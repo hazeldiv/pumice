@@ -1,5 +1,6 @@
 #define NAPI_VERSION 8
 #include <node_api.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -361,6 +362,124 @@ static napi_value generate(napi_env env, napi_callback_info info) {
     return promise;
 }
 
+typedef struct {
+    int done;
+    int total;
+    double loss;
+    long long count;
+} scoreEvent;
+
+typedef struct {
+    napi_async_work work;
+    napi_deferred deferred;
+    napi_threadsafe_function tsfn;
+    engine* e;
+    uint32_t* ids;
+    size_t idCount;
+    int prefill;
+    int decode;
+    int chunks;
+    double loss;
+    long long count;
+} scoreJob;
+
+static void emitScore(void* ctx, int done, int total, double lossSum, long long count) {
+    scoreJob* job = (scoreJob*)ctx;
+    scoreEvent* ev = (scoreEvent*)malloc(sizeof(scoreEvent));
+    ev->done = done;
+    ev->total = total;
+    ev->loss = lossSum;
+    ev->count = count;
+    napi_call_threadsafe_function(job->tsfn, ev, napi_tsfn_blocking);
+}
+
+static void scoreExecute(napi_env env, void* data) {
+    (void)env;
+    scoreJob* job = (scoreJob*)data;
+    engineScore(job->e, job->ids, job->prefill, job->decode, job->chunks, emitScore, job, &job->loss,
+                &job->count);
+}
+
+static void scoreTsfnCall(napi_env env, napi_value jsCallback, void* context, void* data) {
+    (void)context;
+    if (env == NULL) {
+        free(data);
+        return;
+    }
+    scoreEvent* ev = (scoreEvent*)data;
+    napi_value undefined;
+    napi_get_undefined(env, &undefined);
+    napi_value arg;
+    napi_create_object(env, &arg);
+    napi_value v;
+    napi_create_int32(env, ev->done, &v);
+    napi_set_named_property(env, arg, "done", v);
+    napi_create_int32(env, ev->total, &v);
+    napi_set_named_property(env, arg, "total", v);
+    napi_create_double(env, ev->loss, &v);
+    napi_set_named_property(env, arg, "loss", v);
+    napi_create_double(env, (double)ev->count, &v);
+    napi_set_named_property(env, arg, "count", v);
+    double ppl = ev->count > 0 ? exp(ev->loss / (double)ev->count) : 0.0;
+    napi_create_double(env, ppl, &v);
+    napi_set_named_property(env, arg, "ppl", v);
+    napi_value ignored;
+    napi_call_function(env, undefined, jsCallback, 1, &arg, &ignored);
+    free(ev);
+}
+
+static void scoreComplete(napi_env env, napi_status status, void* data) {
+    (void)status;
+    scoreJob* job = (scoreJob*)data;
+    napi_release_threadsafe_function(job->tsfn, napi_tsfn_release);
+    napi_value result;
+    napi_create_object(env, &result);
+    napi_value v;
+    napi_create_double(env, job->loss, &v);
+    napi_set_named_property(env, result, "loss", v);
+    napi_create_double(env, (double)job->count, &v);
+    napi_set_named_property(env, result, "count", v);
+    double ppl = job->count > 0 ? exp(job->loss / (double)job->count) : 0.0;
+    napi_create_double(env, ppl, &v);
+    napi_set_named_property(env, result, "ppl", v);
+    napi_resolve_deferred(env, job->deferred, result);
+    napi_delete_async_work(env, job->work);
+    free(job->ids);
+    free(job);
+    g_busy = 0;
+}
+
+static napi_value score(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4];
+    napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+    if (argc < 4) return throwError(env, "score requires engine, ids, params and callback");
+    engine* e = unwrap(env, argv[0]);
+    if (e == NULL) return throwError(env, "engine is not loaded");
+    if (g_busy) return throwError(env, "generation already in progress");
+
+    scoreJob* job = (scoreJob*)calloc(1, sizeof(scoreJob));
+    job->e = e;
+    if (!readUint32Array(env, argv[1], &job->ids, &job->idCount)) {
+        free(job);
+        return throwError(env, "ids must be a Uint32Array");
+    }
+    job->prefill = (int)getDoubleProp(env, argv[2], "prefill", 4096);
+    job->decode = (int)getDoubleProp(env, argv[2], "decode", 4096);
+    job->chunks = (int)getDoubleProp(env, argv[2], "chunks", 1);
+
+    napi_value promise;
+    napi_create_promise(env, &job->deferred, &promise);
+    napi_value name;
+    napi_create_string_utf8(env, "vkScore", NAPI_AUTO_LENGTH, &name);
+    napi_create_threadsafe_function(env, argv[3], NULL, name, 0, 1, NULL, NULL, NULL, scoreTsfnCall,
+                                    &job->tsfn);
+    napi_create_async_work(env, NULL, name, scoreExecute, scoreComplete, job, &job->work);
+    g_busy = 1;
+    napi_queue_async_work(env, job->work);
+    return promise;
+}
+
 static napi_value requestStop(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1];
@@ -388,5 +507,7 @@ NAPI_MODULE_INIT() {
     napi_set_named_property(env, exports, "generate", fn);
     napi_create_function(env, "requestStop", NAPI_AUTO_LENGTH, requestStop, NULL, &fn);
     napi_set_named_property(env, exports, "requestStop", fn);
+    napi_create_function(env, "score", NAPI_AUTO_LENGTH, score, NULL, &fn);
+    napi_set_named_property(env, exports, "score", fn);
     return exports;
 }

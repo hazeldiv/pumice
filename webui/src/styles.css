@@ -141,6 +141,35 @@ textarea {
   margin-bottom: 10px;
 }
 
+.progress {
+  position: relative;
+  height: 24px;
+  margin: 12px 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 200ms ease;
+}
+
+.progress-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+}
+
+.score .note div {
+  line-height: 1.6;
+}
+
 .check {
   display: flex;
   align-items: center;

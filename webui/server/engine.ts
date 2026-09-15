@@ -19,6 +19,20 @@ export interface ChatResult {
   elapsedMs: number;
 }
 
+export interface ScoreProgress {
+  done: number;
+  total: number;
+  loss: number;
+  count: number;
+  ppl: number;
+}
+
+export interface ScoreResult {
+  loss: number;
+  count: number;
+  ppl: number;
+}
+
 const CHAT_BOS = "<|im_start|>";
 const CHAT_EOS = "<|im_end|>";
 
@@ -79,6 +93,28 @@ export class EngineManager {
 
   stopGeneration(): void {
     if (this.engine) this.vk.requestStop(this.engine);
+  }
+
+  tokenize(text: string): Uint32Array {
+    if (!this.engine) throw new Error("no model loaded");
+    return this.vk.tokenize(this.engine, text, false);
+  }
+
+  async score(
+    ids: Uint32Array,
+    prefill: number,
+    decode: number,
+    chunks: number,
+    onProgress: (p: ScoreProgress) => void,
+  ): Promise<ScoreResult> {
+    if (!this.engine) throw new Error("no model loaded");
+    if (this.busy) throw new Error("generation already in progress");
+    this.busy = true;
+    try {
+      return await this.vk.score(this.engine, ids, { prefill, decode, chunks }, onProgress);
+    } finally {
+      this.busy = false;
+    }
   }
 
   async chat(

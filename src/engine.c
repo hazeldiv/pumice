@@ -382,6 +382,13 @@ void engineGenerate(engine* e, const uint32_t* prompt, size_t count, const sampl
     generateTokens(e->g, prompt, (int)count, maxNew, onToken, &ec);
 }
 
+void engineScore(engine* e, const uint32_t* ids, int prefillN, int decodeN, int chunks,
+                 engine_progress progress, void* ctx, double* outLoss, long long* outCount) {
+    if (e == NULL || e->g == NULL) return;
+    generatorSetScoring(e->g, 1);
+    generateScore(e->g, ids, prefillN, decodeN, chunks, progress, ctx, outLoss, outCount);
+}
+
 int engineVocab(const engine* e) {
     return e->spec.dims.vocab;
 }

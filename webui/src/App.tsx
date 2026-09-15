@@ -4,8 +4,9 @@ import type { ChatMessage, LayerRow, ProbeInfo, Quant } from "../server/types";
 import { ModelTab, type ModelForm } from "./components/ModelTab";
 import { SamplingTab, type SamplingState } from "./components/SamplingTab";
 import { ChatTab } from "./components/ChatTab";
+import { ScoreTab } from "./components/ScoreTab";
 
-type Tab = "model" | "sampling" | "chat";
+type Tab = "model" | "sampling" | "chat" | "eval";
 const DEFAULT_FORM: ModelForm = {
   path: "",
   maxCtx: 32768,
@@ -200,6 +201,7 @@ export default function App() {
           <button className={tab === "model" ? "active" : ""} onClick={() => setTab("model")}>Model</button>
           <button className={tab === "sampling" ? "active" : ""} onClick={() => setTab("sampling")}>Sampling</button>
           <button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>Chat</button>
+          <button className={tab === "eval" ? "active" : ""} onClick={() => setTab("eval")}>Eval</button>
         </nav>
       </header>
       <main>
@@ -241,6 +243,7 @@ export default function App() {
             onClear={clearChat}
           />
         )}
+        {tab === "eval" && <ScoreTab loaded={loaded} />}
       </main>
     </div>
   );

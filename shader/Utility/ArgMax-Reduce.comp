@@ -31,7 +31,7 @@ layout(set = 0, binding = 4) buffer HistoryBuffer { uint history[]; };
 layout(set = 0, binding = 5) buffer RngBuffer { uint rng[]; };
 layout(set = 0, binding = 6) writeonly restrict buffer ResultBuffer { uint result[]; };
 layout(set = 0, binding = 7) buffer PositionBuffer { uint position[]; };
-layout(set = 0, binding = 8) writeonly restrict buffer TokenIdsBuffer { uint tokenIds[]; };
+layout(set = 0, binding = 8) buffer TokenIdsBuffer { uint tokenIds[]; };
 
 shared float redVal[TS];
 shared uint redIdx[TS];
@@ -161,6 +161,53 @@ void main() {
         if (tid == 0u) {
             result[params.passIdx] = redIdx[0];
             tokenIds[0] = redIdx[0];
+            if (params.doIncrement == 1u) position[0] = position[0] + 1u;
+        }
+        return;
+    }
+
+    if (params.mode == 2u) {
+        uint V4 = (V + 3u) / 4u;
+        uint E4 = (V4 + TS - 1u) / TS;
+        uint b4 = tid * E4;
+        uint c4 = 0u;
+        if (b4 < V4) c4 = min(E4, V4 - b4);
+
+        float lmax = -3.4e38f;
+        for (uint k = 0u; k < c4; k++) {
+            vec4 t = logits[b4 + k];
+            uint j = b4 * 4u + k * 4u;
+            if (j + 1u >= V) t.y = -3.4e38f;
+            if (j + 2u >= V) t.z = -3.4e38f;
+            if (j + 3u >= V) t.w = -3.4e38f;
+            lmax = max(lmax, max(max(t.x, t.y), max(t.z, t.w)));
+        }
+        float gMax = maxAll(lmax, tid);
+
+        float mySum = 0.0f;
+        for (uint k = 0u; k < c4; k++) {
+            vec4 t = logits[b4 + k];
+            uint j = b4 * 4u + k * 4u;
+            if (j + 1u >= V) t.y = -3.4e38f;
+            if (j + 2u >= V) t.z = -3.4e38f;
+            if (j + 3u >= V) t.w = -3.4e38f;
+            mySum += (exp(t.x - gMax) + exp(t.y - gMax)) + (exp(t.z - gMax) + exp(t.w - gMax));
+        }
+        float Zall = sumAll(mySum, tid);
+
+        uint target = tokenIds[1u + params.passIdx];
+        float ltarget = 0.0f;
+        if (target >= b4 * 4u && target < b4 * 4u + c4 * 4u) {
+            uint off = target - b4 * 4u;
+            vec4 t = logits[b4 + off / 4u];
+            uint c = off % 4u;
+            ltarget = c == 0u ? t.x : (c == 1u ? t.y : (c == 2u ? t.z : t.w));
+        }
+        ltarget = sumAll(ltarget, tid);
+
+        if (tid == 0u) {
+            result[params.passIdx] = floatBitsToUint(log(Zall) + gMax - ltarget);
+            tokenIds[0] = target;
             if (params.doIncrement == 1u) position[0] = position[0] + 1u;
         }
         return;

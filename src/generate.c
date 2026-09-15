@@ -959,6 +959,11 @@ uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens) {
 
     stateSetPosition(g->s, &g->st, g->nextPos + (uint32_t)nTokens);
 
+    if (g->skipFinal) {
+        g->nextPos += (uint32_t)nTokens;
+        return 0;
+    }
+
     if (g->dumpTopPFile != NULL && g->finalOpCount >= 2) {
         executeRecord(&g->s, g->finalOps, g->finalOpCount - 1);
         executeSubmitNow(&g->s);
@@ -984,6 +989,7 @@ void generatorRequestStop(generator* g) {
 
 void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNewTokens, void (*emit)(uint32_t token, void* ctx), void* ctx) {
     g->stop = 0;
+    g->skipFinal = 0;
     if (nPrompt >= g->maxCtx) {
         fprintf(stderr, "prompt length %d exceeds max ctx %d\n", nPrompt, g->maxCtx);
         return;
@@ -1105,6 +1111,71 @@ void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNe
     executeWaitLast(&g->s);
 }
 
+void generateScore(generator* g, const uint32_t* ids, int prefillN, int decodeN, int chunks,
+                   void (*progress)(void* ctx, int done, int total, double lossSum, long long count), void* ctx,
+                   double* outLoss, long long* outCount) {
+    g->stop = 0;
+    g->skipFinal = 1;
+    double lossSum = 0.0;
+    long long count = 0;
+    int scored = 0;
+    int limit = g->maxCtx - prefillN;
+    if (limit > decodeN) limit = decodeN;
+
+    for (int k = 0; k < chunks && !g->stop && prefillN > 0 && limit > 0; k++) {
+        int s = k * prefillN;
+        resetGenerator(g);
+        runPrefill(g, ids + s, prefillN);
+
+        uint32_t* tokenIds = (uint32_t*)g->st.tokenIds.mappedMemory;
+        tokenIds[1] = ids[s + prefillN];
+
+        if (k == 0) {
+            executeLogged(g->s, g->finalOps, g->finalOpCount, "score", 0);
+            uint32_t bits = 0;
+            readBuffer(g->s.dev.device, g->s.dev.physicalDevice, g->s.dev.queue, g->st.result, &bits);
+            float loss = 0.0f;
+            memcpy(&loss, &bits, sizeof(float));
+            lossSum += (double)loss;
+            count++;
+        }
+        tokenIds[0] = ids[s + prefillN];
+
+        int j = 0;
+        while (j < limit && !g->stop) {
+            int cur = limit - j;
+            if (cur > DECODE_GROUP) cur = DECODE_GROUP;
+            for (int p = 0; p < cur; p++) tokenIds[1 + p] = ids[s + prefillN + j + 1 + p];
+
+            int split = (int)(g->nextPos >= ATT_SPLIT_THRESHOLD);
+            operation* ops = split ? g->groupOps : g->groupOpsShort;
+            int opsPerPass = (split ? g->groupOpCount : g->groupOpCountShort) / DECODE_GROUP;
+            executeRecord(&g->s, ops, cur * opsPerPass);
+            executeSubmitNow(&g->s);
+            executeWaitLast(&g->s);
+
+            uint32_t bits[DECODE_GROUP] = {0};
+            readBuffer(g->s.dev.device, g->s.dev.physicalDevice, g->s.dev.queue, g->st.result, bits);
+            for (int p = 0; p < cur; p++) {
+                float loss = 0.0f;
+                memcpy(&loss, &bits[p], sizeof(float));
+                lossSum += (double)loss;
+                count++;
+            }
+
+            g->nextPos += (uint32_t)cur;
+            j += cur;
+        }
+
+        scored++;
+        if (progress != NULL) progress(ctx, scored, chunks, lossSum, count);
+    }
+
+    g->skipFinal = 0;
+    if (outLoss != NULL) *outLoss = lossSum;
+    if (outCount != NULL) *outCount = count;
+}
+
 void resetGenerator(generator* g) {
     int count = 0;
     buffer* states = (buffer*)malloc(sizeof(buffer) * (g->layerCount * 2 + 1));
@@ -1136,6 +1207,15 @@ void generatorSetSampling(generator* g, const sample_params* p, uint32_t seed) {
     }
     if (g->sampling == sampling) return;
     g->sampling = sampling;
+    g->groupOpCount = compileDecodeGroup(g, g->groupOps, 1);
+    g->groupOpCountShort = compileDecodeGroup(g, g->groupOpsShort, 0);
+    g->finalOpCount = compileFinal(g);
+}
+
+void generatorSetScoring(generator* g, int enabled) {
+    int mode = enabled ? 2 : 0;
+    if (g->sampling == mode) return;
+    g->sampling = mode;
     g->groupOpCount = compileDecodeGroup(g, g->groupOps, 1);
     g->groupOpCountShort = compileDecodeGroup(g, g->groupOpsShort, 0);
     g->finalOpCount = compileFinal(g);

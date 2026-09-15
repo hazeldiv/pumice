@@ -19,6 +19,7 @@ typedef struct {
 typedef struct engine engine;
 
 typedef void (*engine_emit)(void* ctx, uint32_t token, const char* delta, size_t deltaLen);
+typedef void (*engine_progress)(void* ctx, int done, int total, double lossSum, long long count);
 
 engine* engineOpen(const engine_options* opts, char* err, size_t errCap);
 void engineClose(engine* e);
@@ -27,6 +28,8 @@ int engineTokenize(engine* e, const char* text, int addSpecial, uint32_t** out, 
 char* engineDecode(engine* e, const uint32_t* ids, size_t count);
 void engineGenerate(engine* e, const uint32_t* prompt, size_t count, const sample_params* params,
                     uint32_t seed, int maxNew, engine_emit emit, void* ctx);
+void engineScore(engine* e, const uint32_t* ids, int prefillN, int decodeN, int chunks,
+                 engine_progress progress, void* ctx, double* outLoss, long long* outCount);
 
 int engineVocab(const engine* e);
 int engineEos(const engine* e);

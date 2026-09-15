@@ -39,13 +39,18 @@ typedef struct generator {
     FILE* dumpTopPFile;
     uint32_t dumpTopPStep;
     volatile int stop;
+    int skipFinal;
 } generator;
 
 generator* createGenerator(session s, const model_config* spec, const char* weightDir, int verboseWeights);
 void destroyGenerator(generator* g);
 uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens);
 void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNewTokens, void (*emit)(uint32_t token, void* ctx), void* ctx);
+void generateScore(generator* g, const uint32_t* ids, int prefillN, int decodeN, int chunks,
+                   void (*progress)(void* ctx, int done, int total, double lossSum, long long count), void* ctx,
+                   double* outLoss, long long* outCount);
 void generatorRequestStop(generator* g);
+void generatorSetScoring(generator* g, int enabled);
 void resetGenerator(generator* g);
 void generatorSetDumpDir(generator* g, const char* dir);
 void generatorDumpPrefill(generator* g, int rows);

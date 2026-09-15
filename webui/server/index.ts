@@ -9,7 +9,7 @@ import type { ChatMessage, Quant, QuantConfig, Sampling } from "./types";
 
 const engine = new EngineManager(addonPath, quantTmp);
 const app = express();
-app.use(express.json({ limit: "4mb" }));
+app.use(express.json({ limit: "64mb" }));
 
 function resolveInput(target: string): string {
   if (!target) return target;
@@ -93,6 +93,78 @@ app.post("/api/unload", (_req, res) => {
 });
 
 app.post("/api/chat/stop", (_req, res) => {
+  engine.stopGeneration();
+  res.json({ ok: true });
+});
+
+app.post("/api/score", async (req, res) => {
+  const body = req.body ?? {};
+  if (!engine.status().loaded) {
+    res.status(400).json({ error: "no model loaded" });
+    return;
+  }
+  const text = String(body.text ?? "");
+  if (!text.trim()) {
+    res.status(400).json({ error: "text is required" });
+    return;
+  }
+  const prefill = Math.max(1, Number(body.prefill ?? 4096));
+  const decode = Math.max(1, Number(body.decode ?? 4096));
+  const maxCtx = engine.engineInfo()?.maxCtx ?? prefill + decode;
+  if (prefill + decode > maxCtx) {
+    res.status(400).json({ error: `prefill + decode must be <= max ctx (${maxCtx})` });
+    return;
+  }
+
+  let ids: Uint32Array;
+  try {
+    ids = engine.tokenize(text);
+  } catch (e) {
+    res.status(500).json({ error: String((e as Error)?.message ?? e) });
+    return;
+  }
+
+  const maxChunks = Math.floor((ids.length - prefill - decode - 1) / prefill) + 1;
+  if (maxChunks < 1) {
+    res.status(400).json({ error: `text too short: need at least ${prefill + decode + 1} tokens, got ${ids.length}` });
+    return;
+  }
+  const pct = Math.min(1, Math.max(0.001, Number(body.sizePct ?? 0.1)));
+  const wanted = Math.max(1, Math.floor((pct * ids.length) / prefill));
+  const chunks = Math.min(wanted, maxChunks);
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "close");
+  res.flushHeaders?.();
+
+  let closed = false;
+  res.on("close", () => {
+    closed = true;
+    engine.stopGeneration();
+  });
+  res.on("error", () => { closed = true; });
+  const send = (event: unknown) => {
+    if (closed || res.writableEnded) return;
+    try {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    } catch {
+      closed = true;
+    }
+  };
+
+  const started = Date.now();
+  try {
+    const result = await engine.score(ids, prefill, decode, chunks, (p) => send({ progress: p }));
+    send({ done: true, ...result, chunks, tokens: ids.length, elapsedMs: Date.now() - started });
+  } catch (e) {
+    send({ error: String((e as Error)?.message ?? e) });
+  } finally {
+    if (!res.writableEnded) res.end();
+  }
+});
+
+app.post("/api/score/stop", (_req, res) => {
   engine.stopGeneration();
   res.json({ ok: true });
 });
