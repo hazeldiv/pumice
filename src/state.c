@@ -161,7 +161,6 @@ model_state createState(session s, const model_config* spec, int maxM, int vocab
     buffer persistTransfer[2 * MODEL_MAX_LAYERS + 1];
     for (int i = 0; i < np; i++) persistTransfer[i] = *persist[i];
     createTransferAndCopy(s.dev.device, s.dev.queue, persistTransfer, np);
-    for (int i = 0; i < np; i++) releaseStaging(s.dev.device, persist[i]);
 
     return st;
 }

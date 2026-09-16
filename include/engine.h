@@ -28,7 +28,7 @@ int engineTokenize(engine* e, const char* text, int addSpecial, uint32_t** out, 
 char* engineDecode(engine* e, const uint32_t* ids, size_t count);
 void engineGenerate(engine* e, const uint32_t* prompt, size_t count, const sample_params* params,
                     uint32_t seed, int maxNew, engine_emit emit, void* ctx);
-void engineScore(engine* e, const uint32_t* ids, int prefillN, int decodeN, int chunks,
+void engineScore(engine* e, const uint32_t* ids, size_t count, int prefillN, int decodeN, int chunks,
                  engine_progress progress, void* ctx, double* outLoss, long long* outCount);
 
 int engineVocab(const engine* e);

@@ -56,17 +56,18 @@ void main() {
     float inv_rms = 1.0 / rms;
 
     float acc = 0.0;
-    uint baseRow = 0;
-    #pragma unroll
-    for (uint k=0;k<dims.K/4; k+=2) {
-        uvec4 rawInput = B[baseRow + globalCol];
-        vec4 outVectorA = vec4(unpackHalf2x16(rawInput.x), unpackHalf2x16(rawInput.y));
-        vec4 outVectorB = vec4(unpackHalf2x16(rawInput.z), unpackHalf2x16(rawInput.w));
+    if (globalCol < dims.N) {
+        uint baseRow = 0;
+        #pragma unroll
+        for (uint k=0;k<dims.K/4; k+=2) {
+            uvec4 rawInput = B[baseRow + globalCol];
+            vec4 outVectorA = vec4(unpackHalf2x16(rawInput.x), unpackHalf2x16(rawInput.y));
+            vec4 outVectorB = vec4(unpackHalf2x16(rawInput.z), unpackHalf2x16(rawInput.w));
 
-        acc += dot(cache[k] * inv_rms, outVectorA);
-        acc += dot(cache[k+1] * inv_rms, outVectorB);
-        baseRow += dims.N;
+            acc += dot(cache[k] * inv_rms, outVectorA);
+            acc += dot(cache[k+1] * inv_rms, outVectorB);
+            baseRow += dims.N;
+        }
+        logits[globalCol] = acc;
     }
-
-    logits[globalCol] = acc;
 }

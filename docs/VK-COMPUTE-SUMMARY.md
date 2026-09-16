@@ -5,7 +5,7 @@ A Vulkan-based GPU compute engine for running LLM inference — **multi-model** 
 - **Server mode** (`main.exe`, default): a **persistent** inference daemon. It loads the real safetensors weights once (§4.7), then serves repeated "tokenize — generate" requests over a length-prefixed binary protocol on stdin/stdout (`[uint32 n][n×uint32 ids]` in — a stream of `[uint32 id]` tokens terminated by a `0xFFFFFFFF` sentinel; `n == 0` shuts down). Tokens are emitted **one at a time** as they are generated. The Python frontend `vk_llm.py` (repo root, run under `.venv` via **uv**) tokenizes text, drives the daemon, and detokenizes output.
 - **Validation mode** (`main.exe val`): the original shader harness — randomized test data, weight transpose/quantize/upload, GPU dispatch, comparison against single-threaded CPU references.
 - **Memory-info mode** (`main.exe meminfo`): dumps the device memory heaps/types (§3.2) and exits — used to diagnose the VRAM budget (§12).
-- **Node addon mode** (`bin/vk_compute.node`, §14): the same engine core compiled into an N-API shared library. It owns the model, tokenizer (via the vendored `tokenizers-c` static lib, §14.2), and generation loop in-process, streaming tokens to JavaScript through a threadsafe function. The `webui/` React + Vite frontend talks to a small Node server that exposes model probe/load/unload and SSE chat endpoints. The whole thing is published to npm as **`@h4zel/vk-compute`** (§14.9): `npm i -g @h4zel/vk-compute` then run `vk-compute` from a folder containing `model/` and `pruned-vocab/`.
+- **Node addon mode** (`bin/vk_compute.node`, §14): the same engine core compiled into an N-API shared library. It owns the model, tokenizer (via the vendored `tokenizers-c` static lib, §14.2), and generation loop in-process, streaming tokens to JavaScript through a threadsafe function. The `webui/` React + Vite frontend talks to a small Node server that exposes model probe/load/unload, SSE chat, and **perplexity evaluation** (§15) endpoints. The whole thing is published to npm as **`@h4zel/vk-compute`** (§14.9): `npm i -g @h4zel/vk-compute` then run `vk-compute` from a folder containing `model/` and `pruned-vocab/`.
 
 Both the server and the harness share the same `operation` dispatch core (§3.3); the Node addon reuses the same `createGenerator`/`generateTokens` core through `src/engine.c`.
 
@@ -66,6 +66,7 @@ vk-compute/
        test_webui.mjs            # Node end-to-end test for the addon + webui server
        tools/tokenize_cli.py  tools/detokenize.py   # standalone tokenize/detokenize helpers
        tools/json_reader.py  tools/cmp_layers.py    # vocab / HF layer-comparison helpers
+       tools/ppl_ref.py  tools/ppl_ref_windows.py   # HF perplexity references (§15.5)
        tools/run_dump.py             # drives --dump layer-differential runs
        gen_node_lib.ps1               # builds build/libnode.a from the running node.exe (N-API imports)
        tools/setup_2b.py            # (legacy) 2B prep: checks tokenizer parity, runs the pruner
@@ -83,12 +84,14 @@ vk-compute/
             package.json             # os/cpu restricted; ships vk_compute.node + shader/ (staged by pack.mjs)
        webui/                       # React + Vite frontend and Node/Express server (§14)
             package.json  vite.config.ts  tsconfig.json  index.html  .npmignore
-            server/index.ts          # Express API: probe/load/unload/chat(SSE) + static dist
+            server/index.ts          # Express API: probe/load/unload/chat(SSE)/score(SSE) + static dist
             server/paths.ts          # runtime/dist/models/export/pruned-vocab path resolution + chdir
-            server/engine.ts         # EngineManager: wraps the addon, chat template, streaming
+            server/engine.ts         # EngineManager: wraps the addon, chat template, streaming, scoring
             server/probe.ts          # model probe: safetensors shard/config checks, gguf+hqm meta
             server/types.ts          # shared API types
-            src/App.tsx  src/api.ts  src/components/*  src/styles.css
+            src/App.tsx  src/api.ts  src/styles.css
+                 components/ModelTab.tsx  SamplingTab.tsx  ChatTab.tsx  QuantEditor.tsx
+                 components/ScoreTab.tsx  # perplexity eval tab (§15)
        Makefile                    # recursive shader build -> bin/shader/*.spv; builds main.exe + vk_compute.node
        include/                    # C headers
             buffer.h  data.h  descriptor.h  device.h  dispatch.h
@@ -1489,6 +1492,22 @@ A separate `--debug-sampling` flag (`generatorDumpSamplingDebug`) reads back the
     still-intact staging buffers to re-zero state every request. Verified on the 2B at
     `max_ctx=131072` with a 41698-token prompt whose needle sat past position 32768 (retrieved
     correctly; prefill+decode 212 s), with short-prompt runs and `main.exe val` green.
+50. **`resetGenerator` was a no-op — the recurrent state staging had been released.** The paragraph
+    above documents the rule (`stateS`/`convHist`/`sampleHistory` staging must stay alive because
+    `resetGenerator` re-copies it to re-zero state), but the in-process-reload double-free fix
+    (gotcha §14.8) ended up calling `releaseStaging` on the persistent buffers too, nulling
+    `stagingBuffer`. `createTransferAndCopy` skips VRAM buffers with a null staging handle, so
+    **every `resetGenerator` silently did nothing**: requests/windows inherited the previous
+    request's delta-net/conv state. The first forward after load was correct, everything after it
+    was polluted — which is exactly how it surfaced, as a perplexity that changed with the order
+    of prior scoring calls (2B FP16, prefill/decode 4096: 12.698 clean vs 11.755 when a short run
+    preceded it; three identical runs now give bit-identical NLL). Fix: drop the
+    `releaseStaging(persist)` loop; the staging is freed exactly once by `destroyBuffer` at teardown
+    (host cost ~20 MB on the 2B). **`main.exe` was equally affected across requests.**
+51. **`readBuffer` copies the whole buffer — size the destination to match.** `readBuffer` always
+    copies `buf.size` bytes (`mappedMemory` memcpy or a staging round-trip). The scoring path read
+    the 16-byte `result` buffer into a single `uint32_t`, a 12-byte stack smash (UB) on the first
+    window of every scoring run; it now reads into `uint32_t[4]` like every other call site.
 
 
 ---
@@ -1784,6 +1803,8 @@ quant temp file to the OS temp dir, and exports to the launch cwd's `exported/`.
 | `/api/load` | POST | write the UI quant config to a temp file, `createEngine`, load |
 | `/api/unload` | POST | `destroyEngine` |
 | `/api/chat` | POST | build the Qwen chat template, tokenize, generate; **SSE** stream of `{delta}` then `{done,tokens,elapsedMs}` |
+| `/api/score` | POST | tokenize the posted text, run the overlap-window perplexity pass (§15); **SSE** stream of `{progress}` then `{done,ppl,loss,count,chunks,tokens,elapsedMs}` |
+| `/api/score/stop` | POST | `requestStop` — ends the scoring loop and returns the partial result |
 
 `probe.ts` mirrors the Gradio validation: for **safetensors** it reads `config.json` (required
 `text_config` fields, `layer_types` count, `max_position_embeddings`, `num_experts`,
@@ -1814,6 +1835,9 @@ Three tabs, matching the Gradio feature set:
   penalty / penalty length / presence penalty / seed; a `Max new tokens` checkbox reveals a slider
   capped at the context size; thinking + hide-thinking toggles; system prompt.
 - **Chat** — single-session streaming chat (SSE deltas), token/s status, and a Clear button.
+- **Eval** — perplexity scoring (§15): pick a text file, set prefill/decode window sizes and the
+  test size (% of file), watch per-window progress (running ppl + scored-token count), and read the
+  final ppl / mean NLL / ms-per-token. Stop returns the partial result.
 
 ### 14.7 Build, run, test
 
@@ -1919,3 +1943,146 @@ vk-compute                    # http://127.0.0.1:8787 opens automatically
 ```
 
 Requirements: Windows x64, a Vulkan-capable GPU with a current driver, and Node ≥ 18.
+
+---
+
+## 15. Perplexity evaluation
+
+The addon can score a text file with the model it has loaded and report **perplexity** — the
+exponential of the mean negative log-likelihood per token. It runs entirely through the same decode
+path as generation (no separate forward implementation), so a validated model gives a validated ppl.
+
+### 15.1 Overlap sliding window
+
+A ppl run is a sequence of **windows** of `prefill + decode` tokens each, with `prefill` tokens of
+overlap. Window `k` (0-based, `P = prefill`, `D = decode`) does:
+
+1. reset all state and **prefill** `ids[kP .. kP+P)`;
+2. **decode** the next `D` true tokens one at a time (teacher forcing), reading the log-probability
+   the model assigns to each one;
+3. advance to `s = (k+1)P` for the next window.
+
+So the context grows to `P + D` inside a window, then resets and slides forward by `P`. The scored
+tokens are contiguous and counted exactly once:
+
+| Window | Prefill (context) | Scored |
+|---|---|---|
+| `k = 0` | `ids[0 .. P)` | `ids[P .. P+D]` (`D+1` tokens: the final op scores `ids[P]`) |
+| `k ≥ 1` | `ids[kP .. (k+1)P)` | `ids[kP+P+1 .. kP+P+D+1]` (`D` tokens) |
+
+The overlap means the tokens a window decodes become the *next* window's prefill context, so no
+token is ever scored without `P` tokens of history behind it, and the first `P` tokens of the file
+are pure context (never scored). `generateScore` (`src/generate.c`) is the driver:
+
+```c
+for (int k = 0; k < chunks; k++) {
+    resetGenerator(g);
+    runPrefill(g, ids + k * prefillN, prefillN);
+    tokenIds[1] = ids[k * prefillN + prefillN];
+    if (k == 0) score final op;          // ids[P] from the prefill's last hidden state
+    tokenIds[0] = ids[k * prefillN + prefillN];
+    while (j < limit) { feed DECODE_GROUP true tokens; read DECODE_GROUP losses; }
+}
+```
+
+`resetGenerator` is what makes windows independent — and it is the mechanism gotcha 50 broke.
+
+### 15.2 Scoring mode on the GPU
+
+Scoring reuses the decode group (4 tokens per submission) and adds a third `ArgMax-Reduce` mode:
+
+- `generatorSetScoring(g, 1)` sets `g->sampling = 2` and recompiles the decode/final ops; in this
+  mode `buildLmHead` uses `LMHead-GEMV-FP16.spv` (raw logits into `st->logits`) instead of the greedy
+  argmax kernel.
+- `g->skipFinal = 1` makes `runPrefill` skip its built-in final op (it still updates `lastRow` and
+  the position). `generateScore` runs the final op itself, **only for `k == 0`** — for later windows
+  that token was already scored as the previous window's last decode token.
+- `ArgMax-Reduce.comp` **mode 2** computes, per decode pass, the exact cross-entropy of the target
+  token in nats:
+
+  ```glsl
+  result[passIdx] = floatBitsToUint(log(Zall) + gMax - ltarget);   // logsumexp - logit[target]
+  tokenIds[0] = target;                                            // teacher forcing
+  if (doIncrement == 1u) position[0] = position[0] + 1u;
+  ```
+
+  `gMax` is the workgroup max of the logits, `Zall = Σ exp(l - gMax)` (so `log(Zall) + gMax` is the
+  log-sum-exp), and `ltarget` is the target's logit, found by whichever thread's vec4 block contains
+  the id. The write slot is `passIdx`, which is how 4 tokens per submission land in `result[0..3]`.
+  In this mode the sampler's temperature/penalty path is not entered at all.
+
+`ppl = exp(lossSum / count)` is computed both in the addon's progress callback and in its final
+result; the server streams `{progress}` per window and a final `{done}`.
+
+### 15.3 API chain
+
+`engineScore` (`include/engine.h`) → `score` (`src/addon.c`, async work + threadsafe progress
+callback, same single-generation guard as `generate`) → `EngineManager.score`
+(`webui/server/engine.ts`) → `POST /api/score` (SSE) → `ScoreTab.tsx`.
+
+The server tokenizes the whole posted file with the loaded tokenizer, computes
+`chunks = min(floor(pct·len/P), maxChunks)` from the test-size percentage, and validates
+`P + D ≤ maxCtx`. The addon rejects ids outside the model vocab (`token N at index I is outside the
+vocab (V)`) — a tokenizer/vocab mismatch would otherwise silently score `logit[target] = 0` and
+report a near-vocabulary-size ppl instead of failing.
+
+### 15.4 Reproducibility
+
+A scoring run must be **order-independent and repeatable**: the same window scored twice, or after
+any other scoring call, must give the identical NLL. `test` for this is simply running the same
+config several times and comparing the reported mean NLL (three identical `4096/9` runs give
+`1.839663`). This is what caught gotcha 50 — the first forward after a load was correct and every
+subsequent one inherited stale recurrent state, so the reported ppl depended on what had been scored
+before.
+
+### 15.5 Validation against HuggingFace
+
+`tools/ppl_ref.py` (single span) and `tools/ppl_ref_windows.py` (overlap windows) compute the same
+quantity with HF transformers in `tools/pruner/.venv`, softmax over the full vocab; they are the
+ground truth for the engine. `tools/ppl_ref.py` also takes a dtype (`bf16`/`fp32`) to bound the
+reference's own precision. The dataset is `data/wikitext-2_test.txt` (1.1 MB, 270,657 tokens with the
+full Qwen3.5 tokenizer); "test size 2%" means `chunks = 1`, i.e. the first window.
+
+2B safetensors, **unpruned** (full 248,320 vocab), `maxCtx 8192`, prefill/decode 4096:
+
+| Config | Engine | HF bf16 |
+|---|---|---|
+| all-FP16, 2% (`chunks 1`) | ppl **12.698**, mean NLL 2.5415 | ppl **12.705**, mean NLL 2.5420 |
+| all-FP16, first 10 tokens | mean NLL 1.8397 | 1.851 |
+| all-INT4, 2% | ppl **14.937** | — (quantization cost, not error) |
+
+Overlap windows, all-FP16, `P=512 D=512 chunks=3` (1,537 scored tokens):
+
+| | count | mean NLL | ppl |
+|---|---|---|---|
+| Engine | 1537 | 2.301545 | **9.9896** |
+| HF bf16 | 1537 | 2.302019 | **9.9943** |
+
+That is a 0.02% match on a multi-window run, i.e. the overlap design (including the per-window state
+reset and the `k == 0` final-op token) reproduces full-context HF scoring. The same holds along the
+decode axis at `P=4096`:
+
+| `P=4096` | Engine | HF |
+|---|---|---|
+| `D=64` | 6.0438 | 6.0241 (bf16) |
+| `D=512` | 6.6374 | 6.6489 (bf16) / 6.6370 (fp32) |
+| `D=1024` | 7.0668 | — |
+
+The residual spread is ≤0.3% and consistent with fp16 attention/KV accumulation rather than the
+scoring formula. `tools/ppl_ref.py` on the same span is the check to run when a number looks off.
+
+Other models measured with the same 2% config (`P=4096 D=4096`): mixed-quant 2B safetensors 13.499,
+BF16 GGUF 13.500, pruned HQM (102,400 vocab) 14.004, unpruned HQM 14.937.
+
+### 15.6 Using it
+
+In the UI: **Eval** tab → choose a `.txt`, set prefill/decode (default 4096/4096), set test size
+(default 10%; 2% ≈ one window for wikitext-2), **Run**. From code:
+
+```js
+const ids = vk.tokenize(engine, text, false);
+const r = await vk.score(engine, ids, { prefill: 4096, decode: 4096, chunks: 1 }, (p) => {});
+// r = { loss, count, ppl }
+```
+
+Requirements: `prefill + decode ≤ maxCtx`, and at least `prefill + decode + 1` tokens of text.

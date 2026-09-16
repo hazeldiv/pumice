@@ -396,8 +396,8 @@ static void emitScore(void* ctx, int done, int total, double lossSum, long long 
 static void scoreExecute(napi_env env, void* data) {
     (void)env;
     scoreJob* job = (scoreJob*)data;
-    engineScore(job->e, job->ids, job->prefill, job->decode, job->chunks, emitScore, job, &job->loss,
-                &job->count);
+    engineScore(job->e, job->ids, job->idCount, job->prefill, job->decode, job->chunks, emitScore, job,
+                &job->loss, &job->count);
 }
 
 static void scoreTsfnCall(napi_env env, napi_value jsCallback, void* context, void* data) {
@@ -463,6 +463,17 @@ static napi_value score(napi_env env, napi_callback_info info) {
     if (!readUint32Array(env, argv[1], &job->ids, &job->idCount)) {
         free(job);
         return throwError(env, "ids must be a Uint32Array");
+    }
+    int vocab = engineVocab(e);
+    for (size_t i = 0; i < job->idCount; i++) {
+        if ((int)job->ids[i] >= vocab) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "token %u at index %zu is outside the vocab (%d)", job->ids[i],
+                     i, vocab);
+            free(job->ids);
+            free(job);
+            return throwError(env, msg);
+        }
     }
     job->prefill = (int)getDoubleProp(env, argv[2], "prefill", 4096);
     job->decode = (int)getDoubleProp(env, argv[2], "decode", 4096);

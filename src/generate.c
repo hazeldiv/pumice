@@ -1111,7 +1111,7 @@ void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNe
     executeWaitLast(&g->s);
 }
 
-void generateScore(generator* g, const uint32_t* ids, int prefillN, int decodeN, int chunks,
+void generateScore(generator* g, const uint32_t* ids, size_t idCount, int prefillN, int decodeN, int chunks,
                    void (*progress)(void* ctx, int done, int total, double lossSum, long long count), void* ctx,
                    double* outLoss, long long* outCount) {
     g->stop = 0;
@@ -1121,6 +1121,12 @@ void generateScore(generator* g, const uint32_t* ids, int prefillN, int decodeN,
     int scored = 0;
     int limit = g->maxCtx - prefillN;
     if (limit > decodeN) limit = decodeN;
+    if (prefillN > 0 && limit > 0 && idCount > (size_t)(limit + 1)) {
+        int maxChunks = (int)((idCount - (size_t)limit - 1) / (size_t)prefillN);
+        if (chunks > maxChunks) chunks = maxChunks;
+    } else {
+        chunks = 0;
+    }
 
     for (int k = 0; k < chunks && !g->stop && prefillN > 0 && limit > 0; k++) {
         int s = k * prefillN;
@@ -1132,10 +1138,10 @@ void generateScore(generator* g, const uint32_t* ids, int prefillN, int decodeN,
 
         if (k == 0) {
             executeLogged(g->s, g->finalOps, g->finalOpCount, "score", 0);
-            uint32_t bits = 0;
-            readBuffer(g->s.dev.device, g->s.dev.physicalDevice, g->s.dev.queue, g->st.result, &bits);
+            uint32_t bits[DECODE_GROUP] = {0};
+            readBuffer(g->s.dev.device, g->s.dev.physicalDevice, g->s.dev.queue, g->st.result, bits);
             float loss = 0.0f;
-            memcpy(&loss, &bits, sizeof(float));
+            memcpy(&loss, &bits[0], sizeof(float));
             lossSum += (double)loss;
             count++;
         }
