@@ -7,7 +7,7 @@
 
 layout(local_size_x = TS, local_size_y = TS, local_size_z = 1) in;
 
-layout(push_constant) uniform Dimensions { uint M; uint N; uint K; uint off; } dims;
+layout(push_constant) uniform Dimensions { uint M; uint N; uint K; uint off; uint block; } dims;
 
 layout(set = 0, binding = 0) readonly restrict buffer MatrixA { vec4 x[]; };
 layout(set = 0, binding = 1) readonly restrict buffer MatrixB { vec4 gamma[]; };
@@ -15,10 +15,10 @@ layout(set = 0, binding = 2) readonly restrict buffer MatrixC { uvec4 gate[]; };
 layout(set = 0, binding = 3) readonly restrict buffer MatrixD { uvec4 up[]; };
 layout(set = 0, binding = 4) writeonly restrict buffer MatrixE { float gOut[]; };
 layout(set = 0, binding = 5) writeonly restrict buffer MatrixF { float uOut[]; };
-layout(set = 0, binding = 6) readonly restrict buffer MatrixG { vec4 scaleGate[]; };
-layout(set = 0, binding = 7) readonly restrict buffer MatrixH { vec4 zeroPointGate[]; };
-layout(set = 0, binding = 8) readonly restrict buffer MatrixI { vec4 scaleUp[]; };
-layout(set = 0, binding = 9) readonly restrict buffer MatrixJ { vec4 zeroPointUp[]; };
+layout(set = 0, binding = 6) readonly restrict buffer MatrixG { uvec2 scaleGate[]; };
+layout(set = 0, binding = 7) readonly restrict buffer MatrixH { uvec2 zeroPointGate[]; };
+layout(set = 0, binding = 8) readonly restrict buffer MatrixI { uvec2 scaleUp[]; };
+layout(set = 0, binding = 9) readonly restrict buffer MatrixJ { uvec2 zeroPointUp[]; };
 layout(set = 0, binding = 10) readonly restrict buffer InvRms { float invRms[]; };
 
 shared vec4 Asub[2][4][TS];
@@ -31,7 +31,11 @@ vec4 unpackInt4x4(uint packedComponent, uvec4 shiftOffsets) {
     return vec4(uvec4(packedComponent) >> shiftOffsets & uvec4(0xF));
 }
 
-void loadTiles(uint t, uint buf, uint tid, uint lBase, uint upHalf, uint g, uint mRow0) {
+vec4 unpackFp16x4(uvec2 v) {
+    return vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y));
+}
+
+void loadTiles(uint t, uint buf, uint tid, uint lBase, uint upHalf, uint mRow0) {
     if (tid < 64) {
         uint m = tid / 4;
         uint kv = tid % 4;
@@ -40,25 +44,25 @@ void loadTiles(uint t, uint buf, uint tid, uint lBase, uint upHalf, uint g, uint
     }
     if (tid < 32) {
         uint c = tid;
-        uint sIdx = g * (dims.K / vec) + t * 4;
+        uint sIdx = ((lBase + c) / dims.block) * (dims.K / vec) + t * 4;
         if (upHalf == 0u) {
             uvec4 raw = gate[(t / 2) * dims.N + lBase + c];
             bool hi = ((t & 1) == 1);
             uint r0 = hi ? raw.z : raw.x;
             uint r1 = hi ? raw.w : raw.y;
-            Bsub[buf][0][c] = unpackInt4x4(r0, lowShifts)  * scaleGate[sIdx+0] - zeroPointGate[sIdx+0];
-            Bsub[buf][1][c] = unpackInt4x4(r0, highShifts) * scaleGate[sIdx+1] - zeroPointGate[sIdx+1];
-            Bsub[buf][2][c] = unpackInt4x4(r1, lowShifts)  * scaleGate[sIdx+2] - zeroPointGate[sIdx+2];
-            Bsub[buf][3][c] = unpackInt4x4(r1, highShifts) * scaleGate[sIdx+3] - zeroPointGate[sIdx+3];
+            Bsub[buf][0][c] = unpackInt4x4(r0, lowShifts)  * unpackFp16x4(scaleGate[sIdx+0]) - unpackFp16x4(zeroPointGate[sIdx+0]);
+            Bsub[buf][1][c] = unpackInt4x4(r0, highShifts) * unpackFp16x4(scaleGate[sIdx+1]) - unpackFp16x4(zeroPointGate[sIdx+1]);
+            Bsub[buf][2][c] = unpackInt4x4(r1, lowShifts)  * unpackFp16x4(scaleGate[sIdx+2]) - unpackFp16x4(zeroPointGate[sIdx+2]);
+            Bsub[buf][3][c] = unpackInt4x4(r1, highShifts) * unpackFp16x4(scaleGate[sIdx+3]) - unpackFp16x4(zeroPointGate[sIdx+3]);
         } else {
             uvec4 raw = up[(t / 2) * dims.N + lBase + c];
             bool hi = ((t & 1) == 1);
             uint r0 = hi ? raw.z : raw.x;
             uint r1 = hi ? raw.w : raw.y;
-            Bsub[buf][0][c] = unpackInt4x4(r0, lowShifts)  * scaleUp[sIdx+0] - zeroPointUp[sIdx+0];
-            Bsub[buf][1][c] = unpackInt4x4(r0, highShifts) * scaleUp[sIdx+1] - zeroPointUp[sIdx+1];
-            Bsub[buf][2][c] = unpackInt4x4(r1, lowShifts)  * scaleUp[sIdx+2] - zeroPointUp[sIdx+2];
-            Bsub[buf][3][c] = unpackInt4x4(r1, highShifts) * scaleUp[sIdx+3] - zeroPointUp[sIdx+3];
+            Bsub[buf][0][c] = unpackInt4x4(r0, lowShifts)  * unpackFp16x4(scaleUp[sIdx+0]) - unpackFp16x4(zeroPointUp[sIdx+0]);
+            Bsub[buf][1][c] = unpackInt4x4(r0, highShifts) * unpackFp16x4(scaleUp[sIdx+1]) - unpackFp16x4(zeroPointUp[sIdx+1]);
+            Bsub[buf][2][c] = unpackInt4x4(r1, lowShifts)  * unpackFp16x4(scaleUp[sIdx+2]) - unpackFp16x4(zeroPointUp[sIdx+2]);
+            Bsub[buf][3][c] = unpackInt4x4(r1, highShifts) * unpackFp16x4(scaleUp[sIdx+3]) - unpackFp16x4(zeroPointUp[sIdx+3]);
         }
     }
 }
@@ -71,7 +75,6 @@ void main() {
     uint nBase = gl_WorkGroupID.x * TN;
     bool upHalf = nBase >= dims.off;
     uint lBase = nBase - (upHalf ? dims.off : 0u);
-    uint g = lBase / 256;
     uint uh = upHalf ? 1u : 0u;
     uint mRow0 = gl_WorkGroupID.y * TS;
 
@@ -79,11 +82,11 @@ void main() {
     float acc1 = 0.0;
 
     uint numTiles = dims.K / TS;
-    loadTiles(0, 0u, tid, lBase, uh, g, mRow0);
+    loadTiles(0, 0u, tid, lBase, uh, mRow0);
     barrier();
     for (uint t = 0; t < numTiles; t++) {
         uint cur = t & 1u;
-        if (t + 1 < numTiles) loadTiles(t + 1, cur ^ 1u, tid, lBase, uh, g, mRow0);
+        if (t + 1 < numTiles) loadTiles(t + 1, cur ^ 1u, tid, lBase, uh, mRow0);
         #pragma unroll
         for (uint kv = 0; kv < 4; kv++) {
             vec4 a = Asub[cur][kv][row];

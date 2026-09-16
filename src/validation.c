@@ -403,7 +403,7 @@ void validateGEMVINT4(session s, int M, int N, int K, float* input, QuantizedDat
     float* out = (float*)calloc(M * N, sizeof(float));
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
-    transpose_block16(weightINT4.data, transposed, K, N, QUANT_INT4);
+    transpose_block16(weightINT4.data, transposed, K, N, QUANT_Q4_256);
     buffer inputBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer weightBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, transposed, sizeof(uint8_t) * K * N / 2, MEMORY_RAM);
     buffer outBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, out, sizeof(float) * M * N, MEMORY_RAM);
@@ -494,7 +494,7 @@ void validateGEMMINT4(session s, int M, int N, int K, float* input, QuantizedDat
     float* out = (float*)calloc(M * N, sizeof(float));
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
-    transpose_block16(weightINT4.data, transposed, K, N, QUANT_INT4);
+    transpose_block16(weightINT4.data, transposed, K, N, QUANT_Q4_256);
     buffer inputBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer weightBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, transposed, sizeof(uint8_t) * K * N / 2, MEMORY_RAM);
     buffer outBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, out, sizeof(float) * M * N, MEMORY_RAM);
@@ -593,7 +593,7 @@ void validateRmsNormGEMVINT4(session s, int M, int N, int K, float* input, float
     float* out = (float*)calloc(M * N, sizeof(float));
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
-    transpose_block16(weightINT4.data, transposed, K, N, QUANT_INT4);
+    transpose_block16(weightINT4.data, transposed, K, N, QUANT_Q4_256);
     buffer inputBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer gammaBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, gamma, sizeof(float) * M * K, MEMORY_RAM);
     buffer weightBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, transposed, sizeof(uint8_t) * K * N / 2, MEMORY_RAM);
@@ -692,7 +692,7 @@ void validateGemvAddINT4(session s, int M, int N, int K, float* input, float* re
     float* out = (float*)calloc(M * N, sizeof(float));
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
-    transpose_block16(weightINT4.data, transposed, K, N, QUANT_INT4);
+    transpose_block16(weightINT4.data, transposed, K, N, QUANT_Q4_256);
     buffer inputBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer weightBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, transposed, sizeof(uint8_t) * K * N / 2, MEMORY_RAM);
     buffer outBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, out, sizeof(float) * M * N, MEMORY_RAM);
@@ -726,7 +726,7 @@ void validateGemvSplitKINT4(session s, int M, int N, int K, float* input, float*
     float* partials = (float*)calloc(4 * N, sizeof(float));
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
-    transpose_block16(weightINT4.data, transposed, K, N, QUANT_INT4);
+    transpose_block16(weightINT4.data, transposed, K, N, QUANT_Q4_256);
     buffer inputBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer weightBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, transposed, sizeof(uint8_t) * K * N / 2, MEMORY_RAM);
     buffer partialBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, partials, sizeof(float) * 4 * N, MEMORY_RAM);
@@ -943,8 +943,8 @@ void validateRmsNormSwigluFfnINT4(session s, int M, int N, int K, float* input, 
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
     uint8_t* transposed2 = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
-    transpose_block16(weightINT4.data, transposed, K, N, QUANT_INT4);
-    transpose_block16(weight2INT4.data, transposed2, K, N, QUANT_INT4);
+    transpose_block16(weightINT4.data, transposed, K, N, QUANT_Q4_256);
+    transpose_block16(weight2INT4.data, transposed2, K, N, QUANT_Q4_256);
     buffer inputBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer gammaBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, gamma, sizeof(float) * M * K, MEMORY_RAM);
     buffer gateBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, transposed, sizeof(uint8_t) * K * N / 2, MEMORY_RAM);
@@ -1844,7 +1844,7 @@ void validateQkvRopeINT4(session s, int K, int qkv_heads, int qkv_kv_heads, int 
     float* vZero = (float*)calloc(kv_heads * seq_len, sizeof(float));
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * k * n_total / 2);
-    transpose_block16(qkv_weightINT4.data, transposed, k, n_total, QUANT_INT4);
+    transpose_block16(qkv_weightINT4.data, transposed, k, n_total, QUANT_Q4_256);
 
     buffer xBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * k, MEMORY_RAM);
     buffer gammaBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, gamma, sizeof(float) * k, MEMORY_RAM);
@@ -2265,8 +2265,8 @@ void validateGatedDeltaNetINT4(session s, int K, float* input, float* input2, fl
 
     uint8_t* twIn = (uint8_t*)malloc(sizeof(uint8_t) * K * proj_n / 2);
     uint8_t* twOut = (uint8_t*)malloc(sizeof(uint8_t) * K * out_n / 2);
-    transpose_block16(w_inINT4.data, twIn, K, proj_n, QUANT_INT4);
-    transpose_block16(woINT4.data, twOut, K, out_n, QUANT_INT4);
+    transpose_block16(w_inINT4.data, twIn, K, proj_n, QUANT_Q4_256);
+    transpose_block16(woINT4.data, twOut, K, out_n, QUANT_Q4_256);
 
     buffer xBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * K, MEMORY_RAM);
     buffer x2Buffer = createBuffer(s.dev.device, s.dev.physicalDevice, input2, sizeof(float) * K, MEMORY_RAM);
@@ -2583,8 +2583,8 @@ void validateGatedDeltaNetGEMMINT4(session s, int M, int K, float* input, float*
 
     uint8_t* twIn = (uint8_t*)malloc(sizeof(uint8_t) * K * proj_n / 2);
     uint8_t* twOut = (uint8_t*)malloc(sizeof(uint8_t) * K * out_n / 2);
-    transpose_block16(w_inINT4.data, twIn, K, proj_n, QUANT_INT4);
-    transpose_block16(woINT4.data, twOut, K, out_n, QUANT_INT4);
+    transpose_block16(w_inINT4.data, twIn, K, proj_n, QUANT_Q4_256);
+    transpose_block16(woINT4.data, twOut, K, out_n, QUANT_Q4_256);
 
     buffer xBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer gammaBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, gamma, sizeof(float) * K, MEMORY_RAM);
@@ -2700,7 +2700,7 @@ void validateGemmAddINT4(session s, int M, int N, int K, float* input, float* re
     float* out = (float*)calloc(M * N, sizeof(float));
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
-    transpose_block16(weightINT4.data, transposed, K, N, QUANT_INT4);
+    transpose_block16(weightINT4.data, transposed, K, N, QUANT_Q4_256);
     buffer inputBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer weightBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, transposed, sizeof(uint8_t) * K * N / 2, MEMORY_RAM);
     buffer outBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, out, sizeof(float) * M * N, MEMORY_RAM);
@@ -2992,7 +2992,7 @@ void validateQkvRopeSplitKINT4(session s, int K, int qkv_heads, int qkv_kv_heads
     float* vZero = (float*)calloc(kv_heads * 32768, sizeof(float));
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * k * n_total / 2);
-    transpose_block16(qkv_weightINT4.data, transposed, k, n_total, QUANT_INT4);
+    transpose_block16(qkv_weightINT4.data, transposed, k, n_total, QUANT_Q4_256);
     buffer xBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * k, MEMORY_RAM);
     buffer gammaBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, gamma, sizeof(float) * k, MEMORY_RAM);
     buffer weightBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, transposed, sizeof(uint8_t) * k * n_total / 2, MEMORY_RAM);
@@ -3158,8 +3158,8 @@ void validateRmsNormSwigluFfnGEMMINT4(session s, int M, int N, int K, float* inp
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
     uint8_t* transposed2 = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
-    transpose_block16(weightINT4.data, transposed, K, N, QUANT_INT4);
-    transpose_block16(weight2INT4.data, transposed2, K, N, QUANT_INT4);
+    transpose_block16(weightINT4.data, transposed, K, N, QUANT_Q4_256);
+    transpose_block16(weight2INT4.data, transposed2, K, N, QUANT_Q4_256);
     buffer inputBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer gammaBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, gamma, sizeof(float) * K, MEMORY_RAM);
     buffer gateBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, transposed, sizeof(uint8_t) * K * N / 2, MEMORY_RAM);
@@ -3283,8 +3283,8 @@ void validateRmsNormSwigluFfnGEMM2INT4(session s, int M, int N, int K, float* in
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
     uint8_t* transposed2 = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
-    transpose_block16(weightINT4.data, transposed, K, N, QUANT_INT4);
-    transpose_block16(weight2INT4.data, transposed2, K, N, QUANT_INT4);
+    transpose_block16(weightINT4.data, transposed, K, N, QUANT_Q4_256);
+    transpose_block16(weight2INT4.data, transposed2, K, N, QUANT_Q4_256);
     buffer inputBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer gammaBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, gamma, sizeof(float) * K, MEMORY_RAM);
     buffer gateBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, transposed, sizeof(uint8_t) * K * N / 2, MEMORY_RAM);
@@ -3384,8 +3384,8 @@ void validateRmsNormSwigluFlatGEMM2INT4(session s, int M, int N, int K, float* i
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
     uint8_t* transposed2 = (uint8_t*)malloc(sizeof(uint8_t) * K * N / 2);
-    transpose_block16(weightINT4.data, transposed, K, N, QUANT_INT4);
-    transpose_block16(weight2INT4.data, transposed2, K, N, QUANT_INT4);
+    transpose_block16(weightINT4.data, transposed, K, N, QUANT_Q4_256);
+    transpose_block16(weight2INT4.data, transposed2, K, N, QUANT_Q4_256);
     buffer inputBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer gammaBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, gamma, sizeof(float) * K, MEMORY_RAM);
     buffer gateBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, transposed, sizeof(uint8_t) * K * N / 2, MEMORY_RAM);
@@ -3571,7 +3571,7 @@ void validateRmsNormLinearProjGEMMINT4(session s, int M, int K, float* input, fl
     float* bOut = (float*)calloc(M * 32, sizeof(float));
 
     uint8_t* twIn = (uint8_t*)malloc(sizeof(uint8_t) * K * proj_n / 2);
-    transpose_block16(w_inINT4.data, twIn, K, proj_n, QUANT_INT4);
+    transpose_block16(w_inINT4.data, twIn, K, proj_n, QUANT_Q4_256);
 
     buffer xBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
     buffer gammaBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, gamma, sizeof(float) * K, MEMORY_RAM);
@@ -3831,7 +3831,7 @@ void validateQkvRopeGEMMINT4(session s, int K, int qkv_heads, int qkv_kv_heads, 
     float* vZero = (float*)calloc(kv_heads * M, sizeof(float));
 
     uint8_t* transposed = (uint8_t*)malloc(sizeof(uint8_t) * k * n_total / 2);
-    transpose_block16(qkv_weightINT4.data, transposed, k, n_total, QUANT_INT4);
+    transpose_block16(qkv_weightINT4.data, transposed, k, n_total, QUANT_Q4_256);
 
     buffer xBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * k, MEMORY_RAM);
     buffer gammaBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, gamma, sizeof(float) * k, MEMORY_RAM);
@@ -4035,9 +4035,9 @@ void validateSwigluFfnSplitKINT4(session s, int M, int N, int K, float* input, f
     uint8_t* tg = (uint8_t*)malloc(K * N / 2);
     uint8_t* tu = (uint8_t*)malloc(K * N / 2);
     uint8_t* td = (uint8_t*)malloc(N * K / 2);
-    transpose_block16(gateQ.data, tg, K, N, QUANT_INT4);
-    transpose_block16(upQ.data, tu, K, N, QUANT_INT4);
-    transpose_block16(downQ.data, td, N, K, QUANT_INT4);
+    transpose_block16(gateQ.data, tg, K, N, QUANT_Q4_256);
+    transpose_block16(upQ.data, tu, K, N, QUANT_Q4_256);
+    transpose_block16(downQ.data, td, N, K, QUANT_Q4_256);
     int gs = K * N / gateQ.group_size;
     int ds = N * K / downQ.group_size;
     buffer xBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, input, sizeof(float) * M * K, MEMORY_RAM);
@@ -4274,7 +4274,7 @@ void validateLinearProjSplitKINT4(session s, int M, int K, float* input, float* 
     linear_proj_route_ref(proj, qr, kr, vr, zr, ar, br);
 
     uint8_t* tw = (uint8_t*)malloc(K * nTotal / 2);
-    transpose_block16(wQ.data, tw, K, nTotal, QUANT_INT4);
+    transpose_block16(wQ.data, tw, K, nTotal, QUANT_Q4_256);
     int sc = ((nTotal + 255) / 256) * K;
     buffer weightBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, tw, K * nTotal / 2, MEMORY_RAM);
     buffer scaleBuffer = createBuffer(s.dev.device, s.dev.physicalDevice, wQ.scale, sizeof(float) * sc, MEMORY_RAM);
@@ -5739,7 +5739,7 @@ void validateExpertSwigluINT4(session s, int M) {
 
     float* x = getData(9101, M, K);
     QuantizedData gu[MOE_POOL];
-    for (int e = 0; e < experts; e++) gu[e] = getDataINT4(9200 + e, K, 2 * N);
+    for (int e = 0; e < experts; e++) gu[e] = getDataQ4(9200 + e, K, 2 * N);
 
     size_t dataStride = (size_t)K * 2 * N / 2;
     size_t scaleStride = (size_t)(2 * N / 256) * K;
@@ -5747,7 +5747,7 @@ void validateExpertSwigluINT4(session s, int M) {
     float* poolScale = (float*)malloc(sizeof(float) * scaleStride * experts);
     float* poolZero = (float*)malloc(sizeof(float) * scaleStride * experts);
     for (int e = 0; e < experts; e++) {
-        transpose_block16(gu[e].data, poolData + e * dataStride, K, 2 * N, QUANT_INT4);
+        transpose_block16(gu[e].data, poolData + e * dataStride, K, 2 * N, QUANT_Q4_256);
         memcpy(poolScale + e * scaleStride, gu[e].scale, sizeof(float) * scaleStride);
         memcpy(poolZero + e * scaleStride, gu[e].z, sizeof(float) * scaleStride);
     }
@@ -5816,7 +5816,7 @@ void validateExpertDownINT4(session s, int M) {
 
     float* h = getData(9301, M * slots, K);
     QuantizedData dn[MOE_POOL];
-    for (int e = 0; e < experts; e++) dn[e] = getDataINT4(9400 + e, K, N);
+    for (int e = 0; e < experts; e++) dn[e] = getDataQ4(9400 + e, K, N);
 
     size_t dataStride = (size_t)K * N / 2;
     size_t scaleStride = (size_t)(N / 256) * K;
@@ -5824,7 +5824,7 @@ void validateExpertDownINT4(session s, int M) {
     float* poolScale = (float*)malloc(sizeof(float) * scaleStride * experts);
     float* poolZero = (float*)malloc(sizeof(float) * scaleStride * experts);
     for (int e = 0; e < experts; e++) {
-        transpose_block16(dn[e].data, poolData + e * dataStride, K, N, QUANT_INT4);
+        transpose_block16(dn[e].data, poolData + e * dataStride, K, N, QUANT_Q4_256);
         memcpy(poolScale + e * scaleStride, dn[e].scale, sizeof(float) * scaleStride);
         memcpy(poolZero + e * scaleStride, dn[e].z, sizeof(float) * scaleStride);
     }
@@ -5947,8 +5947,8 @@ void validateMoeLayerINT4(session s, int M) {
     QuantizedData gu[MOE_POOL];
     QuantizedData dn[MOE_POOL];
     for (int e = 0; e < experts; e++) {
-        gu[e] = getDataINT4(9700 + e, K, 2 * I);
-        dn[e] = getDataINT4(9800 + e, I, N);
+        gu[e] = getDataQ4(9700 + e, K, 2 * I);
+        dn[e] = getDataQ4(9800 + e, I, N);
     }
 
     size_t guDataStride = (size_t)K * 2 * I / 2;
@@ -5962,10 +5962,10 @@ void validateMoeLayerINT4(session s, int M) {
     float* dnScale = (float*)malloc(sizeof(float) * dnScaleStride * experts);
     float* dnZero = (float*)malloc(sizeof(float) * dnScaleStride * experts);
     for (int e = 0; e < experts; e++) {
-        transpose_block16(gu[e].data, guData + e * guDataStride, K, 2 * I, QUANT_INT4);
+        transpose_block16(gu[e].data, guData + e * guDataStride, K, 2 * I, QUANT_Q4_256);
         memcpy(guScale + e * guScaleStride, gu[e].scale, sizeof(float) * guScaleStride);
         memcpy(guZero + e * guScaleStride, gu[e].z, sizeof(float) * guScaleStride);
-        transpose_block16(dn[e].data, dnData + e * dnDataStride, I, N, QUANT_INT4);
+        transpose_block16(dn[e].data, dnData + e * dnDataStride, I, N, QUANT_Q4_256);
         memcpy(dnScale + e * dnScaleStride, dn[e].scale, sizeof(float) * dnScaleStride);
         memcpy(dnZero + e * dnScaleStride, dn[e].z, sizeof(float) * dnScaleStride);
     }
@@ -6118,10 +6118,10 @@ void validation(void) {
     float* weight = getData(936, K, N);
     uint16_t* weightFP16 = getDataFP16(936, K, N);
     QuantizedData weightINT8 = getDataINT8(936, K, N);
-    QuantizedData weightINT4 = getDataINT4(936, K, N);
+    QuantizedData weightINT4 = getDataQ4(936, K, N);
     uint16_t* weight2FP16 = getDataFP16(1348, K, N);
     QuantizedData weight2INT8 = getDataINT8(1348, K, N);
-    QuantizedData weight2INT4 = getDataINT4(1348, K, N);
+    QuantizedData weight2INT4 = getDataQ4(1348, K, N);
 
     int softmax_n = 1000;
     float* softmax_x = getData(2335, 1, softmax_n);
@@ -6150,7 +6150,7 @@ void validation(void) {
     float* qkv_weight = getData(2468, K, qkv_n);
     uint16_t* qkv_weightFP16 = getDataFP16(2468, K, qkv_n);
     QuantizedData qkv_weightINT8 = getDataINT8(2468, K, qkv_n);
-    QuantizedData qkv_weightINT4 = getDataINT4(2468, K, qkv_n);
+    QuantizedData qkv_weightINT4 = getDataQ4(2468, K, qkv_n);
     float* qkv_theta = (float*)malloc(sizeof(float) * (QKV_ROPE_DIM / 2));
     for (int i = 0; i < QKV_ROPE_DIM / 2; i++) {
         qkv_theta[i] = pow(1e6, -((double)i) / (QKV_ROPE_DIM / 2));
@@ -6160,10 +6160,10 @@ void validation(void) {
     int wo_n = 4096;
     uint16_t* w_inFP16 = getDataFP16(3579, K, w_in_n);
     QuantizedData w_inINT8 = getDataINT8(3579, K, w_in_n);
-    QuantizedData w_inINT4 = getDataINT4(3579, K, w_in_n);
+    QuantizedData w_inINT4 = getDataQ4(3579, K, w_in_n);
     uint16_t* woFP16 = getDataFP16(8642, K, wo_n);
     QuantizedData woINT8 = getDataINT8(8642, K, wo_n);
-    QuantizedData woINT4 = getDataINT4(8642, K, wo_n);
+    QuantizedData woINT4 = getDataQ4(8642, K, wo_n);
 
     // validateGEMV(s, M, N, K, input, weight);
     // validateGEMVFP16(s, M, N, K, input, weightFP16);
@@ -6199,7 +6199,7 @@ void validation(void) {
     float* ffnDownResidual = getData(9222, 1, K);
     uint16_t* ffnDownFP16 = getDataFP16(9333, ffn_n, K);
     QuantizedData ffnDownINT8 = getDataINT8(9333, ffn_n, K);
-    QuantizedData ffnDownINT4 = getDataINT4(9333, ffn_n, K);
+    QuantizedData ffnDownINT4 = getDataQ4(9333, ffn_n, K);
     // validateGemvAddFP16(s, 1, K, ffn_n, ffnDownInput, ffnDownResidual, ffnDownFP16);
     // validateGemvAddINT8(s, 1, K, ffn_n, ffnDownInput, ffnDownResidual, ffnDownINT8);
     // validateGemvAddINT4(s, 1, K, ffn_n, ffnDownInput, ffnDownResidual, ffnDownINT4);

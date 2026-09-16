@@ -1,6 +1,6 @@
 # VK Compute — Complete Technical Summary
 
-A Vulkan-based GPU compute engine for running LLM inference — **multi-model** (any Qwen3.5/3.6-family checkpoint, currently **Qwen3.6-35B-A3B** (MoE), **Qwen3.5 9B**, and **Qwen3.5 2B**), all model dimensions **read at runtime from config files** (no per-model recompile) — with per-layer **hybrid quantization** (INT4, INT8, FP16) and **MoE expert offloading** (per-layer expert pools split between VRAM and host-visible RAM) on AMD RDNA1-class GPUs (RX 580: 36 CUs, wave64). Four entry points — three gated by `main.exe` plus a **Node.js native addon** (`bin/vk_compute.node`) that backs the React web UI:
+A Vulkan-based GPU compute engine for running LLM inference — **multi-model** (any Qwen3.5/3.6-family checkpoint, currently **Qwen3.6-35B-A3B** (MoE), **Qwen3.5 9B**, and **Qwen3.5 2B**), all model dimensions **read at runtime from config files** (no per-model recompile) — with per-layer **hybrid quantization** (Q4_1 with 32/64/128/256-element blocks, INT8, FP16) and **MoE expert offloading** (per-layer expert pools split between VRAM and host-visible RAM) on AMD RDNA1-class GPUs (RX 580: 36 CUs, wave64). Four entry points — three gated by `main.exe` plus a **Node.js native addon** (`bin/vk_compute.node`) that backs the React web UI:
 
 - **Server mode** (`main.exe`, default): a **persistent** inference daemon. It loads the real safetensors weights once (§4.7), then serves repeated "tokenize — generate" requests over a length-prefixed binary protocol on stdin/stdout (`[uint32 n][n×uint32 ids]` in — a stream of `[uint32 id]` tokens terminated by a `0xFFFFFFFF` sentinel; `n == 0` shuts down). Tokens are emitted **one at a time** as they are generated. The Python frontend `vk_llm.py` (repo root, run under `.venv` via **uv**) tokenizes text, drives the daemon, and detokenizes output.
 - **Validation mode** (`main.exe val`): the original shader harness — randomized test data, weight transpose/quantize/upload, GPU dispatch, comparison against single-threaded CPU references.
@@ -20,7 +20,7 @@ Both the server and the harness share the same `operation` dispatch core (§3.3)
 - **Two inference phases:**
   - **Decode (token generation):** `GEMV` / split-K shaders — one token (M=1) Ã— weight matrix, pre-compiled into op groups of `DECODE_GROUP = 4` tokens and double-buffered on the queue.
   - **Prefill (first token / prompt processing):** `GEMM2` shaders — prompt tokens Ã— weight matrix, processed in **chunks** of `prefill_chunk` (512) tokens (chunk size = the state's `maxM`).
-- **Precision:** every layer family exists in FP16, INT8 (per-group 256 asymmetric quantization), and INT4 versions. Some shaders (GatedDeltaNet) are precision-agnostic — they operate on already-dequantized float projections.
+- **Precision:** every layer family exists in FP16, INT8 (per-group 256 asymmetric quantization), and Q4_1 versions (`q4_1_32` / `q4_1_64` / `q4_1_128` / `q4_1_256` in `quant_config.json` — 4-bit asymmetric with fp16 scale/zero per block; `int4` is still accepted as an alias for `q4_1_256`). Some shaders (GatedDeltaNet) are precision-agnostic — they operate on already-dequantized float projections.
 - **Validation:** every shader has a CPU reference (`*_ref` functions) and a `validate*` function that runs the shader and compares via max absolute error (`main.exe val`).
 
 ### Model dimensions (runtime — per model, from `config.json` + `quant_config.json`)
@@ -126,7 +126,7 @@ vk-compute/
                                    # tokenizer files — the hardcoded source for --prune
        shader/
            Utility/                # shared matmul primitives
-                Q16/ Q8/ Q4/        # quant suffix: Q16 = fp16, Q8 = int8, Q4 = int4
+                Q16/ Q8/ Q4/        # quant suffix: Q16 = fp16, Q8 = int8, Q4 = q4_1_* (block in push constants)
                                     # GEMV-SplitK-*, GEMM-ADD2-*, LMHead-GEMV-ArgMax-Q16, LMHead-GEMV-Q16
                 RmsNorm-Prologue.comp        # invRms prologue (workgroup tree reduction, used by all GEMM2 kernels)
                 Reduce-GEMV-ADD.comp         # split-K reduce + residual add
@@ -154,7 +154,7 @@ vk-compute/
                                     # RmsNorm-swiglu-flat-GEMM2-* (prefill, flattened)
                 Swiglu-combine.comp          # silu(gAct) * uAct elementwise pass
            MoE/                    # Qwen3.6-35B-A3B expert FFN
-                Q4/                 # Expert-Swiglu-Q4, Expert-Down-Q4 (int4 expert pools)
+                Q4/                 # Expert-Swiglu-Q4, Expert-Down-Q4 (Q4 expert pools)
                 Router-TopK.comp    Moe-Combine.comp
            Prototype/              # NOT built (excluded by the Makefile): validation-harness shaders
                                    # (GEMM-*/GEMV-*/GEMV-ADD-*/GEMM-ADD-*/RmsNorm-GEMV-*/Att-SplitK-*/
@@ -237,7 +237,7 @@ Pipeline creation (src/pipeline.c) supports two model-agnostic mechanisms, set o
 
 - `getData(seed, M, N)` — float `[M][N]`, pseudo-random in [-1, 1] from a seed-dependent hash of (i, j).
 - `getDataFP16(seed, M, N)` — same values converted to IEEE fp16 via `float_to_fp16`.
-- `getDataINT8(seed, M, N)` / `getDataINT4(seed, M, N)` — per-group-of-256 asymmetric quantization: `scale = (max-min)/255` (or `/15` for INT4), `zero = -min`, layout `scale[bj*K + row]`, `bj = col/256`. INT4 packs 2 columns per byte, high nibble first.
+- `getDataINT8(seed, M, N)` / `getDataQ4(seed, M, N)` — per-group asymmetric quantization: `scale = (max-min)/255` (or `/15` for Q4), `zero = -min`, layout `scale[bj*K + row]`, `bj = col/block`. INT8 uses group 256; Q4 uses Q4_1_256 (the block-size variants only come from `quantizeDataQ4`, below). Q4 packs 2 columns per byte, high nibble first.
 
 ### 4.2 Block-transposed weight layout — `transpose_block16`
 
@@ -247,28 +247,35 @@ Weights are stored `[K][N]` on host but uploaded **block-transposed** so each sh
 |---|---|---|
 | FP16 | `w[(k/8)*N + n]` | 8 halves = 2 vec4 k-rows (`unpackHalf2x16` of `.x,.y` and `.z,.w`) |
 | INT8 | `w[(k/16)*N + n]` | 16 bytes = 4 vec4 k-rows (`unpackUint8x4` per component) |
-| INT4 | `w[(k/32)*N + n]` | 32 nibbles = 8 vec4 k-rows; a 16-k tile takes low half (`.x,.y`, t even) or high half (`.z,.w`, t odd) |
+| Q4 | `w[(k/32)*N + n]` | 32 nibbles = 8 vec4 k-rows; a 16-k tile takes low half (`.x,.y`, t even) or high half (`.z,.w`, t odd) |
 
 ```c
-void transpose_block16(const uint8_t* input, uint8_t* output, int M, int N, int data_type)
+void transpose_block16(const uint8_t* input, uint8_t* output, int M, int N, QuantType q)
 ```
+
+The nibble packing is **independent of the Q4 block size** — only the scale/zero arrays change.
 
 ### 4.3 Quant scale/zero layout
 
-`scale[bj*K + k_float]` and `zero[bj*K + k_float]` with `bj = n/256` (group size 256), stored as `vec4[]`; the vec4 index is `bj*(K/4) + kvec` (`kvec = k/4`). A 16-k tile at k-tile `t` needs `scale[bj*(K/4) + t*4 + kv]` for `kv = 0..3`.
+Q4_1 (`quantizeDataQ4`, block size B = 32 / 64 / 128 / 256 from the quant config): `scale[bj*K + k]` and `zero[bj*K + k]` with `bj = n/B` (asymmetric `scale = (max-min)/15`, `zero = -min`), one value per (output block, input). They are stored as **fp16** (`uvec2[]`, 4 halves per element) at vec index `bj*(K/4) + kvec` (`kvec = k/4`); a 16-k tile at k-tile `t` needs `scale[bj*(K/4) + t*4 + kv]` for `kv = 0..3` (`unpackFp16x4`). INT8 keeps the fp32 `vec4[]` layout with group 256.
+
+**Q4_1 block sizes** (`quant_config.json` per layer: `"q4_1_32"` / `"q4_1_64"` / `"q4_1_128"` / `"q4_1_256"`, `int4` = `q4_1_256`). The block size is carried in the HQM layer config, so a re-export happens automatically when it changes; the shaders get it as an extra push constant (`block`). Because one workgroup spans 256 output columns, the dequant differs by size:
+
+- **B >= 256** (only `q4_1_256` today): every output in the workgroup shares one scale vector, so the split-K GEMV shaders pre-scale the activations in shared memory once per tile (plus a subgroup zero-point reduction) — the original fast path.
+- **B < 256**: each output column has its own block, so the scale/zero are applied **per column** against the weights in the inner loop (the GEMM2 prefill shaders already did this). That costs decode throughput: on the 2B pruned model, decode is ~45 tok/s at `q4_1_256` and ~29-30 tok/s at `q4_1_64`/`q4_1_128`, ~23 tok/s at `q4_1_32` (wikitext-2 test PPL 19.59 / 17.65 / 17.47 / 17.47 — smaller blocks are more accurate, fp16 scales limit the gain past 128).
 
 ### 4.4 Activations & outputs
 
 - Input x: row-major `[M][K]` float, vec4 index `m*(K/4) + kvec`.
 - Outputs: row-major `[M][N]` float.
-- KV cache, layout split by tensor: **K is stored transposed** (dim-major) as `kCache[row Â· MAXCTX + token]` (`row = kvhÂ·headDim + dim`, `MAXCTX` = runtime `maxCtx`, pushed to every shader) so the QK dot in decode/prefill reads are coalesced across the token axis, while **V stays token-major** `vCache[token Â· KV_TOTAL_ROWS + row]`. Precision: fp16 (`uint16_t` + `packHalf2x16`) for FP16 layers, `uint8` + per-(kv-head, token) scale/zero for INT8/INT4 layers. Quantized scale/zero live at the **fixed** stride `kvh * maxCtx + token` in every writer and reader (see gotcha 15).
+- KV cache, layout split by tensor: **K is stored transposed** (dim-major) as `kCache[row Â· MAXCTX + token]` (`row = kvhÂ·headDim + dim`, `MAXCTX` = runtime `maxCtx`, pushed to every shader) so the QK dot in decode/prefill reads are coalesced across the token axis, while **V stays token-major** `vCache[token Â· KV_TOTAL_ROWS + row]`. Precision: fp16 (`uint16_t` + `packHalf2x16`) for FP16 layers, `uint8` + per-(kv-head, token) scale/zero for INT8/Q4 layers. Quantized scale/zero live at the **fixed** stride `kvh * maxCtx + token` in every writer and reader (see gotcha 15).
 - RoPE theta: `theta[i] = ropeTheta^(-i/(rotaryDim/2))`, length `rotaryDim/2` (32 pairs at rotaryDim 64), built per model from config (`rope_theta`, `partial_rotary_factor`).
 
 ### 4.5 Push constants
 
 All layouts below are model-agnostic — every dimension is a runtime value:
 
-- Generic GEMM/GEMV/FFN/LinearProj: `{M, N, K}`.
+- Generic GEMM/GEMV/FFN/LinearProj: `{M, N, K}`; the Q4 variants append `block` (32/64/128/256).
 - QKV GEMV (legacy fused `RmsNorm-QKV-*`): `{M, N, K, gOffset, kOffset, vOffset, maxCtx, headDim, rotaryDim}` — 9 values, all runtime. Decode `RmsNorm-QKV-SplitK-*`: `{M, N, K}` (the reduce passes carry the offsets).
 - Prefill `RmsNorm-QKV-GEMM2-*`: `{M, N, K}` (raw projection only). `Rope-GEMM-*`: `{N, gOffset, kOffset, vOffset, tokBase, maxCtx, headDim, rotaryDim, heads, kvHeads}` (tokBase = chunk-absolute first token; the position buffer is **not** touched by prefill shaders — `runPrefill` sets it host-side once via `stateSetPosition` before `finalOps`).
 - Decode `Reduce-Rope-*`: `{N, gOffset, kOffset, vOffset, maxCtx, headDim, rotaryDim, heads, kvHeads}`.
@@ -287,7 +294,7 @@ All grids are computed from runtime dims:
 
 - GEMV shaders: `dispatchX = N/256` (one workgroup of 256 threads per 256 output columns), M=1.
 - GEMM shaders: `dispatchX = N/16`, `dispatchY = M/16` (each workgroup computes a 16Ã—16 output tile).
-- GEMM2 shaders: `dispatchX = N/TN` (TN=32, or 64 for INT4 GEMM-ADD2 / INT4 QKV-GEMM2), `dispatchY = M/16`; each workgroup computes a 16Ã—TN output tile.
+- GEMM2 shaders: `dispatchX = N/TN` (TN=32, or 64 for Q4 GEMM-ADD2 / Q4 QKV-GEMM2), `dispatchY = M/16`; each workgroup computes a 16Ã—TN output tile.
 - Flattened swiglu (gate|up in one grid): `dispatchX = 2*N/TN` (N=ffnN, `upHalf = nBase >= off`), `dispatchY = M/16`.
 - Rope-GEMM: `dispatchX = 2*heads + 2*kvHeads` (q, g, k, v head workgroups), `dispatchY = M` (one row per workgroup, 256 threads).
 - Embed-Gather: `dispatchX = M`, 256 threads (each row gathers its K floats from the embed/lm-head column).
@@ -320,7 +327,7 @@ Loading is **cache-first and lazy at every level, for every weight class** (matr
    - full-attn `proj` = `q_proj` **de-interleaved** (HF stores q  g per-head interleaved as `[heads][2Â·headDim][K]`; `buildQkvMatrix` takes `headDim`/`heads` from config — an early bug derived them from tensor shapes and scrambled every full-attn layer, gotcha 33) — q    g, then `k_proj`    `v_proj` — `qkvN` columns (Q  G  K  V);
    - delta `proj` = `in_proj_qkv`    `in_proj_z`    `in_proj_a`    `in_proj_b` — `projN` columns (Q  K  V  Z  A  B) — `z` is the output-gate projection (Â§7.3);
    - `gate`/`up`/`down` = `mlp.gate_proj`/`up_proj`/`down_proj`, `out` = `o_proj`/`out_proj`.
-3. Quantize per the `quant_config.json` `QuantType` (`quantizeDataINT8/INT4` for int8/int4, `float_to_fp16` for fp16), then `transpose_block16`, then upload (`createBufferNamed`). Embeddings and the lm-head (`[K][vocab]`) are built fp16 directly from the BF16 `[vocab][K]` source without a float intermediate. Every weight buffer is registered into `g_wbufs` and copied staging—VRAM by a single `createTransferAndCopy` at the end of `createWeights` (gotcha 20).
+3. Quantize per the `quant_config.json` `QuantType` (`quantizeDataINT8` for int8, `quantizeDataQ4(..., q)` for the `q4_1_*` block variants, `float_to_fp16` for fp16), then `transpose_block16`, then upload (`createBufferNamed`). Embeddings and the lm-head (`[K][vocab]`) are built fp16 directly from the BF16 `[vocab][K]` source without a float intermediate. Every weight buffer is registered into `g_wbufs` and copied staging—VRAM by a single `createTransferAndCopy` at the end of `createWeights` (gotcha 20).
 4. The `Qwen3_5RMSNorm` vectors (`input_layernorm`, `post_attention_layernorm`, final `norm`, `q_norm`/`k_norm` [headDim]) are loaded **with `+1.0` added** — `Qwen3_5RMSNorm` stores `weight` zeros-init and applies `scale = 1 + weight`, and the checkpoint stores the raw (near-zero) delta. The delta `norm.weight` [dim] (`Qwen3_5RMSNormGated`, ones-init, applied directly — **no** `+1`) is loaded unchanged, as are `A_log`[nV] and `dt_bias`[nV]. `conv1d.weight` (`[zqkvNÃ—1Ã—4]` — zqkvN channels Ã— 4 taps, channel-major `w0..w3` with `w0` = t'3    `w3` = current) is loaded **FP32** and consumed by `Conv-SiLU.spv` (Â§7.3). See gotcha 22.
 5. Small vectors (norms, `A_log`, `dt_bias`, `conv1d`) have their own on-disk cache (`vec_<label>_<layer>.bin`, `conv_<layer>.bin`) so a cache-only run needs no safetensors at all. All of them resolve cache → `shardSource()` (the conv loader once checked shards *first* and rewrote its cache file every run — now cache-first like the rest).
 
@@ -332,7 +339,7 @@ Loading is **cache-first and lazy at every level, for every weight class** (matr
 FFN is `FFN_MOE`), the loader builds, per layer, two **expert pools** covering all 257 experts
 (256 routed + the shared expert at index 256):
 
-- `guPool_<L>_INT4.bin` — per expert the fused `[K][2*moeI]` gate|up matrix, INT4-quantized
+- `guPool_<L>_INT4.bin` — per expert the fused `[K][2*moeI]` gate|up matrix, Q4_1-quantized
   (group 256) from the BF16 `mlp.experts.gate_up_proj[L][e]` (routed, HF chunks gate|up along dim 0)
   and from `mlp.shared_expert.gate_proj` + `up_proj` (fused the same way);
 - `dnPool_<L>_INT4.bin` — per expert the `[moeI][K]` down matrix from
@@ -382,7 +389,7 @@ endef
 $(foreach f,$(SHADERS),$(eval $(call COMPILE_SHADER,$(f))))
 ```
 
-Run: `make` builds shaders + `bin/main.exe` + `bin/vk_compute.node`; the executable is normally launched by the server/Python path (§11), the addon by the Node server (§14). `make clean` removes `bin/` and `build/` recursively. The quant suffix in shader names is `Q16`/`Q8`/`Q4` (fp16/int8/int4) and `shader/Prototype/` is **excluded from the build** — it holds the validation-harness and legacy shaders, so `main.exe val` no longer resolves its `.spv` files.
+Run: `make` builds shaders + `bin/main.exe` + `bin/vk_compute.node`; the executable is normally launched by the server/Python path (§11), the addon by the Node server (§14). `make clean` removes `bin/` and `build/` recursively. The quant suffix in shader names is `Q16`/`Q8`/`Q4` (fp16/int8/q4_1_*) and `shader/Prototype/` is **excluded from the build** — it holds the validation-harness and legacy shaders, so `main.exe val` no longer resolves its `.spv` files.
 
 **Node addon target** (`bin/vk_compute.node`): the Makefile compiles `src/*.c` except `main.c`/`addon.c`/`engine.c` into `CORE_OBJS`, then links `build/addon.o build/engine.o $(CORE_OBJS)` against the tokenizers static lib and an N-API import library:
 
@@ -465,7 +472,7 @@ for (uint k=0;k<dims.K/vec; k+=2) {
 }
 ```
 
-INT8 does `k += 4` with `unpackUint8x4` per component Ã— scale ' zero; INT4 does `k += 8` with `unpackInt4x4` low/high shifts.
+INT8 does `k += 4` with `unpackUint8x4` per component Ã— fp32 scale ' zero; Q4 does `k += 8` with `unpackInt4x4` low/high shifts (fp16 scale/zero read as `uvec2` through `unpackFp16x4`). The Q4 decode GEMVs take the block size in the push constants and pick one of two dequant modes: `block >= 256` pre-scales the shared activation tile once (the subgroup zero-point reduction), while `block < 256` applies that output column's own scale/zero to the unpacked weights in the inner loop (see Â§4.3).
 
 #### `GEMV-ADD-*`
 
@@ -702,7 +709,7 @@ This is the optimized form (2026-08): the original 48+48-iteration bisections re
 
 #### `RmsNorm-QKV-*` (decode, one token)
 
-Workgroup = one head (256 columns). RMSNorm over K (divisor = spec-constant `d_model`) — project `N = qkvN` columns (q, g, k, v sections at runtime offsets); `g` is the sigmoid output gate — for q/k heads: per-head RMSNorm over headDim cols, then **partial RoPE** over the first `rotaryDim` dims (`angle = pos * theta[col & (rotaryDim/2 - 1)]`, the rest pass through); q written to `qOut` (scaled by `inversesqrt(headDim)` — the attention QK `1/šhead_dim` folded into q), k/v stored to the KV cache at slot `pos * (vOffset ' kOffset)`. INT8/INT4 additionally quantize k/v per (head, token) with min/max over the headDim cols and write scale/zero at stride `kvh*maxCtx + pos`. **Position source:** the write slot and RoPE index come from a shared `uint[1]` position buffer (last binding) instead of push constants — the value is the current context length (how many tokens are already cached).
+Workgroup = one head (256 columns). RMSNorm over K (divisor = spec-constant `d_model`) — project `N = qkvN` columns (q, g, k, v sections at runtime offsets); `g` is the sigmoid output gate — for q/k heads: per-head RMSNorm over headDim cols, then **partial RoPE** over the first `rotaryDim` dims (`angle = pos * theta[col & (rotaryDim/2 - 1)]`, the rest pass through); q written to `qOut` (scaled by `inversesqrt(headDim)` — the attention QK `1/šhead_dim` folded into q), k/v stored to the KV cache at slot `pos * (vOffset ' kOffset)`. INT8/Q4 additionally quantize k/v per (head, token) with min/max over the headDim cols and write scale/zero at stride `kvh*maxCtx + pos`. **Position source:** the write slot and RoPE index come from a shared `uint[1]` position buffer (last binding) instead of push constants — the value is the current context length (how many tokens are already cached).
 
 #### `RmsNorm-QKV-GEMM-*` (prefill, head-wide tile — **legacy, unwired**)
 
@@ -1831,7 +1838,7 @@ Three tabs, matching the Gradio feature set:
 
 - **Model** — a `model/` dropdown (A1111-style) plus a free-text path field; probe/validation
   status; a collapsible **Quantization** accordion with a per-layer `attn`/`ffn` `FP16`/`INT8`/
-  `INT4` selector and "set all" presets (disabled + dimmed for HQM); max context (bounded by
+  `Q4_1_32`/`Q4_1_64`/`Q4_1_128`/`Q4_1_256` selector and "set all" presets (disabled + dimmed for HQM); max context (bounded by
   `max_position_embeddings`), prefill chunk; `Embed quant`/`LM head quant` for untied models or a
   single `Embed/LM head quant` for tied models; `Experts in VRAM` only for MoE models; prune-vocab
   and export-HQM toggles with an export dir. **Load / Export HQM** writes the `.hqm`.

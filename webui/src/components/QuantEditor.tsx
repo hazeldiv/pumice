@@ -1,7 +1,7 @@
 import type { LayerRow, Quant } from "../../server/types";
 
-const QUANTS: Quant[] = ["fp16", "int8", "int4"];
-const PRESETS: (Quant | "custom")[] = ["custom", "fp16", "int8", "int4"];
+const QUANTS: Quant[] = ["fp16", "int8", "q4_1_32", "q4_1_64", "q4_1_128", "q4_1_256"];
+const PRESETS: (Quant | "custom")[] = ["custom", "fp16", "int8", "q4_1_32", "q4_1_64", "q4_1_128", "q4_1_256"];
 
 interface Props {
   layers: LayerRow[];

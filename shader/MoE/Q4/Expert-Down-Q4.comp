@@ -10,17 +10,18 @@ layout(push_constant) uniform Params {
     uint slots;
     uint vramExperts;
     uint experts;
+    uint block;
 } dims;
 
 layout(set = 0, binding = 0) readonly restrict buffer H { vec4 h[]; };
 layout(set = 0, binding = 1) readonly restrict buffer Ids { uint ids[]; };
 layout(set = 0, binding = 2) readonly restrict buffer DownV { uvec4 w[]; };
-layout(set = 0, binding = 3) readonly restrict buffer ScaleV { vec4 scale[]; };
-layout(set = 0, binding = 4) readonly restrict buffer ZeroV { vec4 zeroPoint[]; };
+layout(set = 0, binding = 3) readonly restrict buffer ScaleV { uvec2 scale[]; };
+layout(set = 0, binding = 4) readonly restrict buffer ZeroV { uvec2 zeroPoint[]; };
 layout(set = 0, binding = 5) writeonly restrict buffer Partials { float p[]; };
 layout(set = 0, binding = 6) readonly restrict buffer DownR { uvec4 wr[]; };
-layout(set = 0, binding = 7) readonly restrict buffer ScaleR { vec4 scaleR[]; };
-layout(set = 0, binding = 8) readonly restrict buffer ZeroR { vec4 zeroPointR[]; };
+layout(set = 0, binding = 7) readonly restrict buffer ScaleR { uvec2 scaleR[]; };
+layout(set = 0, binding = 8) readonly restrict buffer ZeroR { uvec2 zeroPointR[]; };
 
 shared vec4 hCache[512];
 shared vec4 scaleSub[2][TS];
@@ -31,6 +32,10 @@ const uvec4 highShifts = uvec4(16, 20, 24, 28);
 
 vec4 unpackInt4x4(uint packedComponent, uvec4 shiftOffsets) {
     return vec4(uvec4(packedComponent) >> shiftOffsets & uvec4(0xF));
+}
+
+vec4 unpackFp16x4(uvec2 v) {
+    return vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y));
 }
 
 void main() {
@@ -44,66 +49,100 @@ void main() {
     uint e = useRam ? (src - (dims.vramExperts - 1)) : (src == dims.experts - 1 ? dims.vramExperts - 1 : src);
 
     uint expertW = e * (dims.K / 32) * dims.N;
-    uint nBlocks = dims.N / 256;
+    uint nBlocks = (dims.N + dims.block - 1) / dims.block;
     uint expertS = e * nBlocks * (dims.K / vec);
-    uint sBase = expertS + (j / 256) * (dims.K / vec);
+    uint sBase = expertS + (j / dims.block) * (dims.K / vec);
 
     for (uint i = col; i < dims.K / vec; i += TS) hCache[i] = h[globalSlot * (dims.K / vec) + i];
-
-    if (col < dims.K / vec) {
-        if (useRam) {
-            scaleSub[0][col] = scaleR[sBase + col];
-            zeroSub[0][col] = zeroPointR[sBase + col];
-        } else {
-            scaleSub[0][col] = scale[sBase + col];
-            zeroSub[0][col] = zeroPoint[sBase + col];
-        }
-    }
+    barrier();
 
     float acc = 0.0;
     uint baseRow = expertW + j;
-    uint cur = 0;
-    uint blockCount = 0;
-    for (uint k = 0; k < dims.K / vec; k += 8) {
-        if (k % TS == 0) {
-            barrier();
-            cur = blockCount & 1;
-            if (k + TS < dims.K / vec) {
-                uint nxt = (blockCount + 1) & 1;
-                if (k + TS + col < dims.K / vec) {
-                    if (useRam) {
-                        scaleSub[nxt][col] = scaleR[sBase + k + TS + col];
-                        zeroSub[nxt][col] = zeroPointR[sBase + k + TS + col];
-                    } else {
-                        scaleSub[nxt][col] = scale[sBase + k + TS + col];
-                        zeroSub[nxt][col] = zeroPoint[sBase + k + TS + col];
-                    }
-                }
-                blockCount++;
+
+    if (dims.block >= TS) {
+        if (col < dims.K / vec) {
+            if (useRam) {
+                scaleSub[0][col] = unpackFp16x4(scaleR[sBase + col]);
+                zeroSub[0][col] = unpackFp16x4(zeroPointR[sBase + col]);
+            } else {
+                scaleSub[0][col] = unpackFp16x4(scale[sBase + col]);
+                zeroSub[0][col] = unpackFp16x4(zeroPoint[sBase + col]);
             }
         }
 
-        uint ki = k % TS;
-        vec4 xv0 = hCache[k];
-        vec4 xv1 = hCache[k + 1];
-        vec4 xv2 = hCache[k + 2];
-        vec4 xv3 = hCache[k + 3];
-        vec4 xv4 = hCache[k + 4];
-        vec4 xv5 = hCache[k + 5];
-        vec4 xv6 = hCache[k + 6];
-        vec4 xv7 = hCache[k + 7];
+        uint cur = 0;
+        uint blockCount = 0;
+        for (uint k = 0; k < dims.K / vec; k += 8) {
+            if (k % TS == 0) {
+                barrier();
+                cur = blockCount & 1;
+                if (k + TS < dims.K / vec) {
+                    uint nxt = (blockCount + 1) & 1;
+                    if (k + TS + col < dims.K / vec) {
+                        if (useRam) {
+                            scaleSub[nxt][col] = unpackFp16x4(scaleR[sBase + k + TS + col]);
+                            zeroSub[nxt][col] = unpackFp16x4(zeroPointR[sBase + k + TS + col]);
+                        } else {
+                            scaleSub[nxt][col] = unpackFp16x4(scale[sBase + k + TS + col]);
+                            zeroSub[nxt][col] = unpackFp16x4(zeroPoint[sBase + k + TS + col]);
+                        }
+                    }
+                    blockCount++;
+                }
+            }
 
-        uvec4 raw = useRam ? wr[baseRow] : w[baseRow];
-        acc += dot(xv0, unpackInt4x4(raw.x, lowShifts) * scaleSub[cur][ki] - zeroSub[cur][ki]);
-        acc += dot(xv1, unpackInt4x4(raw.x, highShifts) * scaleSub[cur][ki + 1] - zeroSub[cur][ki + 1]);
-        acc += dot(xv2, unpackInt4x4(raw.y, lowShifts) * scaleSub[cur][ki + 2] - zeroSub[cur][ki + 2]);
-        acc += dot(xv3, unpackInt4x4(raw.y, highShifts) * scaleSub[cur][ki + 3] - zeroSub[cur][ki + 3]);
-        acc += dot(xv4, unpackInt4x4(raw.z, lowShifts) * scaleSub[cur][ki + 4] - zeroSub[cur][ki + 4]);
-        acc += dot(xv5, unpackInt4x4(raw.z, highShifts) * scaleSub[cur][ki + 5] - zeroSub[cur][ki + 5]);
-        acc += dot(xv6, unpackInt4x4(raw.w, lowShifts) * scaleSub[cur][ki + 6] - zeroSub[cur][ki + 6]);
-        acc += dot(xv7, unpackInt4x4(raw.w, highShifts) * scaleSub[cur][ki + 7] - zeroSub[cur][ki + 7]);
+            uint ki = k % TS;
+            vec4 xv0 = hCache[k];
+            vec4 xv1 = hCache[k + 1];
+            vec4 xv2 = hCache[k + 2];
+            vec4 xv3 = hCache[k + 3];
+            vec4 xv4 = hCache[k + 4];
+            vec4 xv5 = hCache[k + 5];
+            vec4 xv6 = hCache[k + 6];
+            vec4 xv7 = hCache[k + 7];
 
-        baseRow += dims.N;
+            uvec4 raw = useRam ? wr[baseRow] : w[baseRow];
+            acc += dot(xv0, unpackInt4x4(raw.x, lowShifts) * scaleSub[cur][ki] - zeroSub[cur][ki]);
+            acc += dot(xv1, unpackInt4x4(raw.x, highShifts) * scaleSub[cur][ki + 1] - zeroSub[cur][ki + 1]);
+            acc += dot(xv2, unpackInt4x4(raw.y, lowShifts) * scaleSub[cur][ki + 2] - zeroSub[cur][ki + 2]);
+            acc += dot(xv3, unpackInt4x4(raw.y, highShifts) * scaleSub[cur][ki + 3] - zeroSub[cur][ki + 3]);
+            acc += dot(xv4, unpackInt4x4(raw.z, lowShifts) * scaleSub[cur][ki + 4] - zeroSub[cur][ki + 4]);
+            acc += dot(xv5, unpackInt4x4(raw.z, highShifts) * scaleSub[cur][ki + 5] - zeroSub[cur][ki + 5]);
+            acc += dot(xv6, unpackInt4x4(raw.w, lowShifts) * scaleSub[cur][ki + 6] - zeroSub[cur][ki + 6]);
+            acc += dot(xv7, unpackInt4x4(raw.w, highShifts) * scaleSub[cur][ki + 7] - zeroSub[cur][ki + 7]);
+
+            baseRow += dims.N;
+        }
+    } else {
+        for (uint k = 0; k < dims.K / vec; k += 8) {
+            vec4 xv0 = hCache[k];
+            vec4 xv1 = hCache[k + 1];
+            vec4 xv2 = hCache[k + 2];
+            vec4 xv3 = hCache[k + 3];
+            vec4 xv4 = hCache[k + 4];
+            vec4 xv5 = hCache[k + 5];
+            vec4 xv6 = hCache[k + 6];
+            vec4 xv7 = hCache[k + 7];
+
+            uvec4 raw = useRam ? wr[baseRow] : w[baseRow];
+            uvec2 sc[8];
+            uvec2 zr[8];
+            #pragma unroll
+            for (uint i = 0; i < 8; i++) {
+                sc[i] = useRam ? scaleR[sBase + k + i] : scale[sBase + k + i];
+                zr[i] = useRam ? zeroPointR[sBase + k + i] : zeroPoint[sBase + k + i];
+            }
+            acc += dot(xv0, unpackInt4x4(raw.x, lowShifts) * unpackFp16x4(sc[0]) - unpackFp16x4(zr[0]));
+            acc += dot(xv1, unpackInt4x4(raw.x, highShifts) * unpackFp16x4(sc[1]) - unpackFp16x4(zr[1]));
+            acc += dot(xv2, unpackInt4x4(raw.y, lowShifts) * unpackFp16x4(sc[2]) - unpackFp16x4(zr[2]));
+            acc += dot(xv3, unpackInt4x4(raw.y, highShifts) * unpackFp16x4(sc[3]) - unpackFp16x4(zr[3]));
+            acc += dot(xv4, unpackInt4x4(raw.z, lowShifts) * unpackFp16x4(sc[4]) - unpackFp16x4(zr[4]));
+            acc += dot(xv5, unpackInt4x4(raw.z, highShifts) * unpackFp16x4(sc[5]) - unpackFp16x4(zr[5]));
+            acc += dot(xv6, unpackInt4x4(raw.w, lowShifts) * unpackFp16x4(sc[6]) - unpackFp16x4(zr[6]));
+            acc += dot(xv7, unpackInt4x4(raw.w, highShifts) * unpackFp16x4(sc[7]) - unpackFp16x4(zr[7]));
+
+            baseRow += dims.N;
+        }
     }
 
     p[globalSlot * dims.N + j] = acc;

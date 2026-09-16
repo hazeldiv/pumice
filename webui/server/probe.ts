@@ -2,9 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ProbeInfo, Quant } from "./types";
 
-const QUANT_BY_VALUE: Record<number, Quant> = { 4: "int4", 8: "int8", 16: "fp16" };
+const QUANT_BY_VALUE: Record<number, Quant> = { 4: "q4_1_32", 5: "q4_1_64", 6: "q4_1_128", 7: "q4_1_256", 8: "int8", 16: "fp16" };
 const TYPE_BY_VALUE: Record<number, string> = { 1: "full_attention", 2: "linear_attention" };
-const QUANT_VALUES = new Set<string>(["fp16", "int8", "int4"]);
+const QUANT_VALUES = new Set<string>(["fp16", "int8", "q4_1_32", "q4_1_64", "q4_1_128", "q4_1_256"]);
 const DEFAULT_MAX_CTX = 32768;
 const DEFAULT_PREFILL = 512;
 

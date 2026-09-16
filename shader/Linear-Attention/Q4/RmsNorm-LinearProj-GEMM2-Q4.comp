@@ -7,7 +7,7 @@
 
 layout(local_size_x = TS, local_size_y = TS, local_size_z = 1) in;
 
-layout(push_constant) uniform Dimensions { uint M; uint N; uint K; uint kOff; uint vOff; uint zOff; uint aOff; uint bOff; } dims;
+layout(push_constant) uniform Dimensions { uint M; uint N; uint K; uint kOff; uint vOff; uint zOff; uint aOff; uint bOff; uint block; } dims;
 
 layout(set = 0, binding = 0) readonly restrict buffer MatrixA { vec4 x[]; };
 layout(set = 0, binding = 1) readonly restrict buffer MatrixB { vec4 gamma[]; };
@@ -18,8 +18,8 @@ layout(set = 0, binding = 5) writeonly restrict buffer MatrixF { float vOut[]; }
 layout(set = 0, binding = 6) writeonly restrict buffer MatrixZ { float zOut[]; };
 layout(set = 0, binding = 7) writeonly restrict buffer MatrixH { float aOut[]; };
 layout(set = 0, binding = 8) writeonly restrict buffer MatrixI { float bOut[]; };
-layout(set = 0, binding = 9) readonly restrict buffer MatrixJ { vec4 scale[]; };
-layout(set = 0, binding = 10) readonly restrict buffer MatrixK { vec4 zeroPoint[]; };
+layout(set = 0, binding = 9) readonly restrict buffer MatrixJ { uvec2 scale[]; };
+layout(set = 0, binding = 10) readonly restrict buffer MatrixK { uvec2 zeroPoint[]; };
 layout(set = 0, binding = 11) readonly restrict buffer InvRms { float invRms[]; };
 
 shared vec4 Asub[4][TS];
@@ -32,13 +32,16 @@ vec4 unpackInt4x4(uint packedComponent, uvec4 shiftOffsets) {
     return vec4(uvec4(packedComponent) >> shiftOffsets & uvec4(0xF));
 }
 
+vec4 unpackFp16x4(uvec2 v) {
+    return vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y));
+}
+
 void main() {
     uint row = gl_LocalInvocationID.y;
     uint col = gl_LocalInvocationID.x;
     uint tid = row * TS + col;
     uint mGlobal = gl_WorkGroupID.y * TS + row;
     uint nBase = gl_WorkGroupID.x * TN;
-    uint g = nBase / 256;
 
     float acc0 = 0.0;
     float acc1 = 0.0;
@@ -51,14 +54,15 @@ void main() {
             Asub[kv][m] = x[mg * (dims.K / vec) + t * 4 + kv] * gamma[t * 4 + kv] * invRms[mg];
         }
         if (tid < 32) {
+            uint g = (nBase + tid) / dims.block;
             uvec4 raw = w[(t / 2) * dims.N + nBase + tid];
             bool hi = ((t & 1) == 1);
             uint r0 = hi ? raw.z : raw.x;
             uint r1 = hi ? raw.w : raw.y;
-            Bsub[0][tid] = unpackInt4x4(r0, lowShifts) * scale[g*(dims.K/vec)+t*4+0] - zeroPoint[g*(dims.K/vec)+t*4+0];
-            Bsub[1][tid] = unpackInt4x4(r0, highShifts) * scale[g*(dims.K/vec)+t*4+1] - zeroPoint[g*(dims.K/vec)+t*4+1];
-            Bsub[2][tid] = unpackInt4x4(r1, lowShifts) * scale[g*(dims.K/vec)+t*4+2] - zeroPoint[g*(dims.K/vec)+t*4+2];
-            Bsub[3][tid] = unpackInt4x4(r1, highShifts) * scale[g*(dims.K/vec)+t*4+3] - zeroPoint[g*(dims.K/vec)+t*4+3];
+            Bsub[0][tid] = unpackInt4x4(r0, lowShifts) * unpackFp16x4(scale[g*(dims.K/vec)+t*4+0]) - unpackFp16x4(zeroPoint[g*(dims.K/vec)+t*4+0]);
+            Bsub[1][tid] = unpackInt4x4(r0, highShifts) * unpackFp16x4(scale[g*(dims.K/vec)+t*4+1]) - unpackFp16x4(zeroPoint[g*(dims.K/vec)+t*4+1]);
+            Bsub[2][tid] = unpackInt4x4(r1, lowShifts) * unpackFp16x4(scale[g*(dims.K/vec)+t*4+2]) - unpackFp16x4(zeroPoint[g*(dims.K/vec)+t*4+2]);
+            Bsub[3][tid] = unpackInt4x4(r1, highShifts) * unpackFp16x4(scale[g*(dims.K/vec)+t*4+3]) - unpackFp16x4(zeroPoint[g*(dims.K/vec)+t*4+3]);
         }
         barrier();
         #pragma unroll

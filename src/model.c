@@ -19,7 +19,10 @@ static QuantType parse_quant(const char* s, QuantType def) {
     if (s == NULL) return def;
     if (strcmp(s, "fp16") == 0) return QUANT_FP16;
     if (strcmp(s, "int8") == 0) return QUANT_INT8;
-    if (strcmp(s, "int4") == 0) return QUANT_INT4;
+    if (strcmp(s, "q4_1_32") == 0) return QUANT_Q4_32;
+    if (strcmp(s, "q4_1_64") == 0) return QUANT_Q4_64;
+    if (strcmp(s, "q4_1_128") == 0) return QUANT_Q4_128;
+    if (strcmp(s, "q4_1_256") == 0 || strcmp(s, "int4") == 0) return QUANT_Q4_256;
     return def;
 }
 

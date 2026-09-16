@@ -7,17 +7,17 @@
 
 layout(local_size_x = TS, local_size_y = TS, local_size_z = 1) in;
 
-layout(push_constant) uniform Dimensions { uint M; uint N; uint K; } dims;
+layout(push_constant) uniform Dimensions { uint M; uint N; uint K; uint block; } dims;
 
 layout(set = 0, binding = 0) readonly restrict buffer MatrixA { vec4 x[]; };
 layout(set = 0, binding = 1) readonly restrict buffer MatrixB { vec4 gamma[]; };
 layout(set = 0, binding = 2) readonly restrict buffer MatrixC { uvec4 gate[]; };
 layout(set = 0, binding = 3) readonly restrict buffer MatrixD { uvec4 up[]; };
 layout(set = 0, binding = 4) writeonly restrict buffer MatrixE { float y[]; };
-layout(set = 0, binding = 5) readonly restrict buffer MatrixF { vec4 scaleGate[]; };
-layout(set = 0, binding = 6) readonly restrict buffer MatrixG { vec4 zeroPointGate[]; };
-layout(set = 0, binding = 7) readonly restrict buffer MatrixH { vec4 scaleUp[]; };
-layout(set = 0, binding = 8) readonly restrict buffer MatrixI { vec4 zeroPointUp[]; };
+layout(set = 0, binding = 5) readonly restrict buffer MatrixF { uvec2 scaleGate[]; };
+layout(set = 0, binding = 6) readonly restrict buffer MatrixG { uvec2 zeroPointGate[]; };
+layout(set = 0, binding = 7) readonly restrict buffer MatrixH { uvec2 scaleUp[]; };
+layout(set = 0, binding = 8) readonly restrict buffer MatrixI { uvec2 zeroPointUp[]; };
 layout(set = 0, binding = 9) readonly restrict buffer InvRms { float invRms[]; };
 
 shared vec4 Asub[4][TS];
@@ -31,13 +31,16 @@ vec4 unpackInt4x4(uint packedComponent, uvec4 shiftOffsets) {
     return vec4(uvec4(packedComponent) >> shiftOffsets & uvec4(0xF));
 }
 
+vec4 unpackFp16x4(uvec2 v) {
+    return vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y));
+}
+
 void main() {
     uint row = gl_LocalInvocationID.y;
     uint col = gl_LocalInvocationID.x;
     uint tid = row * TS + col;
     uint mGlobal = gl_WorkGroupID.y * TS + row;
     uint nBase = gl_WorkGroupID.x * TN;
-    uint g = nBase / 256;
 
     float accGate0 = 0.0;
     float accGate1 = 0.0;
@@ -53,24 +56,26 @@ void main() {
         }
         if (tid < 32) {
             uint c = tid;
+            uint g = (nBase + c) / dims.block;
             uvec4 rawGate = gate[(t / 2) * dims.N + nBase + c];
             bool hi = ((t & 1) == 1);
             uint c0 = hi ? rawGate.z : rawGate.x;
             uint c1 = hi ? rawGate.w : rawGate.y;
-            BgSub[0][c] = unpackInt4x4(c0, lowShifts)  * scaleGate[g*(dims.K/vec)+t*4+0] - zeroPointGate[g*(dims.K/vec)+t*4+0];
-            BgSub[1][c] = unpackInt4x4(c0, highShifts) * scaleGate[g*(dims.K/vec)+t*4+1] - zeroPointGate[g*(dims.K/vec)+t*4+1];
-            BgSub[2][c] = unpackInt4x4(c1, lowShifts)  * scaleGate[g*(dims.K/vec)+t*4+2] - zeroPointGate[g*(dims.K/vec)+t*4+2];
-            BgSub[3][c] = unpackInt4x4(c1, highShifts) * scaleGate[g*(dims.K/vec)+t*4+3] - zeroPointGate[g*(dims.K/vec)+t*4+3];
+            BgSub[0][c] = unpackInt4x4(c0, lowShifts)  * unpackFp16x4(scaleGate[g*(dims.K/vec)+t*4+0]) - unpackFp16x4(zeroPointGate[g*(dims.K/vec)+t*4+0]);
+            BgSub[1][c] = unpackInt4x4(c0, highShifts) * unpackFp16x4(scaleGate[g*(dims.K/vec)+t*4+1]) - unpackFp16x4(zeroPointGate[g*(dims.K/vec)+t*4+1]);
+            BgSub[2][c] = unpackInt4x4(c1, lowShifts)  * unpackFp16x4(scaleGate[g*(dims.K/vec)+t*4+2]) - unpackFp16x4(zeroPointGate[g*(dims.K/vec)+t*4+2]);
+            BgSub[3][c] = unpackInt4x4(c1, highShifts) * unpackFp16x4(scaleGate[g*(dims.K/vec)+t*4+3]) - unpackFp16x4(zeroPointGate[g*(dims.K/vec)+t*4+3]);
         } else if (tid < 64) {
             uint c = tid - 32;
+            uint g = (nBase + c) / dims.block;
             uvec4 rawUp = up[(t / 2) * dims.N + nBase + c];
             bool hi = ((t & 1) == 1);
             uint d0 = hi ? rawUp.z : rawUp.x;
             uint d1 = hi ? rawUp.w : rawUp.y;
-            BuSub[0][c] = unpackInt4x4(d0, lowShifts)  * scaleUp[g*(dims.K/vec)+t*4+0] - zeroPointUp[g*(dims.K/vec)+t*4+0];
-            BuSub[1][c] = unpackInt4x4(d0, highShifts) * scaleUp[g*(dims.K/vec)+t*4+1] - zeroPointUp[g*(dims.K/vec)+t*4+1];
-            BuSub[2][c] = unpackInt4x4(d1, lowShifts)  * scaleUp[g*(dims.K/vec)+t*4+2] - zeroPointUp[g*(dims.K/vec)+t*4+2];
-            BuSub[3][c] = unpackInt4x4(d1, highShifts) * scaleUp[g*(dims.K/vec)+t*4+3] - zeroPointUp[g*(dims.K/vec)+t*4+3];
+            BuSub[0][c] = unpackInt4x4(d0, lowShifts)  * unpackFp16x4(scaleUp[g*(dims.K/vec)+t*4+0]) - unpackFp16x4(zeroPointUp[g*(dims.K/vec)+t*4+0]);
+            BuSub[1][c] = unpackInt4x4(d0, highShifts) * unpackFp16x4(scaleUp[g*(dims.K/vec)+t*4+1]) - unpackFp16x4(zeroPointUp[g*(dims.K/vec)+t*4+1]);
+            BuSub[2][c] = unpackInt4x4(d1, lowShifts)  * unpackFp16x4(scaleUp[g*(dims.K/vec)+t*4+2]) - unpackFp16x4(zeroPointUp[g*(dims.K/vec)+t*4+2]);
+            BuSub[3][c] = unpackInt4x4(d1, highShifts) * unpackFp16x4(scaleUp[g*(dims.K/vec)+t*4+3]) - unpackFp16x4(zeroPointUp[g*(dims.K/vec)+t*4+3]);
         }
         barrier();
         #pragma unroll

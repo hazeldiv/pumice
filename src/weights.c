@@ -31,8 +31,8 @@ typedef struct {
     int cols;
     uint8_t* data;
     int dataBytes;
-    float* scale;
-    float* zero;
+    void* scale;
+    void* zero;
     int scaleCount;
 } cachedTensor;
 
@@ -97,7 +97,7 @@ static cachedTensor* cacheFind(const char* name, QuantType q) {
     return NULL;
 }
 
-static cachedTensor* cacheStore(const char* name, QuantType q, int rows, int cols, uint8_t* data, int dataBytes, float* scale, float* zero, int scaleCount) {
+static cachedTensor* cacheStore(const char* name, QuantType q, int rows, int cols, uint8_t* data, int dataBytes, void* scale, void* zero, int scaleCount) {
     if (tensorCacheCount >= TENSOR_CACHE_MAX) fatal("tensor cache overflow");
     cachedTensor* ct = &tensorCache[tensorCacheCount++];
     memset(ct, 0, sizeof(cachedTensor));
@@ -142,26 +142,30 @@ static int tensorHave(const char* name, QuantType q, int rows, int cols) {
 static cachedTensor* hqmReadQuant(const char* name, QuantType q, int rows, int cols, int experts) {
     const hqm_tensor* t = hqm_tensor_find(&g_hqm, name);
     if (t == NULL) fatal("hqm missing tensor");
-    int blocks = (cols + 255) / 256;
+    int block = quant_is_q4(q) ? quant_block(q) : 256;
+    int blocks = (cols + block - 1) / block;
     int64_t dataBytes = (q == QUANT_FP16 ? (int64_t)rows * cols * 2 :
                          q == QUANT_INT8 ? (int64_t)rows * cols :
                          (int64_t)rows * cols / 2) * experts;
     int scaleCount = rows * blocks * experts;
     uint8_t* data = (uint8_t*)hqm_tensor_read(&g_hqm, t, NULL);
     if (data == NULL) fatal("hqm tensor read error");
-    float* scale = NULL;
-    float* zero = NULL;
+    void* scale = NULL;
+    void* zero = NULL;
     if (q != QUANT_FP16) {
+        int64_t scaleBytes = (int64_t)quant_scale_bytes(q) * scaleCount;
         char sub[96];
+        int64_t got = 0;
         snprintf(sub, sizeof(sub), "%s.scale", name);
         const hqm_tensor* ts = hqm_tensor_find(&g_hqm, sub);
         if (ts == NULL) fatal("hqm missing scale");
-        scale = (float*)hqm_tensor_read(&g_hqm, ts, NULL);
+        scale = hqm_tensor_read(&g_hqm, ts, &got);
+        if (scale == NULL || got != scaleBytes) fatal("hqm scale size mismatch, re-export model");
         snprintf(sub, sizeof(sub), "%s.zero", name);
         const hqm_tensor* tz = hqm_tensor_find(&g_hqm, sub);
         if (tz == NULL) fatal("hqm missing zero");
-        zero = (float*)hqm_tensor_read(&g_hqm, tz, NULL);
-        if (scale == NULL || zero == NULL) fatal("hqm scale read error");
+        zero = hqm_tensor_read(&g_hqm, tz, &got);
+        if (zero == NULL || got != scaleBytes) fatal("hqm zero size mismatch, re-export model");
     }
     return cacheStore(name, q, rows, cols, data, (int)dataBytes, scale, zero, scaleCount);
 }
@@ -174,10 +178,13 @@ static void hqmExportTensor(const cachedTensor* ct) {
     if (ct->q != QUANT_FP16) {
         char sub[96];
         int64_t sd[1] = {ct->scaleCount};
+        int scaleBytes = quant_scale_bytes(ct->q);
+        int scaleType = scaleBytes == 2 ? HQM_T_FP16 : HQM_T_F32;
+        int64_t total = (int64_t)scaleBytes * ct->scaleCount;
         snprintf(sub, sizeof(sub), "%s.scale", ct->name);
-        hqm_writer_tensor(g_hqmWriter, sub, HQM_T_F32, ct->scale, (int64_t)sizeof(float) * ct->scaleCount, sd, 1);
+        hqm_writer_tensor(g_hqmWriter, sub, scaleType, ct->scale, total, sd, 1);
         snprintf(sub, sizeof(sub), "%s.zero", ct->name);
-        hqm_writer_tensor(g_hqmWriter, sub, HQM_T_F32, ct->zero, (int64_t)sizeof(float) * ct->scaleCount, sd, 1);
+        hqm_writer_tensor(g_hqmWriter, sub, scaleType, ct->zero, total, sd, 1);
     }
 }
 
@@ -187,14 +194,24 @@ static void hqmExportPool(const cachedTensor* ct, int experts) {
     hqm_writer_tensor(g_hqmWriter, ct->name, HQM_T_INT4, ct->data, ct->dataBytes, dims, 3);
     char sub[96];
     int64_t sd[1] = {ct->scaleCount};
+    int scaleBytes = quant_scale_bytes(ct->q);
+    int scaleType = scaleBytes == 2 ? HQM_T_FP16 : HQM_T_F32;
+    int64_t total = (int64_t)scaleBytes * ct->scaleCount;
     snprintf(sub, sizeof(sub), "%s.scale", ct->name);
-    hqm_writer_tensor(g_hqmWriter, sub, HQM_T_F32, ct->scale, (int64_t)sizeof(float) * ct->scaleCount, sd, 1);
+    hqm_writer_tensor(g_hqmWriter, sub, scaleType, ct->scale, total, sd, 1);
     snprintf(sub, sizeof(sub), "%s.zero", ct->name);
-    hqm_writer_tensor(g_hqmWriter, sub, HQM_T_F32, ct->zero, (int64_t)sizeof(float) * ct->scaleCount, sd, 1);
+    hqm_writer_tensor(g_hqmWriter, sub, scaleType, ct->zero, total, sd, 1);
+}
+
+static uint16_t* scaleToFp16(const float* src, int count) {
+    uint16_t* dst = (uint16_t*)malloc(sizeof(uint16_t) * count);
+    for (int i = 0; i < count; i++) dst[i] = float_to_fp16(src[i]);
+    return dst;
 }
 
 static cachedTensor* tensorBuild(const char* name, QuantType q, int rows, int cols, float wscale, const float* mat) {
-    int blocks = (cols + 255) / 256;
+    int block = quant_is_q4(q) ? quant_block(q) : 256;
+    int blocks = (cols + block - 1) / block;
     int scaleCount = rows * blocks;
     int64_t total = (int64_t)rows * cols;
     cachedTensor* ct;
@@ -207,7 +224,7 @@ static cachedTensor* tensorBuild(const char* name, QuantType q, int rows, int co
         free(w);
         ct = cacheStore(name, q, rows, cols, (uint8_t*)tw, (int)(total * 2), NULL, NULL, 0);
     } else {
-        QuantizedData qd = (q == QUANT_INT8) ? quantizeDataINT8(mat, rows, cols) : quantizeDataINT4(mat, rows, cols);
+        QuantizedData qd = (q == QUANT_INT8) ? quantizeDataINT8(mat, rows, cols) : quantizeDataQ4(mat, rows, cols, q);
         if (wscale != 1.0f) {
             for (int i = 0; i < scaleCount; i++) {
                 qd.scale[i] *= wscale;
@@ -218,7 +235,15 @@ static cachedTensor* tensorBuild(const char* name, QuantType q, int rows, int co
         uint8_t* tw = (uint8_t*)malloc(dataBytes);
         transpose_block16(qd.data, tw, rows, cols, q);
         free(qd.data);
-        ct = cacheStore(name, q, rows, cols, tw, dataBytes, qd.scale, qd.z, scaleCount);
+        void* scale = qd.scale;
+        void* zero = qd.z;
+        if (quant_is_q4(q)) {
+            scale = scaleToFp16(qd.scale, scaleCount);
+            zero = scaleToFp16(qd.z, scaleCount);
+            free(qd.scale);
+            free(qd.z);
+        }
+        ct = cacheStore(name, q, rows, cols, tw, dataBytes, scale, zero, scaleCount);
     }
     hqmExportTensor(ct);
     return ct;
@@ -248,13 +273,14 @@ static void loadTensorInto(session s, tensor* t, const char* name, int layer, in
     countBuffer(name, layer, t->data);
     registerWeightBuffer(&t->data);
     if (q != QUANT_FP16) {
+        int scaleBytes = quant_scale_bytes(q);
         char label[80];
         snprintf(label, sizeof(label), "%s-scale", name);
-        t->scale = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->scale, sizeof(float) * ct->scaleCount, MEMORY_VRAM, label);
+        t->scale = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->scale, scaleBytes * ct->scaleCount, MEMORY_VRAM, label);
         countBuffer(label, layer, t->scale);
         registerWeightBuffer(&t->scale);
         snprintf(label, sizeof(label), "%s-zero", name);
-        t->zero = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->zero, sizeof(float) * ct->scaleCount, MEMORY_VRAM, label);
+        t->zero = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->zero, scaleBytes * ct->scaleCount, MEMORY_VRAM, label);
         countBuffer(label, layer, t->zero);
         registerWeightBuffer(&t->zero);
     }
@@ -582,20 +608,21 @@ static void expertPoolSplit(session s, expert_pool* p, const expert_pool_build* 
     if (vramExperts < 1) vramExperts = 1;
     int vramCount = vramExperts + 1;
     int ramCount = experts - 1 - vramExperts;
+    int block = quant_is_q4(b->ct->q) ? quant_block(b->ct->q) : 256;
     int64_t dataStride = (int64_t)rows * cols / 2;
-    int64_t scaleStride = (int64_t)sizeof(float) * rows * (cols / 256);
+    int64_t scaleStride = (int64_t)quant_scale_bytes(b->ct->q) * rows * ((cols + block - 1) / block);
 
     uint8_t* vramData;
-    float* vramScale;
-    float* vramZero;
+    uint16_t* vramScale;
+    uint16_t* vramZero;
     if (ramCount == 0) {
         vramData = b->ct->data;
-        vramScale = b->ct->scale;
-        vramZero = b->ct->zero;
+        vramScale = (uint16_t*)b->ct->scale;
+        vramZero = (uint16_t*)b->ct->zero;
     } else {
         vramData = (uint8_t*)malloc((size_t)(dataStride * vramCount));
-        vramScale = (float*)malloc((size_t)(scaleStride * vramCount));
-        vramZero = (float*)malloc((size_t)(scaleStride * vramCount));
+        vramScale = (uint16_t*)malloc((size_t)(scaleStride * vramCount));
+        vramZero = (uint16_t*)malloc((size_t)(scaleStride * vramCount));
         memcpy(vramData, b->ct->data, (size_t)(dataStride * vramExperts));
         memcpy(vramData + dataStride * vramExperts, (uint8_t*)b->ct->data + dataStride * (experts - 1), (size_t)dataStride);
         memcpy(vramScale, b->ct->scale, (size_t)(scaleStride * vramExperts));
@@ -651,22 +678,23 @@ static void destroyExpertPool(session s, expert_pool* p) {
     if (p->ramZero.buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, p->ramZero);
 }
 
-static cachedTensor* expertPoolAcquire(const char* cacheName, int rows, int cols, int experts) {
-    cachedTensor* ct = cacheFind(cacheName, QUANT_INT4);
+static cachedTensor* expertPoolAcquire(const char* cacheName, QuantType q, int rows, int cols, int experts) {
+    cachedTensor* ct = cacheFind(cacheName, q);
     if (ct != NULL) return ct;
-    if (g_hqmOpen) return hqmReadQuant(cacheName, QUANT_INT4, rows, cols, experts);
+    if (g_hqmOpen) return hqmReadQuant(cacheName, q, rows, cols, experts);
     return NULL;
 }
 
-static void expertPoolBuildLayer(const safetensors* sf, const char* hfName, int rows, int cols, int experts,
+static void expertPoolBuildLayer(const safetensors* sf, const char* hfName, int rows, int cols, int experts, QuantType q,
                                  const int* hfSrcRows, int hfSrcCount, const char* sharedName, const char* sharedUpName,
                                  const char* cacheName, expert_pool_build* out) {
-    int blocks = (cols + 255) / 256;
+    int block = quant_block(q);
+    int blocks = (cols + block - 1) / block;
     int scaleCount = rows * blocks;
     int64_t dataBytes = (int64_t)rows * cols / 2;
     uint8_t* poolData = (uint8_t*)malloc((size_t)(dataBytes * experts));
-    float* poolScale = (float*)malloc(sizeof(float) * (size_t)scaleCount * experts);
-    float* poolZero = (float*)malloc(sizeof(float) * (size_t)scaleCount * experts);
+    uint16_t* poolScale = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)scaleCount * experts);
+    uint16_t* poolZero = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)scaleCount * experts);
 
     for (int e = 0; e < experts; e++) {
         float* eng = NULL;
@@ -708,17 +736,19 @@ static void expertPoolBuildLayer(const safetensors* sf, const char* hfName, int 
         eng = (float*)malloc(sizeof(float) * (size_t)rows * cols);
         transpose(hf, eng, cols, rows);
         free(hf);
-        QuantizedData qd = quantizeDataINT4(eng, rows, cols);
+        QuantizedData qd = quantizeDataQ4(eng, rows, cols, q);
         free(eng);
-        transpose_block16(qd.data, poolData + (size_t)e * dataBytes, rows, cols, QUANT_INT4);
+        transpose_block16(qd.data, poolData + (size_t)e * dataBytes, rows, cols, q);
         free(qd.data);
-        memcpy(poolScale + (size_t)e * scaleCount, qd.scale, sizeof(float) * scaleCount);
-        memcpy(poolZero + (size_t)e * scaleCount, qd.z, sizeof(float) * scaleCount);
+        for (int i = 0; i < scaleCount; i++) {
+            poolScale[(size_t)e * scaleCount + i] = float_to_fp16(qd.scale[i]);
+            poolZero[(size_t)e * scaleCount + i] = float_to_fp16(qd.z[i]);
+        }
         free(qd.scale);
         free(qd.z);
     }
 
-    out->ct = cacheStore(cacheName, QUANT_INT4, rows, cols, poolData, (int)(dataBytes * experts), poolScale, poolZero, scaleCount * experts);
+    out->ct = cacheStore(cacheName, q, rows, cols, poolData, (int)(dataBytes * experts), poolScale, poolZero, scaleCount * experts);
     hqmExportPool(out->ct, experts);
     snprintf(out->name, sizeof(out->name), "%s", cacheName);
     out->rows = rows;
@@ -1068,25 +1098,26 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             int poolExperts = d->experts + 1;
             int* srcRows = (int*)malloc(sizeof(int) * d->experts);
             for (int e = 0; e < d->experts; e++) srcRows[e] = e;
+            QuantType eq = quant_is_q4(f) ? f : QUANT_Q4_256;
 
             expert_pool_build gu, dn;
-            gu.ct = expertPoolAcquire(guName, d->K, 2 * d->moeI, poolExperts);
+            gu.ct = expertPoolAcquire(guName, eq, d->K, 2 * d->moeI, poolExperts);
             if (gu.ct == NULL) {
                 lname(n1, sizeof(n1), L, "mlp.experts.gate_up_proj");
                 lname(n2, sizeof(n2), L, "mlp.shared_expert.gate_proj.weight");
                 lname(n3, sizeof(n3), L, "mlp.shared_expert.up_proj.weight");
-                expertPoolBuildLayer(shardSource(), n1, d->K, 2 * d->moeI, poolExperts, srcRows, d->experts, n2, n3, guName, &gu);
+                expertPoolBuildLayer(shardSource(), n1, d->K, 2 * d->moeI, poolExperts, eq, srcRows, d->experts, n2, n3, guName, &gu);
             } else {
                 gu.rows = d->K;
                 gu.cols = 2 * d->moeI;
                 gu.experts = poolExperts;
             }
 
-            dn.ct = expertPoolAcquire(dnName, d->moeI, d->K, poolExperts);
+            dn.ct = expertPoolAcquire(dnName, eq, d->moeI, d->K, poolExperts);
             if (dn.ct == NULL) {
                 lname(n1, sizeof(n1), L, "mlp.experts.down_proj");
                 lname(n2, sizeof(n2), L, "mlp.shared_expert.down_proj.weight");
-                expertPoolBuildLayer(shardSource(), n1, d->moeI, d->K, poolExperts, srcRows, d->experts, n2, NULL, dnName, &dn);
+                expertPoolBuildLayer(shardSource(), n1, d->moeI, d->K, poolExperts, eq, srcRows, d->experts, n2, NULL, dnName, &dn);
             } else {
                 dn.rows = d->moeI;
                 dn.cols = d->K;

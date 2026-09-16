@@ -13,6 +13,7 @@ layout(push_constant) uniform Dimensions {
     uint N;
     uint K;
     uint off;
+    uint block;
 } dims;
 
 const float EPSILON = 1e-6;
@@ -22,10 +23,10 @@ layout(set = 0, binding = 1) readonly restrict buffer MatrixB { vec4 gamma[]; };
 layout(set = 0, binding = 2) readonly restrict buffer MatrixC { uvec4 gate[]; };
 layout(set = 0, binding = 3) readonly restrict buffer MatrixD { uvec4 up[]; };
 layout(set = 0, binding = 4) writeonly restrict buffer PartialBuffer { float PgPu[]; };
-layout(set = 0, binding = 5) readonly restrict buffer MatrixF { vec4 scaleGate[]; };
-layout(set = 0, binding = 6) readonly restrict buffer MatrixG { vec4 zeroPointGate[]; };
-layout(set = 0, binding = 7) readonly restrict buffer MatrixH { vec4 scaleUp[]; };
-layout(set = 0, binding = 8) readonly restrict buffer MatrixI { vec4 zeroPointUp[]; };
+layout(set = 0, binding = 5) readonly restrict buffer MatrixF { uvec2 scaleGate[]; };
+layout(set = 0, binding = 6) readonly restrict buffer MatrixG { uvec2 zeroPointGate[]; };
+layout(set = 0, binding = 7) readonly restrict buffer MatrixH { uvec2 scaleUp[]; };
+layout(set = 0, binding = 8) readonly restrict buffer MatrixI { uvec2 zeroPointUp[]; };
 
 shared float shared_sum;
 shared vec4 xsCache[2][TS];
@@ -45,13 +46,17 @@ vec4 unpackInt4x4High(uint packedComponent) {
                       bitfieldExtract(packedComponent, 28, 4)));
 }
 
+vec4 unpackFp16x4(uvec2 v) {
+    return vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y));
+}
+
 void main() {
     uint col = gl_LocalInvocationID.x;
     uint chunk = gl_WorkGroupID.y;
     uint globalCol = gl_WorkGroupID.x*TS + col;
     uint upHalf = uint(globalCol >= dims.off);
     if (upHalf == 1u) globalCol -= dims.off;
-    uint blockIdx = (gl_WorkGroupID.x - upHalf * (dims.off / TS)) * dims.K / vec + col;
+    uint blockBase = (globalCol / dims.block) * dims.K / vec;
 
     float sum_sq = 0.0;
     uint numTiles = (dims.K + TS - 1) / TS / vec;
@@ -78,91 +83,149 @@ void main() {
     float inv_rms = 1.0 / sqrt((shared_sum / float(d_model)) + EPSILON);
 
     float ztot = 0.0;
-    if (chunk < numTiles) {
-        vec4 sc;
-        vec4 zc;
-        if (upHalf == 1u) {
-            sc = scaleUp[chunk*TS + blockIdx];
-            zc = zeroPointUp[chunk*TS + blockIdx];
-        } else {
-            sc = scaleGate[chunk*TS + blockIdx];
-            zc = zeroPointGate[chunk*TS + blockIdx];
-        }
-        vec4 xa = x[chunk*TS + col] * gamma[chunk*TS + col] * inv_rms;
-        xsCache[0][col] = xa * sc;
-        float zp = subgroupAdd(dot(xa * zc, vec4(1.0)));
-        if (subgroupElect()) {
-            sub_sums[gl_SubgroupID] = zp;
-        }
-    }
-
-    barrier();
-    if (chunk < numTiles) {
-        for (uint i = 0; i < gl_NumSubgroups; i++) ztot += sub_sums[i];
-    }
-
-    uint blockCount = 0;
     float result = 0.0;
 
-    for (uint t = chunk; t < numTiles; t += 4u) {
-        uint cur = blockCount & 1, nxt = (blockCount+1) & 1;
-        uint nextTile = t + 4u;
-        if (nextTile < numTiles) {
-            vec4 sc;
-            vec4 zc;
+    if (dims.block >= TS) {
+        uint scaleIdx = blockBase + col;
+        if (chunk < numTiles) {
+            vec4 xa = x[chunk*TS + col] * gamma[chunk*TS + col] * inv_rms;
             if (upHalf == 1u) {
-                sc = scaleUp[nextTile*TS + blockIdx];
-                zc = zeroPointUp[nextTile*TS + blockIdx];
+                xsCache[0][col] = xa * unpackFp16x4(scaleUp[chunk*TS + scaleIdx]);
+                float zp = subgroupAdd(dot(xa * unpackFp16x4(zeroPointUp[chunk*TS + scaleIdx]), vec4(1.0)));
+                if (subgroupElect()) sub_sums[gl_SubgroupID] = zp;
             } else {
-                sc = scaleGate[nextTile*TS + blockIdx];
-                zc = zeroPointGate[nextTile*TS + blockIdx];
-            }
-            vec4 xa = x[nextTile*TS + col] * gamma[nextTile*TS + col] * inv_rms;
-            xsCache[nxt][col] = xa * sc;
-            float zp = subgroupAdd(dot(xa * zc, vec4(1.0)));
-            if (subgroupElect()) {
-                sub_sums[gl_SubgroupID] = zp;
+                xsCache[0][col] = xa * unpackFp16x4(scaleGate[chunk*TS + scaleIdx]);
+                float zp = subgroupAdd(dot(xa * unpackFp16x4(zeroPointGate[chunk*TS + scaleIdx]), vec4(1.0)));
+                if (subgroupElect()) sub_sums[gl_SubgroupID] = zp;
             }
         }
         barrier();
-        if (nextTile < numTiles) {
+        if (chunk < numTiles) {
             for (uint i = 0; i < gl_NumSubgroups; i++) ztot += sub_sums[i];
         }
-        blockCount++;
 
-        uint baseRow = t * (TS / 8) * dims.N;
-        #pragma unroll
-        for (uint k=0;k<TS; k+=16) {
-            uvec4 ra;
-            uvec4 rb;
-            if (upHalf == 1u) {
-                ra = up[baseRow + globalCol];
-                rb = up[baseRow + dims.N + globalCol];
-            } else {
-                ra = gate[baseRow + globalCol];
-                rb = gate[baseRow + dims.N + globalCol];
+        uint blockCount = 0;
+        for (uint t = chunk; t < numTiles; t += 4u) {
+            uint cur = blockCount & 1, nxt = (blockCount+1) & 1;
+            uint nextTile = t + 4u;
+            if (nextTile < numTiles) {
+                vec4 xa = x[nextTile*TS + col] * gamma[nextTile*TS + col] * inv_rms;
+                if (upHalf == 1u) {
+                    xsCache[nxt][col] = xa * unpackFp16x4(scaleUp[nextTile*TS + scaleIdx]);
+                    float zp = subgroupAdd(dot(xa * unpackFp16x4(zeroPointUp[nextTile*TS + scaleIdx]), vec4(1.0)));
+                    if (subgroupElect()) sub_sums[gl_SubgroupID] = zp;
+                } else {
+                    xsCache[nxt][col] = xa * unpackFp16x4(scaleGate[nextTile*TS + scaleIdx]);
+                    float zp = subgroupAdd(dot(xa * unpackFp16x4(zeroPointGate[nextTile*TS + scaleIdx]), vec4(1.0)));
+                    if (subgroupElect()) sub_sums[gl_SubgroupID] = zp;
+                }
             }
-            result += dot(xsCache[cur][k], unpackInt4x4(ra.x));
-            result += dot(xsCache[cur][k+1], unpackInt4x4High(ra.x));
-            result += dot(xsCache[cur][k+2], unpackInt4x4(ra.y));
-            result += dot(xsCache[cur][k+3], unpackInt4x4High(ra.y));
-            result += dot(xsCache[cur][k+4], unpackInt4x4(ra.z));
-            result += dot(xsCache[cur][k+5], unpackInt4x4High(ra.z));
-            result += dot(xsCache[cur][k+6], unpackInt4x4(ra.w));
-            result += dot(xsCache[cur][k+7], unpackInt4x4High(ra.w));
-            result += dot(xsCache[cur][k+8], unpackInt4x4(rb.x));
-            result += dot(xsCache[cur][k+9], unpackInt4x4High(rb.x));
-            result += dot(xsCache[cur][k+10], unpackInt4x4(rb.y));
-            result += dot(xsCache[cur][k+11], unpackInt4x4High(rb.y));
-            result += dot(xsCache[cur][k+12], unpackInt4x4(rb.z));
-            result += dot(xsCache[cur][k+13], unpackInt4x4High(rb.z));
-            result += dot(xsCache[cur][k+14], unpackInt4x4(rb.w));
-            result += dot(xsCache[cur][k+15], unpackInt4x4High(rb.w));
+            barrier();
+            if (nextTile < numTiles) {
+                for (uint i = 0; i < gl_NumSubgroups; i++) ztot += sub_sums[i];
+            }
+            blockCount++;
 
-            baseRow += 2 * dims.N;
+            uint baseRow = t * (TS / 8) * dims.N;
+            #pragma unroll
+            for (uint k=0;k<TS; k+=16) {
+                uvec4 ra;
+                uvec4 rb;
+                if (upHalf == 1u) {
+                    ra = up[baseRow + globalCol];
+                    rb = up[baseRow + dims.N + globalCol];
+                } else {
+                    ra = gate[baseRow + globalCol];
+                    rb = gate[baseRow + dims.N + globalCol];
+                }
+                result += dot(xsCache[cur][k], unpackInt4x4(ra.x));
+                result += dot(xsCache[cur][k+1], unpackInt4x4High(ra.x));
+                result += dot(xsCache[cur][k+2], unpackInt4x4(ra.y));
+                result += dot(xsCache[cur][k+3], unpackInt4x4High(ra.y));
+                result += dot(xsCache[cur][k+4], unpackInt4x4(ra.z));
+                result += dot(xsCache[cur][k+5], unpackInt4x4High(ra.z));
+                result += dot(xsCache[cur][k+6], unpackInt4x4(ra.w));
+                result += dot(xsCache[cur][k+7], unpackInt4x4High(ra.w));
+                result += dot(xsCache[cur][k+8], unpackInt4x4(rb.x));
+                result += dot(xsCache[cur][k+9], unpackInt4x4High(rb.x));
+                result += dot(xsCache[cur][k+10], unpackInt4x4(rb.y));
+                result += dot(xsCache[cur][k+11], unpackInt4x4High(rb.y));
+                result += dot(xsCache[cur][k+12], unpackInt4x4(rb.z));
+                result += dot(xsCache[cur][k+13], unpackInt4x4High(rb.z));
+                result += dot(xsCache[cur][k+14], unpackInt4x4(rb.w));
+                result += dot(xsCache[cur][k+15], unpackInt4x4High(rb.w));
+
+                baseRow += 2 * dims.N;
+            }
+
+            barrier();
         }
-
+    } else {
+        if (chunk < numTiles) {
+            xsCache[0][col] = x[chunk*TS + col] * gamma[chunk*TS + col] * inv_rms;
+        }
         barrier();
+
+        uint blockCount = 0;
+        for (uint t = chunk; t < numTiles; t += 4u) {
+            uint cur = blockCount & 1, nxt = (blockCount+1) & 1;
+            uint nextTile = t + 4u;
+            if (nextTile < numTiles) {
+                xsCache[nxt][col] = x[nextTile*TS + col] * gamma[nextTile*TS + col] * inv_rms;
+            }
+            barrier();
+            blockCount++;
+
+            uint baseRow = t * (TS / 8) * dims.N;
+            uint kbase = t * TS;
+            #pragma unroll
+            for (uint k=0;k<TS; k+=16) {
+                uvec4 ra;
+                uvec4 rb;
+                if (upHalf == 1u) {
+                    ra = up[baseRow + globalCol];
+                    rb = up[baseRow + dims.N + globalCol];
+                } else {
+                    ra = gate[baseRow + globalCol];
+                    rb = gate[baseRow + dims.N + globalCol];
+                }
+                vec4 qv[16];
+                qv[0] = unpackInt4x4(ra.x);
+                qv[1] = unpackInt4x4High(ra.x);
+                qv[2] = unpackInt4x4(ra.y);
+                qv[3] = unpackInt4x4High(ra.y);
+                qv[4] = unpackInt4x4(ra.z);
+                qv[5] = unpackInt4x4High(ra.z);
+                qv[6] = unpackInt4x4(ra.w);
+                qv[7] = unpackInt4x4High(ra.w);
+                qv[8] = unpackInt4x4(rb.x);
+                qv[9] = unpackInt4x4High(rb.x);
+                qv[10] = unpackInt4x4(rb.y);
+                qv[11] = unpackInt4x4High(rb.y);
+                qv[12] = unpackInt4x4(rb.z);
+                qv[13] = unpackInt4x4High(rb.z);
+                qv[14] = unpackInt4x4(rb.w);
+                qv[15] = unpackInt4x4High(rb.w);
+
+                #pragma unroll
+                for (uint j = 0; j < 16; j++) {
+                    vec4 sc;
+                    vec4 zc;
+                    if (upHalf == 1u) {
+                        sc = unpackFp16x4(scaleUp[blockBase + kbase + k + j]);
+                        zc = unpackFp16x4(zeroPointUp[blockBase + kbase + k + j]);
+                    } else {
+                        sc = unpackFp16x4(scaleGate[blockBase + kbase + k + j]);
+                        zc = unpackFp16x4(zeroPointGate[blockBase + kbase + k + j]);
+                    }
+                    result += dot(xsCache[cur][k + j], qv[j] * sc - zc);
+                }
+
+                baseRow += 2 * dims.N;
+            }
+
+            barrier();
+        }
     }
 
     PgPu[(upHalf * 4u + chunk) * dims.N + globalCol] = result - ztot;

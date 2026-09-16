@@ -40,7 +40,7 @@ uint16_t float_to_fp16(float f) {
             return sign;
         }
         mant = mant | 0x800000;
-        return sign | (mant >> (1 - exp));
+        return sign | (mant >> (-1 - exp));
     }
     
     if (exp >= 16) {
@@ -136,12 +136,12 @@ QuantizedData getDataINT8(int seed, int M, int N) {
     return q;
 }
 
-QuantizedData getDataINT4(int seed, int M, int N) {
+QuantizedData getDataQ4(int seed, int M, int N) {
     QuantizedData q = {0};
     q.M          = M;
     q.N          = N;
     q.group_size = 256;
-    q.type       = QUANT_INT4;
+    q.type       = QUANT_Q4_256;
 
     int blocks_per_row = (N + q.group_size - 1) / q.group_size;
     int blocks_count   = M * blocks_per_row;
@@ -247,26 +247,26 @@ QuantizedData quantizeDataINT8(const float* A, int M, int N) {
     return q;
 }
 
-QuantizedData quantizeDataINT4(const float* A, int M, int N) {
-    QuantizedData q = {0};
-    q.M = M;
-    q.N = N;
-    q.group_size = 256;
-    q.type = QUANT_INT4;
+QuantizedData quantizeDataQ4(const float* A, int M, int N, QuantType q) {
+    QuantizedData qd = {0};
+    qd.M = M;
+    qd.N = N;
+    qd.group_size = quant_block(q);
+    qd.type = q;
 
-    int blocks_per_row = (N + q.group_size - 1) / q.group_size;
+    int blocks_per_row = (N + qd.group_size - 1) / qd.group_size;
     int blocks_count = M * blocks_per_row;
 
-    q.data = (uint8_t*)malloc(sizeof(uint8_t) * M * N / 2);
-    q.scale = (float*)malloc(sizeof(float) * blocks_count);
-    q.z = (float*)malloc(sizeof(float) * blocks_count);
+    qd.data = (uint8_t*)malloc(sizeof(uint8_t) * M * N / 2);
+    qd.scale = (float*)malloc(sizeof(float) * blocks_count);
+    qd.z = (float*)malloc(sizeof(float) * blocks_count);
 
     for (int i = 0; i < M; i++) {
         for (int bj = 0; bj < blocks_per_row; bj++) {
             float min_val = 1e9f;
             float max_val = -1e9f;
-            int base_j = bj * q.group_size;
-            for (int k = 0; k < q.group_size; k++) {
+            int base_j = bj * qd.group_size;
+            for (int k = 0; k < qd.group_size; k++) {
                 int j = base_j + k;
                 if (j >= N) break;
                 float val = A[i * N + j];
@@ -274,21 +274,21 @@ QuantizedData quantizeDataINT4(const float* A, int M, int N) {
                 if (val > max_val) max_val = val;
             }
             int block_idx = bj * M + i;
-            q.scale[block_idx] = (max_val - min_val) / 15.0f;
-            q.z[block_idx] = -min_val;
+            qd.scale[block_idx] = (max_val - min_val) / 15.0f;
+            qd.z[block_idx] = -min_val;
 
-            for (int k = 0; k < q.group_size; k += 2) {
+            for (int k = 0; k < qd.group_size; k += 2) {
                 int j0 = base_j + k;
                 int j1 = base_j + k + 1;
-                uint8_t v0 = (uint8_t)clampf(roundf((A[i * N + j0] + q.z[block_idx]) / q.scale[block_idx]), 0.0f, 15.0f);
-                uint8_t v1 = (j1 < N) ? (uint8_t)clampf(roundf((A[i * N + j1] + q.z[block_idx]) / q.scale[block_idx]), 0.0f, 15.0f) : 0;
-                int packed_idx = i * (N / 2) + (bj * q.group_size + k) / 2;
-                q.data[packed_idx] = ((v0 & 0x0F) << 4) | (v1 & 0x0F);
+                uint8_t v0 = (uint8_t)clampf(roundf((A[i * N + j0] + qd.z[block_idx]) / qd.scale[block_idx]), 0.0f, 15.0f);
+                uint8_t v1 = (j1 < N) ? (uint8_t)clampf(roundf((A[i * N + j1] + qd.z[block_idx]) / qd.scale[block_idx]), 0.0f, 15.0f) : 0;
+                int packed_idx = i * (N / 2) + (bj * qd.group_size + k) / 2;
+                qd.data[packed_idx] = ((v0 & 0x0F) << 4) | (v1 & 0x0F);
             }
         }
     }
 
-    return q;
+    return qd;
 }
 
 void transpose(const float* src, float* dest, int m, int n) {
@@ -302,7 +302,8 @@ void transpose(const float* src, float* dest, int m, int n) {
     }
 }
 
-void transpose_block16(const uint8_t *input, uint8_t *output, int M, int N, int data_type) {
+void transpose_block16(const uint8_t *input, uint8_t *output, int M, int N, QuantType q) {
+    int data_type = quant_bits(q);
     int out_N = N * 16;
     for (int b = 0; b < M; b += 128/data_type) {
         int out_row = b / (128/data_type);

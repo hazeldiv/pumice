@@ -46,6 +46,11 @@ static void addOp(operation* ops, int* n, const char* shader, int layer, buffer*
     (*n)++;
 }
 
+static int pushBlock(int* push, int pc, QuantType q) {
+    if (quant_is_q4(q)) push[pc++] = quant_block(q);
+    return pc;
+}
+
 static void addGemvSplit(generator* g, operation* ops, int* n, int L, const tensor* wt, buffer input, buffer output, buffer residual, QuantType q) {
     const model_dims* d = g->dims;
     buffer bufs[5];
@@ -57,8 +62,8 @@ static void addGemvSplit(generator* g, operation* ops, int* n, int L, const tens
         bufs[b++] = wt->scale;
         bufs[b++] = wt->zero;
     }
-    int push[] = {1, d->K, wt->rows};
-    addOp(ops, n, model_shader("GEMV-SplitK", q), L, bufs, b, push, 3, d->K / 256, 4);
+    int push[] = {1, d->K, wt->rows, 0};
+    addOp(ops, n, model_shader("GEMV-SplitK", q), L, bufs, b, push, pushBlock(push, 3, q), d->K / 256, 4);
 
     buffer rBufs[3];
     rBufs[0] = g->st.gemvPartial;
@@ -96,9 +101,9 @@ static void addGemmAdd(generator* g, operation* ops, int* n, int L, const tensor
     }
     bufs[b++] = residual;
     int k = (input.buffer == g->st.act.buffer) ? d->ffnN : wt->rows;
-    int tn = (q == QUANT_INT4) ? 64 : 32;
-    int push[] = {m, d->K, k};
-    addOp(ops, n, model_shader("GEMM-ADD2", q), L, bufs, b, push, 3, d->K / tn, (m + 15) / 16);
+    int tn = quant_is_q4(q) ? 64 : 32;
+    int push[] = {m, d->K, k, 0};
+    addOp(ops, n, model_shader("GEMM-ADD2", q), L, bufs, b, push, pushBlock(push, 3, q), d->K / tn, (m + 15) / 16);
 }
 
 static void addLinearProj(generator* g, operation* ops, int* n, int L, int gemm, int m, buffer input) {
@@ -118,8 +123,8 @@ static void addLinearProj(generator* g, operation* ops, int* n, int L, int gemm,
             bufs[b++] = w->proj[L].zero;
         }
         bufs[b++] = st->linprojPartial;
-        int push[] = {m, d->projN, d->K};
-        addOp(ops, n, model_shader("RmsNorm-LinearProj-SplitK", q), L, bufs, b, push, 3,
+        int push[] = {m, d->projN, d->K, 0};
+        addOp(ops, n, model_shader("RmsNorm-LinearProj-SplitK", q), L, bufs, b, push, pushBlock(push, 3, q),
               (d->projN + 255) / 256, 4);
 
         buffer rBufs[7];
@@ -152,13 +157,13 @@ static void addLinearProj(generator* g, operation* ops, int* n, int L, int gemm,
         bufs[b++] = w->proj[L].zero;
     }
     bufs[b++] = st->invRms;
-    int push[] = {m, d->projN, d->K, d->projKOff, d->projVOff, d->projZOff, d->projAOff, d->projBOff};
+    int push[] = {m, d->projN, d->K, d->projKOff, d->projVOff, d->projZOff, d->projAOff, d->projBOff, 0};
     int pushP[] = {d->K};
     buffer proBufs[2];
     proBufs[0] = input;
     proBufs[1] = st->invRms;
     addOp(ops, n, "RmsNorm-Prologue.spv", L, proBufs, 2, pushP, 1, m, 1);
-    addOp(ops, n, model_shader("RmsNorm-LinearProj-GEMM2", q), L, bufs, b, push, 8,
+    addOp(ops, n, model_shader("RmsNorm-LinearProj-GEMM2", q), L, bufs, b, push, pushBlock(push, 8, q),
           d->projN / 32, (m + 15) / 16);
 }
 
@@ -182,8 +187,8 @@ static void buildFfn(generator* g, operation* ops, int* n, int L, int gemm, int 
             upBufs[b++] = w->up[L].scale;
             upBufs[b++] = w->up[L].zero;
         }
-        int push[] = {m, d->ffnN, d->K, d->ffnN};
-        addOp(ops, n, model_shader("RmsNorm-up-ffn-SplitK", f), L, upBufs, b, push, 4,
+        int push[] = {m, d->ffnN, d->K, d->ffnN, 0};
+        addOp(ops, n, model_shader("RmsNorm-up-ffn-SplitK", f), L, upBufs, b, push, pushBlock(push, 4, f),
               2 * d->ffnN / 256, 4);
 
         buffer dBufs[5];
@@ -195,8 +200,8 @@ static void buildFfn(generator* g, operation* ops, int* n, int L, int gemm, int 
             dBufs[bd++] = w->down[L].scale;
             dBufs[bd++] = w->down[L].zero;
         }
-        int pushD[] = {m, d->K, d->ffnN};
-        addOp(ops, n, model_shader("FFN-Down-SplitK", f), L, dBufs, bd, pushD, 3,
+        int pushD[] = {m, d->K, d->ffnN, 0};
+        addOp(ops, n, model_shader("FFN-Down-SplitK", f), L, dBufs, bd, pushD, pushBlock(pushD, 3, f),
               d->K / 256, 4);
 
         addReduceGemvAdd(g, ops, n, L, st->gemvPartial, st->h, st->h);
@@ -218,8 +223,8 @@ static void buildFfn(generator* g, operation* ops, int* n, int L, int gemm, int 
         ffnBufs[bf++] = w->up[L].data;
         ffnBufs[bf++] = st->act;
         ffnBufs[bf++] = st->invRms;
-        int push[] = {m, d->ffnN, d->K};
-        addOp(ops, n, model_shader("RmsNorm-swiglu-ffn-GEMM2", f), L, ffnBufs, bf, push, 3,
+        int push[] = {m, d->ffnN, d->K, 0};
+        addOp(ops, n, model_shader("RmsNorm-swiglu-ffn-GEMM2", f), L, ffnBufs, bf, push, pushBlock(push, 3, f),
               d->ffnN / 32, (m + 15) / 16);
     } else {
         buffer flatBufs[11];
@@ -235,8 +240,8 @@ static void buildFfn(generator* g, operation* ops, int* n, int L, int gemm, int 
         flatBufs[bf2++] = w->up[L].scale;
         flatBufs[bf2++] = w->up[L].zero;
         flatBufs[bf2++] = st->invRms;
-        int pushF[] = {m, d->ffnN, d->K, d->ffnN};
-        addOp(ops, n, model_shader("RmsNorm-swiglu-flat-GEMM2", f), L, flatBufs, bf2, pushF, 4,
+        int pushF[] = {m, d->ffnN, d->K, d->ffnN, 0};
+        addOp(ops, n, model_shader("RmsNorm-swiglu-flat-GEMM2", f), L, flatBufs, bf2, pushF, pushBlock(pushF, 4, f),
               (d->ffnN * 2) / 32, (m + 15) / 16);
 
         buffer cmbBufs[3];
@@ -274,9 +279,9 @@ static void buildAttention(generator* g, operation* ops, int* n, int L, int gemm
         }
         qkvGBufs[bq2++] = st->qkvRaw;
         qkvGBufs[bq2++] = st->invRms;
-        int tnQkv = (q == QUANT_INT4) ? 64 : 32;
-        int pushQ[] = {m, d->qkvN, d->K};
-        addOp(ops, n, model_shader("RmsNorm-QKV-GEMM2", q), L, qkvGBufs, bq2, pushQ, 3,
+        int tnQkv = quant_is_q4(q) ? 64 : 32;
+        int pushQ[] = {m, d->qkvN, d->K, 0};
+        addOp(ops, n, model_shader("RmsNorm-QKV-GEMM2", q), L, qkvGBufs, bq2, pushQ, pushBlock(pushQ, 3, q),
               d->qkvN / tnQkv, (m + 15) / 16);
 
         buffer ropeGBufs[13];
@@ -348,8 +353,8 @@ static void buildAttention(generator* g, operation* ops, int* n, int L, int gemm
             splitBufs[bs++] = w->proj[L].zero;
         }
         splitBufs[bs++] = st->qkvPartial;
-        int push[] = {1, d->qkvN, d->K};
-        addOp(ops, n, model_shader("RmsNorm-QKV-SplitK", q), L, splitBufs, bs, push, 3,
+        int push[] = {1, d->qkvN, d->K, 0};
+        addOp(ops, n, model_shader("RmsNorm-QKV-SplitK", q), L, splitBufs, bs, push, pushBlock(push, 3, q),
               d->qkvN / 256, 4);
 
         buffer ropeBufs[13];
@@ -456,6 +461,7 @@ static void buildMoe(generator* g, operation* ops, int* n, int L, int m) {
     model_weights* w = &g->w;
     const model_dims* d = g->dims;
     int slots = d->expertsPerTok + 1;
+    QuantType eq = quant_is_q4(g->spec->layers[L].ffn.q) ? g->spec->layers[L].ffn.q : QUANT_Q4_256;
 
     buffer rtBufs[8];
     rtBufs[0] = st->h;
@@ -479,8 +485,8 @@ static void buildMoe(generator* g, operation* ops, int* n, int L, int m) {
     guBufs[6] = w->guPool[L].ramData;
     guBufs[7] = w->guPool[L].ramScale;
     guBufs[8] = w->guPool[L].ramZero;
-    int pushG[] = {d->K, d->moeI, slots, w->guPool[L].vramExperts, w->guPool[L].expertCount};
-    addOp(ops, n, "Expert-Swiglu-Q4.spv", L, guBufs, 9, pushG, 5,
+    int pushG[] = {d->K, d->moeI, slots, w->guPool[L].vramExperts, w->guPool[L].expertCount, 0};
+    addOp(ops, n, "Expert-Swiglu-Q4.spv", L, guBufs, 9, pushG, pushBlock(pushG, 5, eq),
           d->moeI / 256, m * slots);
 
     buffer dnBufs[9];
@@ -493,8 +499,8 @@ static void buildMoe(generator* g, operation* ops, int* n, int L, int m) {
     dnBufs[6] = w->dnPool[L].ramData;
     dnBufs[7] = w->dnPool[L].ramScale;
     dnBufs[8] = w->dnPool[L].ramZero;
-    int pushD[] = {d->moeI, d->K, slots, w->dnPool[L].vramExperts, w->dnPool[L].expertCount};
-    addOp(ops, n, "Expert-Down-Q4.spv", L, dnBufs, 9, pushD, 5,
+    int pushD[] = {d->moeI, d->K, slots, w->dnPool[L].vramExperts, w->dnPool[L].expertCount, 0};
+    addOp(ops, n, "Expert-Down-Q4.spv", L, dnBufs, 9, pushD, pushBlock(pushD, 5, eq),
           d->K / 256, m * slots);
 
     buffer cbBufs[5];
@@ -570,8 +576,8 @@ static void addDecodeEmbedLinearProj(generator* g, operation* ops, int* n) {
     bufs[b++] = w->proj[0].scale;
     bufs[b++] = w->proj[0].zero;
     bufs[b++] = st->linprojPartial;
-    int push[] = {1, d->projN, d->K};
-    addOp(ops, n, model_shader("RmsNorm-LinearProj-SplitK", q), 0, bufs, b, push, 3,
+    int push[] = {1, d->projN, d->K, 0};
+    addOp(ops, n, model_shader("RmsNorm-LinearProj-SplitK", q), 0, bufs, b, push, pushBlock(push, 3, q),
           (d->projN + 255) / 256, 4);
 
     buffer rBufs[7];

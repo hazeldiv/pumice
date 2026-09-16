@@ -228,10 +228,12 @@ void* hqm_tensor_read(const hqm* h, const hqm_tensor* t, int64_t* outBytes) {
 }
 
 static int64_t quant_bytes(QuantType q, int rows, int cols) {
-    int64_t blocks = (cols + 255) / 256;
     if (q == QUANT_FP16) return (int64_t)rows * cols * 2;
-    if (q == QUANT_INT8) return (int64_t)rows * cols + 2 * (int64_t)rows * blocks * 4;
-    return (int64_t)rows * cols / 2 + 2 * (int64_t)rows * blocks * 4;
+    int block = quant_is_q4(q) ? quant_block(q) : 256;
+    int64_t blocks = (cols + block - 1) / block;
+    int64_t scaleBytes = (int64_t)quant_scale_bytes(q) * rows * blocks;
+    if (q == QUANT_INT8) return (int64_t)rows * cols + 2 * scaleBytes;
+    return (int64_t)rows * cols / 2 + 2 * scaleBytes;
 }
 
 static int64_t hqm_vram_bytes(const model_config* spec) {
@@ -264,7 +266,8 @@ static int64_t hqm_vram_bytes(const model_config* spec) {
             if (vramExperts > d->experts - 1) vramExperts = d->experts - 1;
             if (vramExperts < 1) vramExperts = 1;
             int vramCount = vramExperts + 1;
-            total += vramCount * (quant_bytes(QUANT_INT4, d->K, 2 * d->moeI) + quant_bytes(QUANT_INT4, d->moeI, d->K));
+            QuantType eq = quant_is_q4(ly->ffn.q) ? ly->ffn.q : QUANT_Q4_256;
+            total += vramCount * (quant_bytes(eq, d->K, 2 * d->moeI) + quant_bytes(eq, d->moeI, d->K));
             total += (int64_t)d->K * d->experts * 2;
             total += (int64_t)d->K * 2;
         }

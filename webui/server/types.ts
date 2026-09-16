@@ -1,4 +1,4 @@
-export type Quant = "fp16" | "int8" | "int4";
+export type Quant = "fp16" | "int8" | "q4_1_32" | "q4_1_64" | "q4_1_128" | "q4_1_256";
 
 export interface LayerRow {
   type: string;

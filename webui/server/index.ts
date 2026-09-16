@@ -16,7 +16,7 @@ function resolveInput(target: string): string {
   return path.isAbsolute(target) ? target : path.resolve(launchCwd, target);
 }
 
-const QUANT_VALUES = new Set(["fp16", "int8", "int4"]);
+const QUANT_VALUES = new Set(["fp16", "int8", "q4_1_32", "q4_1_64", "q4_1_128", "q4_1_256"]);
 
 function toQuant(value: unknown, fallback: Quant = "fp16"): Quant {
   const s = String(value ?? "");

@@ -88,7 +88,7 @@ export function ModelTab(props: Props) {
             Embed/LM head quant
             <select value={form.embedLm} disabled={locked}
               onChange={(e) => props.onForm({ embedLm: e.target.value as Quant })}>
-              {["fp16", "int8", "int4"].map((q) => <option key={q} value={q}>{q.toUpperCase()}</option>)}
+              {["fp16", "int8", "q4_1_32", "q4_1_64", "q4_1_128", "q4_1_256"].map((q) => <option key={q} value={q}>{q.toUpperCase()}</option>)}
             </select>
           </label>
         ) : (
@@ -97,14 +97,14 @@ export function ModelTab(props: Props) {
               Embed quant
               <select value={form.embed} disabled={locked}
                 onChange={(e) => props.onForm({ embed: e.target.value as Quant })}>
-                {["fp16", "int8", "int4"].map((q) => <option key={q} value={q}>{q.toUpperCase()}</option>)}
+                {["fp16", "int8", "q4_1_32", "q4_1_64", "q4_1_128", "q4_1_256"].map((q) => <option key={q} value={q}>{q.toUpperCase()}</option>)}
               </select>
             </label>
             <label className="field">
               LM head quant
               <select value={form.lmHead} disabled={locked}
                 onChange={(e) => props.onForm({ lmHead: e.target.value as Quant })}>
-                {["fp16", "int8", "int4"].map((q) => <option key={q} value={q}>{q.toUpperCase()}</option>)}
+                {["fp16", "int8", "q4_1_32", "q4_1_64", "q4_1_128", "q4_1_256"].map((q) => <option key={q} value={q}>{q.toUpperCase()}</option>)}
               </select>
             </label>
           </>
