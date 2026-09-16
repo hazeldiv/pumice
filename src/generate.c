@@ -1112,8 +1112,9 @@ void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNe
 }
 
 void generateScore(generator* g, const uint32_t* ids, size_t idCount, int prefillN, int decodeN, int chunks,
-                   void (*progress)(void* ctx, int done, int total, double lossSum, long long count), void* ctx,
-                   double* outLoss, long long* outCount) {
+                   void (*progress)(void* ctx, int done, int total, int chunkTokens, int chunkTotal,
+                                    double lossSum, long long count),
+                   void* ctx, double* outLoss, long long* outCount) {
     g->stop = 0;
     g->skipFinal = 1;
     double lossSum = 0.0;
@@ -1130,6 +1131,8 @@ void generateScore(generator* g, const uint32_t* ids, size_t idCount, int prefil
 
     for (int k = 0; k < chunks && !g->stop && prefillN > 0 && limit > 0; k++) {
         int s = k * prefillN;
+        int chunkTotal = limit + (k == 0 ? 1 : 0);
+        if (progress != NULL) progress(ctx, scored, chunks, 0, chunkTotal, lossSum, count);
         resetGenerator(g);
         runPrefill(g, ids + s, prefillN);
 
@@ -1144,6 +1147,7 @@ void generateScore(generator* g, const uint32_t* ids, size_t idCount, int prefil
             memcpy(&loss, &bits[0], sizeof(float));
             lossSum += (double)loss;
             count++;
+            if (progress != NULL) progress(ctx, scored, chunks, 1, chunkTotal, lossSum, count);
         }
         tokenIds[0] = ids[s + prefillN];
 
@@ -1171,10 +1175,12 @@ void generateScore(generator* g, const uint32_t* ids, size_t idCount, int prefil
 
             g->nextPos += (uint32_t)cur;
             j += cur;
+            if (progress != NULL && (j & 31) == 0)
+                progress(ctx, scored, chunks, j + (k == 0 ? 1 : 0), chunkTotal, lossSum, count);
         }
 
         scored++;
-        if (progress != NULL) progress(ctx, scored, chunks, lossSum, count);
+        if (progress != NULL) progress(ctx, scored, chunks, chunkTotal, chunkTotal, lossSum, count);
     }
 
     g->skipFinal = 0;

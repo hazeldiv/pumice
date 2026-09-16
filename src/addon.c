@@ -365,6 +365,8 @@ static napi_value generate(napi_env env, napi_callback_info info) {
 typedef struct {
     int done;
     int total;
+    int chunkTokens;
+    int chunkTotal;
     double loss;
     long long count;
 } scoreEvent;
@@ -383,11 +385,14 @@ typedef struct {
     long long count;
 } scoreJob;
 
-static void emitScore(void* ctx, int done, int total, double lossSum, long long count) {
+static void emitScore(void* ctx, int done, int total, int chunkTokens, int chunkTotal, double lossSum,
+                      long long count) {
     scoreJob* job = (scoreJob*)ctx;
     scoreEvent* ev = (scoreEvent*)malloc(sizeof(scoreEvent));
     ev->done = done;
     ev->total = total;
+    ev->chunkTokens = chunkTokens;
+    ev->chunkTotal = chunkTotal;
     ev->loss = lossSum;
     ev->count = count;
     napi_call_threadsafe_function(job->tsfn, ev, napi_tsfn_blocking);
@@ -416,6 +421,10 @@ static void scoreTsfnCall(napi_env env, napi_value jsCallback, void* context, vo
     napi_set_named_property(env, arg, "done", v);
     napi_create_int32(env, ev->total, &v);
     napi_set_named_property(env, arg, "total", v);
+    napi_create_int32(env, ev->chunkTokens, &v);
+    napi_set_named_property(env, arg, "chunkTokens", v);
+    napi_create_int32(env, ev->chunkTotal, &v);
+    napi_set_named_property(env, arg, "chunkTotal", v);
     napi_create_double(env, ev->loss, &v);
     napi_set_named_property(env, arg, "loss", v);
     napi_create_double(env, (double)ev->count, &v);

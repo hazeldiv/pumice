@@ -153,6 +153,18 @@ app.post("/api/score", async (req, res) => {
     }
   };
 
+  const scoredTokens = 1 + chunks * decode;
+  send({
+    start: {
+      model: engine.status().info?.name ?? "model",
+      fileTokens: ids.length,
+      scoredTokens,
+      chunks,
+      prefill,
+      decode,
+    },
+  });
+
   const started = Date.now();
   try {
     const result = await engine.score(ids, prefill, decode, chunks, (p) => send({ progress: p }));

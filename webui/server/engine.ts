@@ -22,6 +22,8 @@ export interface ChatResult {
 export interface ScoreProgress {
   done: number;
   total: number;
+  chunkTokens: number;
+  chunkTotal: number;
   loss: number;
   count: number;
   ppl: number;

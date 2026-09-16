@@ -116,9 +116,20 @@ export interface ScorePayload {
   sizePct: number;
 }
 
+export interface ScoreStart {
+  model: string;
+  fileTokens: number;
+  scoredTokens: number;
+  chunks: number;
+  prefill: number;
+  decode: number;
+}
+
 export interface ScoreProgress {
   done: number;
   total: number;
+  chunkTokens: number;
+  chunkTotal: number;
   loss: number;
   count: number;
   ppl: number;
@@ -133,9 +144,14 @@ export interface ScoreDone {
   elapsedMs: number;
 }
 
+export interface ScoreHandlers {
+  onStart?: (s: ScoreStart) => void;
+  onProgress?: (p: ScoreProgress) => void;
+}
+
 export async function scoreStream(
   payload: ScorePayload,
-  onProgress: (p: ScoreProgress) => void,
+  handlers: ScoreHandlers,
   signal?: AbortSignal,
 ): Promise<ScoreDone> {
   const res = await fetch("/api/score", {
@@ -168,7 +184,8 @@ export async function scoreStream(
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
       const event = JSON.parse(line.slice(6));
-      if (event.progress) onProgress(event.progress as ScoreProgress);
+      if (event.start) handlers.onStart?.(event.start as ScoreStart);
+      if (event.progress) handlers.onProgress?.(event.progress as ScoreProgress);
       if (event.done) done = event as ScoreDone;
       if (event.error) error = event.error;
     }

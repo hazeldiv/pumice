@@ -19,7 +19,8 @@ typedef struct {
 typedef struct engine engine;
 
 typedef void (*engine_emit)(void* ctx, uint32_t token, const char* delta, size_t deltaLen);
-typedef void (*engine_progress)(void* ctx, int done, int total, double lossSum, long long count);
+typedef void (*engine_progress)(void* ctx, int done, int total, int chunkTokens, int chunkTotal, double lossSum,
+                                long long count);
 
 engine* engineOpen(const engine_options* opts, char* err, size_t errCap);
 void engineClose(engine* e);
