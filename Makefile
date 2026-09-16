@@ -31,7 +31,7 @@ MAIN_OBJS    := $(BUILD_DIR)/main.o $(CORE_OBJS)
 ADDON_OBJS   := $(BUILD_DIR)/addon.o $(ENGINE_OBJ) $(CORE_OBJS)
 DEPS         := $(CORE_OBJS:.o=.d) $(ENGINE_OBJ:.o=.d) $(BUILD_DIR)/main.d $(BUILD_DIR)/addon.d
 rwildcard    = $(foreach d,$(wildcard $(1)*),$(call rwildcard,$(d)/,$(2)) $(filter $(subst *,%,$(2)),$(d)))
-SHADERS      := $(call rwildcard,$(SHADER_DIR)/,*.comp)
+SHADERS      := $(filter-out $(SHADER_DIR)/Prototype/%,$(call rwildcard,$(SHADER_DIR)/,*.comp))
 SHADER_OUT   := $(BIN_DIR)/shader
 SHADER_OUT_W := $(subst /,\,$(SHADER_OUT))
 SHADERS_OBJS := $(addprefix $(SHADER_OUT)/,$(notdir $(SHADERS:.comp=.spv)))

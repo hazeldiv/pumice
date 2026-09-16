@@ -126,37 +126,41 @@ vk-compute/
                                    # tokenizer files — the hardcoded source for --prune
        shader/
            Utility/                # shared matmul primitives
-                FP16/ INT8/ INT4/   # GEMV-*, GEMV-ADD-*, GEMV-SplitK-*, GEMM-*, GEMM-ADD2-*,
-                                  # RmsNorm-GEMV-*, LMHead-GEMV-ArgMax-*, LMHead-GEMV-FP16-*
+                Q16/ Q8/ Q4/        # quant suffix: Q16 = fp16, Q8 = int8, Q4 = int4
+                                    # GEMV-SplitK-*, GEMM-ADD2-*, LMHead-GEMV-ArgMax-Q16, LMHead-GEMV-Q16
                 RmsNorm-Prologue.comp        # invRms prologue (workgroup tree reduction, used by all GEMM2 kernels)
                 Reduce-GEMV-ADD.comp         # split-K reduce + residual add
-                ArgMax-Reduce.comp           # token selection: greedy argmax or full-logits sampler
+                ArgMax-Reduce.comp           # token selection: greedy argmax / sampler / perplexity scoring
+                Gate-Sigmoid.comp            # sigmoid gate for the delta-net output
            Full-Attention/         # QKV projection + RoPE + full attention
-                FP16/ INT8/ INT4/   # RmsNorm-QKV-* (legacy fused), RmsNorm-QKV-SplitK-*, Reduce-Rope-*
-                FP16/ INT8/ INT4/   # RmsNorm-QKV-GEMM2-* + Rope-GEMM-* (prefill, split passes)
-                FP16/ INT8/ INT4/   # Att-full-* (decode), Att-SplitK2-* (decode, split-K)
-                FP16/ INT8/ INT4/   # Att-QK2-*, Att-PV2-* (prefill, unfused)
+                Q16/ Q8/ Q4/        # RmsNorm-QKV-SplitK-* + Reduce-Rope-* (decode)
+                Q16/ Q8/ Q4/        # RmsNorm-QKV-GEMM2-* + Rope-GEMM-* (prefill, split passes)
+                Q16/ Q8/ Q4/        # Att-full-* (decode), Att-SplitK2-* (decode, split-K)
+                Q16/ Q8/ Q4/        # Att-QK2-*, Att-PV2-* (prefill, unfused)
                 Att-Softmax.comp    # prefill softmax pass (fp16 score buffer + smSum reciprocals)
                 Reduce-Att2.comp    # decode split-K attention reduce
            Linear-Attention/       # gated delta-net
-                FP16/ INT8/ INT4/   # RmsNorm-LinearProj-SplitK-* (decode),
-                                  # RmsNorm-LinearProj-GEMM2-* (prefill)
+                Q16/ Q8/ Q4/        # RmsNorm-LinearProj-SplitK-* (decode),
+                                    # RmsNorm-LinearProj-GEMM2-* (prefill)
+                                    # Embed-RmsNorm-LinearProj-Q16 (fused fp16 embed+GEMV)
                 Embed-Gather.comp   # prefill embedding pre-fetch (embed/lm-head column gather)
                 GatedDeltaNet.comp  GatedDeltaNet-GEMM.comp   (precision-agnostic)
                 Conv-SiLU.comp      # depthwise causal conv (kernel 4) + SiLU (realM-aware)
                 Reduce-LinearProj.comp       # LinearProj split-K reduce (5-way routing)
            FFN/                    # swiglu feed-forward
-                FP16/ INT8/ INT4/   # RmsNorm-swiglu-ffn-* (decode GEMV),
-                                  # RmsNorm-up-ffn-SplitK-* (decode, flattened gate|up),
-                                  # FFN-Down-SplitK-* (decode down projection)
-                                  # RmsNorm-swiglu-ffn-GEMM2-* (prefill, dual-matrix),
-                                  # RmsNorm-swiglu-flat-GEMM2-* (prefill, flattened)
-                RmsNorm-swiglu-ffn.comp      (fp32, at root)
+                Q16/ Q8/ Q4/        # RmsNorm-up-ffn-SplitK-* (decode, flattened gate|up),
+                                    # FFN-Down-SplitK-* (decode down projection)
+                                    # RmsNorm-swiglu-ffn-GEMM2-* (prefill, dual-matrix),
+                                    # RmsNorm-swiglu-flat-GEMM2-* (prefill, flattened)
                 Swiglu-combine.comp          # silu(gAct) * uAct elementwise pass
-           Prototype/              # experiments / unused
-        # gemv.comp, gemv1..7.comp, gemm.comp, RmsNorm.comp, test.comp,
-        # online-softmax.comp, RmsNorm-GEMV.comp, RmsNorm-GEMV-Rope-*.comp,
-        # RmsNorm-QKV-score-V.comp_
+           MoE/                    # Qwen3.6-35B-A3B expert FFN
+                Q4/                 # Expert-Swiglu-Q4, Expert-Down-Q4 (int4 expert pools)
+                Router-TopK.comp    Moe-Combine.comp
+           Prototype/              # NOT built (excluded by the Makefile): validation-harness shaders
+                                   # (GEMM-*/GEMV-*/GEMV-ADD-*/GEMM-ADD-*/RmsNorm-GEMV-*/Att-SplitK-*/
+                                   #  Att-full-GEMM-*/RmsNorm-QKV-*/RmsNorm-LinearProj-*/Reduce-Att/
+                                   #  RmsNorm-swiglu-ffn*) plus legacy experiments (gemv1..7, gemm,
+                                   #  RmsNorm, online-softmax, RmsNorm-GEMV-Rope-*, test)
 ```
 
 ### Per-model folder layout
@@ -366,7 +370,7 @@ pools were also resident (gotcha 46).
 
 ```makefile
 rwildcard    = $(foreach d,$(wildcard $(1)*),$(call rwildcard,$(d)/,$(2)) $(filter $(subst *,%,$(2)),$(d)))
-SHADERS      := $(call rwildcard,$(SHADER_DIR)/,*.comp)
+SHADERS      := $(filter-out $(SHADER_DIR)/Prototype/%,$(call rwildcard,$(SHADER_DIR)/,*.comp))
 SHADER_OUT   := $(BIN_DIR)/shader
 SHADERS_OBJS := $(addprefix $(SHADER_OUT)/,$(notdir $(SHADERS:.comp=.spv)))
 
@@ -378,7 +382,7 @@ endef
 $(foreach f,$(SHADERS),$(eval $(call COMPILE_SHADER,$(f))))
 ```
 
-Run: `make` builds shaders + `bin/main.exe` + `bin/vk_compute.node`; the executable is normally launched by the server/Python path (§11), the addon by the Node server (§14). `make clean` removes `bin/` and `build/` recursively.
+Run: `make` builds shaders + `bin/main.exe` + `bin/vk_compute.node`; the executable is normally launched by the server/Python path (§11), the addon by the Node server (§14). `make clean` removes `bin/` and `build/` recursively. The quant suffix in shader names is `Q16`/`Q8`/`Q4` (fp16/int8/int4) and `shader/Prototype/` is **excluded from the build** — it holds the validation-harness and legacy shaders, so `main.exe val` no longer resolves its `.spv` files.
 
 **Node addon target** (`bin/vk_compute.node`): the Makefile compiles `src/*.c` except `main.c`/`addon.c`/`engine.c` into `CORE_OBJS`, then links `build/addon.o build/engine.o $(CORE_OBJS)` against the tokenizers static lib and an N-API import library:
 

@@ -10,7 +10,7 @@
 
 const char* model_shader(const char* base, QuantType q) {
     static char buf[160];
-    const char* suffix = (q == QUANT_FP16) ? "FP16" : (q == QUANT_INT8) ? "INT8" : "INT4";
+    const char* suffix = (q == QUANT_FP16) ? "Q16" : (q == QUANT_INT8) ? "Q8" : "Q4";
     snprintf(buf, sizeof(buf), "%s-%s.spv", base, suffix);
     return buf;
 }

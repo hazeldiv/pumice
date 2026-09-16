@@ -480,7 +480,7 @@ static void buildMoe(generator* g, operation* ops, int* n, int L, int m) {
     guBufs[7] = w->guPool[L].ramScale;
     guBufs[8] = w->guPool[L].ramZero;
     int pushG[] = {d->K, d->moeI, slots, w->guPool[L].vramExperts, w->guPool[L].expertCount};
-    addOp(ops, n, "Expert-Swiglu-INT4.spv", L, guBufs, 9, pushG, 5,
+    addOp(ops, n, "Expert-Swiglu-Q4.spv", L, guBufs, 9, pushG, 5,
           d->moeI / 256, m * slots);
 
     buffer dnBufs[9];
@@ -494,7 +494,7 @@ static void buildMoe(generator* g, operation* ops, int* n, int L, int m) {
     dnBufs[7] = w->dnPool[L].ramScale;
     dnBufs[8] = w->dnPool[L].ramZero;
     int pushD[] = {d->moeI, d->K, slots, w->dnPool[L].vramExperts, w->dnPool[L].expertCount};
-    addOp(ops, n, "Expert-Down-INT4.spv", L, dnBufs, 9, pushD, 5,
+    addOp(ops, n, "Expert-Down-Q4.spv", L, dnBufs, 9, pushD, 5,
           d->K / 256, m * slots);
 
     buffer cbBufs[5];
@@ -529,11 +529,11 @@ static void buildLmHead(generator* g, operation* ops, int* n, buffer* input, int
     if (g->sampling) {
         buffer lmBufs[] = {*input, w->lmHead, st->logits, w->gammaFinal};
         int pushL[] = {1, g->vocab, d->K};
-        addOp(ops, n, "LMHead-GEMV-FP16.spv", -1, lmBufs, 4, pushL, 3, (g->vocab + 255) / 256, 1);
+        addOp(ops, n, "LMHead-GEMV-Q16.spv", -1, lmBufs, 4, pushL, 3, (g->vocab + 255) / 256, 1);
     } else {
         buffer lmBufs[] = {*input, w->lmHead, st->maxValue, st->maxIndex, w->gammaFinal};
         int pushL[] = {1, g->vocab, d->K};
-        addOp(ops, n, "LMHead-GEMV-ArgMax-FP16.spv", -1, lmBufs, 5, pushL, 3, (g->vocab + 255) / 256, 1);
+        addOp(ops, n, "LMHead-GEMV-ArgMax-Q16.spv", -1, lmBufs, 5, pushL, 3, (g->vocab + 255) / 256, 1);
     }
 
     buffer redBufs[] = {st->maxValue, st->maxIndex, st->logits, st->sampleParams, st->sampleHistory, st->sampleRng, st->result, st->position, st->tokenIds};
@@ -550,7 +550,7 @@ static void addDecodeEmbedLinearProj(generator* g, operation* ops, int* n) {
     if (q == QUANT_FP16) {
         buffer embedBufs[] = {st->tokenIds, w->embed, w->gammaIn[0], w->proj[0].data, st->qProj, st->kProj, st->vProj, st->zProj, st->aProj, st->bProj, st->embOut};
         int pushE[] = {1, d->projN, d->K, d->projKOff, d->projVOff, d->projZOff, d->projAOff, d->projBOff, g->vocab};
-        addOp(ops, n, "Embed-RmsNorm-LinearProj-FP16.spv", -1, embedBufs, 11, pushE, 9, (d->projN + 255) / 256, 1);
+        addOp(ops, n, "Embed-RmsNorm-LinearProj-Q16.spv", -1, embedBufs, 11, pushE, 9, (d->projN + 255) / 256, 1);
         return;
     }
 
