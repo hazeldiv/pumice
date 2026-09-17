@@ -15,13 +15,14 @@ NODE_LDFLAGS := -shared -L"$(VULKAN_SDK)/Lib" -lvulkan-1 -luser32 -lgdi32 \
                 -lws2_32 -luserenv -lbcrypt -lntdll -ladvapi32 -lole32 -loleaut32 \
                 -lpsapi -lshell32 -lshlwapi -lcrypt32
 
-TARGET       := main
+TARGET       := main.exe
 NODE_MODULE  := vk_compute.node
 SRC_DIR      := src
 BUILD_DIR    := build
 BIN_DIR      := bin
 SHADER_DIR   := shader
 NODE_LIB     := $(BUILD_DIR)/libnode.a
+TOKENIZERS_LIB := $(BUILD_DIR)/libtokenizers_c.a
 
 SRCS         := $(wildcard $(SRC_DIR)/*.c)
 CORE_SRCS    := $(filter-out $(SRC_DIR)/main.c $(SRC_DIR)/addon.c $(SRC_DIR)/engine.c,$(SRCS))
@@ -41,13 +42,17 @@ all: ${SHADERS_OBJS} $(BIN_DIR)/$(TARGET) $(BIN_DIR)/$(NODE_MODULE)
 $(BIN_DIR)/$(TARGET): $(MAIN_OBJS)
 	@if not exist $(BIN_DIR) mkdir $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-	@echo "Built successfully: $@.exe"
+	@echo "Built successfully: $@"
 
 $(BUILD_DIR)/libnode.a:
 	@if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
 	powershell -NoProfile -ExecutionPolicy Bypass -File gen_node_lib.ps1 -NodeExe "$(NODE_EXE)" -OutLib "$(NODE_LIB)"
 
-$(BIN_DIR)/$(NODE_MODULE): $(ADDON_OBJS) $(NODE_LIB) $(TOKENIZERS)/lib/libtokenizers_c.a
+$(TOKENIZERS_LIB): $(TOKENIZERS)/lib/libtokenizers_c.a
+	@if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
+	objcopy -R .drectve $< $@
+
+$(BIN_DIR)/$(NODE_MODULE): $(ADDON_OBJS) $(NODE_LIB) $(TOKENIZERS_LIB)
 	@if not exist $(BIN_DIR) mkdir $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(NODE_LDFLAGS)
 	@echo "Built successfully: $@"

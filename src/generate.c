@@ -595,7 +595,6 @@ static void addDecodeEmbedLinearProj(generator* g, operation* ops, int* n) {
 
 static int compileDecodeGroup(generator* g, operation* ops, int splitAttn) {
     model_state* st = &g->st;
-    const model_dims* d = g->dims;
     int n = 0;
 
     for (int p = 0; p < DECODE_GROUP; p++) {
@@ -825,7 +824,7 @@ static void executeChunked(session s, operation* ops, int opCount, const char* p
     }
 }
 
-static void dumpHiddenStates(generator* g, int padded, int cur, int done) {
+static void dumpHiddenStates(generator* g, int cur, int done) {
     model_state* st = &g->st;
     const model_dims* d = g->dims;
     char path[320];
@@ -952,7 +951,7 @@ uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens) {
             executeChunked(g->s, g->prefillOps, g->prefillOpCount, "prefill", (int)(g->nextPos + done));
         }
         if (g->dumpHiddenDir[0] != '\0') {
-            dumpHiddenStates(g, padded, cur, done);
+            dumpHiddenStates(g, cur, done);
         }
         done += cur;
         lastCur = cur;

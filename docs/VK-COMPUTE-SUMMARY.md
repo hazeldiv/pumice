@@ -398,18 +398,22 @@ CORE_SRCS    := $(filter-out $(SRC_DIR)/main.c $(SRC_DIR)/addon.c $(SRC_DIR)/eng
 NODE_EXE     := $(shell node -p "process.execPath")
 NODE_INC     ?= $(firstword $(wildcard $(LOCALAPPDATA)/node-gyp/Cache/*/include/node))
 NODE_LIB     := $(BUILD_DIR)/libnode.a
+TOKENIZERS_LIB := $(BUILD_DIR)/libtokenizers_c.a
 
 $(BUILD_DIR)/libnode.a:
 	powershell -NoProfile -ExecutionPolicy Bypass -File gen_node_lib.ps1 -NodeExe "$(NODE_EXE)" -OutLib "$(NODE_LIB)"
 
-$(BIN_DIR)/$(NODE_MODULE): $(ADDON_OBJS) $(NODE_LIB) $(TOKENIZERS)/lib/libtokenizers_c.a
+$(TOKENIZERS_LIB): $(TOKENIZERS)/lib/libtokenizers_c.a
+	objcopy -R .drectve $< $@
+
+$(BIN_DIR)/$(NODE_MODULE): $(ADDON_OBJS) $(NODE_LIB) $(TOKENIZERS_LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(NODE_LDFLAGS)
 ```
 
 - `gen_node_lib.ps1` (repo root, so it is not swallowed by the gitignored `tools/`) lists the `napi_*` exports of the **running** `node.exe` with `objdump -p`, writes a `.def`, and runs `dlltool` to produce a GNU import library — this avoids depending on an MSVC `node.lib` (MinGW's `ld` cannot consume the MSVC import records) and always matches the active Node version.
 - N-API headers come from the node-gyp cache (`%LOCALAPPDATA%/node-gyp/Cache/<ver>/include/node`); N-API is ABI-stable, so headers from an older version link/run against a newer Node.
 - `NODE_LDFLAGS` adds `-shared` plus the Rust runtime deps (`-lws2_32 -luserenv -lbcrypt -lntdll -ladvapi32 -lole32 -loleaut32 -lpsapi -lshell32 -lshlwapi -lcrypt32`). The tokenizers lib is a MinGW (`x86_64-pc-windows-gnu`) Rust staticlib (identified by its `___chkstk_ms` references), so it links with the same gcc toolchain as the rest of the engine; `libtokenizers_cpp.a` is not needed (the C API is used directly).
-- Rust staticlibs emit `.drectve` `-exclude-symbols` records that MinGW `ld` reports as `unrecognized` warnings; they are harmless.
+- Rust staticlibs carry `.drectve` `-exclude-symbols` records (thousands of them in `libtokenizers_c.a`). MinGW `ld` does not understand them and prints one `unrecognized` / `corrupt .drectve` warning block per member — ~20,000 stderr lines per addon link. The Makefile strips the section once with `objcopy -R .drectve` into the cached `build/libtokenizers_c.a` (rebuilt only when the vendored lib changes), so the link is silent. The directives only matter to MSVC linkers; GNU `ld` ignores them.
 
 > **Windows quirks** (important): the effective recipe shell is `cmd.exe`, so `mkdir`/`if exist` must use **backslashes** (`bin\shader`) — cmd treats `/` as a switch prefix — and folder names must not contain spaces (GNU make word-splits `$(wildcard)`/`$(foreach)` output on spaces, hence `Full-Attention/` and `Linear-Attention/` rather than `Full Attention/`).
 
