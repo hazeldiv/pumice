@@ -36,7 +36,7 @@ export function buildLoadOptions(target: string, info: ProbeInfo, body: any): Lo
   };
   if (quant && info.experts > 0) quant.expertsVram = expertsVram;
 
-  const autoPrune = process.env.VK_COMPUTE_AUTOLOAD_PRUNE;
+  const autoPrune = process.env.PUMICE_AUTOLOAD_PRUNE;
   const prune = body?.prune !== undefined
     ? Boolean(body.prune)
     : (autoPrune !== undefined ? autoPrune !== "0" : info.kind !== "hqm");

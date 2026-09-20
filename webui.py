@@ -11,9 +11,9 @@ from pathlib import Path
 
 import gradio as gr
 
-import vk_llm
+import pumice_llm
 
-ROOT = vk_llm.ROOT
+ROOT = pumice_llm.ROOT
 QUANT_TMP = ROOT / "bin" / "webui_quant.json"
 DEFAULT_EXPORT_DIR = ROOT / "exported"
 QUANT_CHOICES = [("FP16", "fp16"), ("INT8", "int8"), ("INT4", "int4")]
@@ -143,7 +143,7 @@ def validate_safetensors(model_dir):
 
 def read_gguf_info(path):
     path = Path(path)
-    meta = vk_llm.gguf_meta(path)
+    meta = pumice_llm.gguf_meta(path)
 
     def get(suffix, default=None):
         for key, value in meta.items():
@@ -180,7 +180,7 @@ def read_gguf_info(path):
 def _read_hqm_i32(path, tensors, data_offset, name):
     if name not in tensors:
         return []
-    raw = vk_llm.hqm_read_tensor(path, tensors, data_offset, name)
+    raw = pumice_llm.hqm_read_tensor(path, tensors, data_offset, name)
     if len(raw) % 4 != 0:
         return []
     return list(struct.unpack("<%di" % (len(raw) // 4), raw))
@@ -188,7 +188,7 @@ def _read_hqm_i32(path, tensors, data_offset, name):
 
 def read_hqm_info(path):
     path = Path(path)
-    kvs, tensors, data_offset = vk_llm.hqm_meta(path)
+    kvs, tensors, data_offset = pumice_llm.hqm_meta(path)
     types = _read_hqm_i32(path, tensors, data_offset, "config.layer_type")
     aq = _read_hqm_i32(path, tensors, data_offset, "config.layer_attn_quant")
     fq = _read_hqm_i32(path, tensors, data_offset, "config.layer_ffn_quant")
@@ -352,7 +352,7 @@ def _close_engine():
     llm = _ENGINE.get("llm")
     if llm is not None:
         try:
-            vk_llm.close(llm)
+            pumice_llm.close(llm)
         except Exception:
             pass
     _ENGINE.update({"llm": None, "path": None, "kind": None, "info": {}})
@@ -440,7 +440,7 @@ def load_model(path, vals, rows, max_ctx, prefill_chunk, embed_q, lm_head_q, emb
         _close_engine()
         out_dir = _resolve_dir(export_dir) or DEFAULT_EXPORT_DIR
         try:
-            llm = vk_llm.start_llm(
+            llm = pumice_llm.start_llm(
                 weight_dir,
                 max_ctx=int(max_ctx),
                 max_new_tokens=4096,
@@ -463,7 +463,7 @@ def unload_model():
 
 
 def _set_sampling(llm, temperature, top_k, top_p, min_p, rep_penalty, penalty_len, presence_penalty, seed, greedy):
-    vk_llm.set_sampling(
+    pumice_llm.set_sampling(
         llm,
         is_sampling=not greedy,
         temperature=temperature,
@@ -503,7 +503,7 @@ def respond(message, history, system_prompt, thinking, hide_thinking, max_new, l
     _set_sampling(llm, temperature, top_k, top_p, min_p, rep_penalty, penalty_len, presence_penalty, seed, not sampling)
     messages = history + [{"role": "user", "content": message}]
     try:
-        ids = vk_llm.apply_chat_template(llm, messages, system=system_prompt or "", enable_thinking=bool(thinking))
+        ids = pumice_llm.apply_chat_template(llm, messages, system=system_prompt or "", enable_thinking=bool(thinking))
     except Exception as exc:
         yield history + [{"role": "user", "content": message},
                          {"role": "assistant", "content": "Tokenize failed: %s" % exc}], "", ""
@@ -512,7 +512,7 @@ def respond(message, history, system_prompt, thinking, hide_thinking, max_new, l
     count = 0
     start = time.perf_counter()
     try:
-        for delta, n in vk_llm.generate_stream_tokens(llm, ids):
+        for delta, n in pumice_llm.generate_stream_tokens(llm, ids):
             count = n
             partial += delta
             elapsed = time.perf_counter() - start
@@ -535,8 +535,8 @@ def clear_chat():
 
 def build_ui():
     DEFAULT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    with gr.Blocks(title="VK Compute") as demo:
-        gr.Markdown("# VK Compute")
+    with gr.Blocks(title="Pumice") as demo:
+        gr.Markdown("# Pumice")
         layer_rows = gr.State([])
         layer_vals = gr.State([])
         locked = gr.State(False)

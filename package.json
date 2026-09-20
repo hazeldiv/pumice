@@ -1,11 +1,11 @@
 {
-  "name": "@h4zel/vk-compute",
+  "name": "@h4zel/pumice",
   "version": "1.0.1",
   "description": "Vulkan LLM inference engine with a local web UI",
   "type": "module",
   "main": "cli.js",
   "bin": {
-    "vk-compute": "cli.js"
+    "pumice": "cli.js"
   },
   "files": [
     "cli.js",
@@ -22,7 +22,7 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@h4zel/vk-compute-win32-x64": "1.0.1"
+    "@h4zel/pumice-win32-x64": "1.0.1"
   },
   "dependencies": {
     "express": "^4.21.2"

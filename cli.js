@@ -8,16 +8,16 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const require = createRequire(import.meta.url);
 const home = path.dirname(fileURLToPath(import.meta.url));
 const launchCwd = process.cwd();
-const platformPackage = "@h4zel/vk-compute-win32-x64";
+const platformPackage = "@h4zel/pumice-win32-x64";
 
 function usage() {
-  console.log(`Usage: vk-compute [options]
+  console.log(`Usage: pumice [options]
 
 Options:
   -p, --port <port>    port to listen on (default 8787)
   -m, --models <dir>   model directory to scan (default ./model)
-      --host <addr>    bind address (default 127.0.0.1, env VK_COMPUTE_HOST)
-      --api-key <key>  require Authorization: Bearer <key> on /v1 (env VK_COMPUTE_API_KEY)
+      --host <addr>    bind address (default 127.0.0.1, env PUMICE_HOST)
+      --api-key <key>  require Authorization: Bearer <key> on /v1 (env PUMICE_API_KEY)
       --no-open        do not open the browser
   -h, --help           show this help`);
 }
@@ -35,13 +35,13 @@ function parseArgs(argv) {
       usage();
       process.exit(0);
     } else {
-      console.error(`vk-compute: unknown option ${arg}`);
+      console.error(`pumice: unknown option ${arg}`);
       usage();
       process.exit(2);
     }
   }
   if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
-    console.error(`vk-compute: invalid port ${opts.port}`);
+    console.error(`pumice: invalid port ${opts.port}`);
     process.exit(2);
   }
   return opts;
@@ -52,9 +52,9 @@ function resolveRuntime() {
     return path.dirname(require.resolve(`${platformPackage}/package.json`));
   } catch {}
   const local = path.join(home, "platform", "win32-x64");
-  if (fs.existsSync(path.join(local, "vk_compute.node"))) return local;
-  console.error(`vk-compute: no engine binary for ${process.platform}-${process.arch}`);
-  console.error(`vk-compute: expected optional dependency ${platformPackage}`);
+  if (fs.existsSync(path.join(local, "pumice.node"))) return local;
+  console.error(`pumice: no engine binary for ${process.platform}-${process.arch}`);
+  console.error(`pumice: expected optional dependency ${platformPackage}`);
   process.exit(1);
 }
 
@@ -62,29 +62,29 @@ const opts = parseArgs(process.argv.slice(2));
 const runtimeDir = resolveRuntime();
 const modelsDir = opts.models ? path.resolve(launchCwd, opts.models) : path.join(launchCwd, "model");
 
-process.env.VK_COMPUTE_RUNTIME = runtimeDir;
-process.env.VK_COMPUTE_CWD = launchCwd;
-process.env.VK_COMPUTE_MODELS = modelsDir;
-process.env.VK_PRUNED_VOCAB_DIR = path.join(launchCwd, "pruned-vocab");
-process.env.VK_COMPUTE_EXPORT_DIR = path.join(launchCwd, "exported");
-process.env.VK_COMPUTE_QUANT_TMP = path.join(os.tmpdir(), `vk-compute-quant-${process.pid}.json`);
-process.env.VK_COMPUTE_OPEN = opts.open ? "1" : "0";
-if (opts.apiKey) process.env.VK_COMPUTE_API_KEY = opts.apiKey;
-if (opts.host) process.env.VK_COMPUTE_HOST = opts.host;
+process.env.PUMICE_RUNTIME = runtimeDir;
+process.env.PUMICE_CWD = launchCwd;
+process.env.PUMICE_MODELS = modelsDir;
+process.env.PUMICE_PRUNED_VOCAB_DIR = path.join(launchCwd, "pruned-vocab");
+process.env.PUMICE_EXPORT_DIR = path.join(launchCwd, "exported");
+process.env.PUMICE_QUANT_TMP = path.join(os.tmpdir(), `pumice-quant-${process.pid}.json`);
+process.env.PUMICE_OPEN = opts.open ? "1" : "0";
+if (opts.apiKey) process.env.PUMICE_API_KEY = opts.apiKey;
+if (opts.host) process.env.PUMICE_HOST = opts.host;
 process.env.PORT = String(opts.port);
 
 const server = path.join(home, "webui", "dist-server", "index.mjs");
 if (!fs.existsSync(server)) {
-  console.error("vk-compute: server bundle missing, reinstall the package");
+  console.error("pumice: server bundle missing, reinstall the package");
   process.exit(1);
 }
-if (!fs.existsSync(path.join(runtimeDir, "vk_compute.node"))) {
-  console.error(`vk-compute: engine binary missing in ${runtimeDir}`);
+if (!fs.existsSync(path.join(runtimeDir, "pumice.node"))) {
+  console.error(`pumice: engine binary missing in ${runtimeDir}`);
   process.exit(1);
 }
 
-console.log(`vk-compute: models  ${modelsDir}`);
-console.log(`vk-compute: runtime ${runtimeDir}`);
-console.log(`vk-compute: api     http://${opts.host ?? "127.0.0.1"}:${opts.port}/v1`);
+console.log(`pumice: models  ${modelsDir}`);
+console.log(`pumice: runtime ${runtimeDir}`);
+console.log(`pumice: api     http://${opts.host ?? "127.0.0.1"}:${opts.port}/v1`);
 
 await import(pathToFileURL(server).href);

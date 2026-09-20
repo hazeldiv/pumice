@@ -26,7 +26,7 @@ function startServer(env = {}) {
     env: { ...process.env, ...env },
   });
   const logPort = env.PORT ?? port;
-  const log = fs.createWriteStream(path.join(os.tmpdir(), `vk-v1-test-${logPort}.log`));
+  const log = fs.createWriteStream(path.join(os.tmpdir(), `pumice-v1-test-${logPort}.log`));
   proc.stdout.pipe(log);
   proc.stderr.pipe(log);
   return proc;
@@ -248,8 +248,8 @@ async function main() {
     body: JSON.stringify(chatBody("Say hello in exactly three words.")),
   });
   await hdrRes.json();
-  const cacheHeader = hdrRes.headers.get("x-vk-cache-cached-tokens");
-  check("cache header present", cacheHeader !== null, `x-vk-cache-cached-tokens=${cacheHeader}`);
+  const cacheHeader = hdrRes.headers.get("x-pumice-cache-cached-tokens");
+  check("cache header present", cacheHeader !== null, `x-pumice-cache-cached-tokens=${cacheHeader}`);
 
   const streamedTool = await chatStream({
     model: MODEL,
@@ -338,7 +338,7 @@ async function main() {
 
   const authPort = port + 1;
   const authBase = `http://127.0.0.1:${authPort}`;
-  const authServer = startServer({ PORT: String(authPort), VK_COMPUTE_API_KEY: "secret" });
+  const authServer = startServer({ PORT: String(authPort), PUMICE_API_KEY: "secret" });
   try {
     if (await waitForServer(authBase)) {
       const noKey = await fetch(`${authBase}/v1/models`);

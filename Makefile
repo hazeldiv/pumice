@@ -16,7 +16,7 @@ NODE_LDFLAGS := -shared -L"$(VULKAN_SDK)/Lib" -lvulkan-1 -luser32 -lgdi32 \
                 -lpsapi -lshell32 -lshlwapi -lcrypt32
 
 TARGET       := main.exe
-NODE_MODULE  := vk_compute.node
+NODE_MODULE  := pumice.node
 SRC_DIR      := src
 BUILD_DIR    := build
 BIN_DIR      := bin

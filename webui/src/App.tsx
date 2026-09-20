@@ -202,7 +202,7 @@ export default function App() {
   return (
     <div className="app">
       <header>
-        <h1>VK Compute</h1>
+        <h1>Pumice</h1>
         <nav>
           <button className={tab === "model" ? "active" : ""} onClick={() => setTab("model")}>Model</button>
           <button className={tab === "sampling" ? "active" : ""} onClick={() => setTab("sampling")}>Sampling</button>

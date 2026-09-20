@@ -75,7 +75,7 @@ async function main() {
       cwd: webui,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const log = fs.createWriteStream(path.join(os.tmpdir(), "vk-webui-test-server.log"));
+    const log = fs.createWriteStream(path.join(os.tmpdir(), "pumice-webui-test-server.log"));
     server.stdout.pipe(log);
     server.stderr.pipe(log);
     server.on("exit", (code, signal) => {

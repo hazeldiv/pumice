@@ -192,7 +192,7 @@ function buildUsage(promptTokens: number, completionTokens: number, cachedTokens
 }
 
 function auth(req: Request, res: Response, next: () => void): void {
-  const key = process.env.VK_COMPUTE_API_KEY;
+  const key = process.env.PUMICE_API_KEY;
   if (!key) {
     next();
     return;
@@ -211,12 +211,12 @@ export function createV1Router(engine: EngineManager): Router {
 
   router.get("/models", (_req, res) => {
     const models = scanModels(modelRoot);
-    const data = models.map((m) => ({ id: m.label, object: "model", created: 0, owned_by: "vk-compute" }));
+    const data = models.map((m) => ({ id: m.label, object: "model", created: 0, owned_by: "pumice" }));
     const loaded = engine.status();
     if (loaded.loaded && loaded.info) {
       const id = loaded.info.name;
       if (!data.some((d) => d.id.toLowerCase() === id.toLowerCase())) {
-        data.unshift({ id, object: "model", created: 0, owned_by: "vk-compute" });
+        data.unshift({ id, object: "model", created: 0, owned_by: "pumice" });
       }
     }
     res.json({ object: "list", data });
@@ -375,7 +375,7 @@ export function createV1Router(engine: EngineManager): Router {
         const message: Record<string, unknown> = { role: "assistant", content: visible.length ? visible : null };
         if (reasoning) message.reasoning_content = reasoning;
         if (toolCalls.length) message.tool_calls = toolCalls;
-        res.setHeader("X-Vk-Cache-Cached-Tokens", String(usage.prompt_tokens_details.cached_tokens));
+        res.setHeader("X-Pumice-Cache-Cached-Tokens", String(usage.prompt_tokens_details.cached_tokens));
         res.json({
           id,
           object: "chat.completion",
@@ -519,7 +519,7 @@ export function createV1Router(engine: EngineManager): Router {
 
       const usage = buildUsage(ids.length, result.tokens, result.cachedTokens);
       if (!streaming) {
-        res.setHeader("X-Vk-Cache-Cached-Tokens", String(usage.prompt_tokens_details.cached_tokens));
+        res.setHeader("X-Pumice-Cache-Cached-Tokens", String(usage.prompt_tokens_details.cached_tokens));
         res.json({
           id,
           object: "text_completion",

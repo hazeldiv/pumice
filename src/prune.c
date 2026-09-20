@@ -15,7 +15,7 @@
 #define GATHER_CHUNK 8192
 
 const char* prunedVocabDir(void) {
-    const char* dir = getenv("VK_PRUNED_VOCAB_DIR");
+    const char* dir = getenv("PUMICE_PRUNED_VOCAB_DIR");
     return (dir && dir[0]) ? dir : PRUNED_VOCAB_DIR;
 }
 

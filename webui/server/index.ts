@@ -212,7 +212,7 @@ if (fs.existsSync(distDir)) {
 }
 
 const port = Number(process.env.PORT ?? 8787);
-const host = process.env.VK_COMPUTE_HOST ?? "127.0.0.1";
+const host = process.env.PUMICE_HOST ?? "127.0.0.1";
 process.on("uncaughtException", (e) => console.error("uncaught:", e));
 process.on("unhandledRejection", (e) => console.error("unhandled:", e));
 
@@ -229,10 +229,10 @@ function openBrowser(url: string): void {
 
 app.listen(port, host, () => {
   const url = `http://${host}:${port}`;
-  console.log(`vk-compute webui server on ${url}`);
-  console.log(`vk-compute [OI] api on ${url}/v1`);
+  console.log(`pumice webui server on ${url}`);
+  console.log(`pumice [OI] api on ${url}/v1`);
   if (!fs.existsSync(addonPath)) {
     console.warn(`missing addon: ${addonPath} (run make)`);
   }
-  if (process.env.VK_COMPUTE_OPEN === "1") openBrowser(url);
+  if (process.env.PUMICE_OPEN === "1") openBrowser(url);
 });

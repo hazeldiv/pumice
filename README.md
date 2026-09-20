@@ -1,4 +1,4 @@
-# VK Compute
+# Pumice
 
 A Vulkan-based LLM inference engine, written from scratch in C and GLSL compute shaders — no ML framework involved: no PyTorch, no CUDA, no llama.cpp. It runs Qwen3.5-2B, Qwen3.5-9B, and the Qwen3.6-35B-A3B MoE locally, tested on an **AMD RX 580 8 GB** and an **NVIDIA RTX 4060**.
 
@@ -11,7 +11,7 @@ The web UI ships as an npm package with a prebuilt engine binary: model loader w
 Requires **Windows x64**, **Node.js 18+**, and a Vulkan-capable GPU with a current driver.
 
 ```bash
-npm install -g @h4zel/vk-compute
+npm install -g @h4zel/pumice
 ```
 
 Models live in a folder you own — the command scans `./model` and `./pruned-vocab` relative to where you run it:
@@ -26,7 +26,7 @@ my-models/
 
 ```bash
 cd my-models
-vk-compute
+pumice
 ```
 
 The UI opens automatically at `http://127.0.0.1:8787`.
@@ -36,7 +36,7 @@ The UI opens automatically at `http://127.0.0.1:8787`.
 | `-p, --port <port>`  | port to listen on (default 8787)            |
 | `-m, --models <dir>` | model directory to scan (default `./model`) |
 | `--host <addr>`      | bind address (default `127.0.0.1`)          |
-| `--api-key <key>`    | require `Authorization: Bearer <key>` on `/v1` (or set `VK_COMPUTE_API_KEY`) |
+| `--api-key <key>`    | require `Authorization: Bearer <key>` on `/v1` (or set `PUMICE_API_KEY`) |
 | `--no-open`          | do not open the browser                     |
 
 ### Agent API
@@ -63,9 +63,9 @@ Add a custom provider to `opencode.json` (the model id must match `GET /v1/model
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "vk-compute": {
+    "pumice": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "VK Compute (local)",
+      "name": "Pumice (local)",
       "options": { "baseURL": "http://127.0.0.1:8787/v1" },
       "models": {
         "Qwen3.5-2B-1.6gb.hqm": {

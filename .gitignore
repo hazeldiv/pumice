@@ -13,6 +13,6 @@ build
 model
 exported
 tokenizers-cpp
-platform/win32-x64/vk_compute.node
+platform/win32-x64/pumice.node
 platform/win32-x64/shader
 webui/dist-server

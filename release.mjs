@@ -21,8 +21,8 @@ function nextVersion(current, spec) {
 function writeVersion(file, version) {
   const data = JSON.parse(fs.readFileSync(file, "utf8"));
   data.version = version;
-  if (data.optionalDependencies?.["@h4zel/vk-compute-win32-x64"]) {
-    data.optionalDependencies["@h4zel/vk-compute-win32-x64"] = version;
+  if (data.optionalDependencies?.["@h4zel/pumice-win32-x64"]) {
+    data.optionalDependencies["@h4zel/pumice-win32-x64"] = version;
   }
   fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
 }
@@ -51,4 +51,4 @@ execSync(publishArgs, { cwd: platform, stdio: "inherit" });
 console.log("release: publishing main package");
 execSync(publishArgs, { cwd: root, stdio: "inherit" });
 
-console.log(`release: published @h4zel/vk-compute@${version}`);
+console.log(`release: published @h4zel/pumice@${version}`);

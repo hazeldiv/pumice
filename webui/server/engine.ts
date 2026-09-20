@@ -65,7 +65,7 @@ export function buildChatTemplate(messages: ChatMessage[], system: string, think
 }
 
 export class EngineManager {
-  private vk: any;
+  private addon: any;
   private engine: any = null;
   private info: ProbeInfo | null = null;
   private tail: Promise<unknown> = Promise.resolve();
@@ -73,7 +73,7 @@ export class EngineManager {
   private active: RunHandle | null = null;
 
   constructor(addonPath: string, private quantTmp: string) {
-    this.vk = require(addonPath);
+    this.addon = require(addonPath);
   }
 
   private enqueue<T>(handle: RunHandle, fn: () => Promise<T>, force = false): Promise<T> {
@@ -111,7 +111,7 @@ export class EngineManager {
       fs.writeFileSync(this.quantTmp, JSON.stringify(opts.quant, null, 2));
       quantConfig = this.quantTmp;
     }
-    const engine = await this.vk.createEngine({
+    const engine = await this.addon.createEngine({
       weights: opts.path,
       quantConfig,
       maxCtx: opts.maxCtx,
@@ -129,7 +129,7 @@ export class EngineManager {
 
   unload(): void {
     if (this.engine) {
-      this.vk.destroyEngine(this.engine);
+      this.addon.destroyEngine(this.engine);
       this.engine = null;
     }
     this.info = null;
@@ -154,7 +154,7 @@ export class EngineManager {
     kvColdBytes: number;
     kvRestoreMs: number;
   } | null {
-    return this.engine ? this.vk.engineInfo(this.engine) : null;
+    return this.engine ? this.addon.engineInfo(this.engine) : null;
   }
 
   stopGeneration(handle?: RunHandle): void {
@@ -162,12 +162,12 @@ export class EngineManager {
       handle.cancelled = true;
       if (this.active !== handle) return;
     }
-    if (this.engine) this.vk.requestStop(this.engine);
+    if (this.engine) this.addon.requestStop(this.engine);
   }
 
   tokenize(text: string): Uint32Array {
     if (!this.engine) throw new Error("no model loaded");
-    return this.vk.tokenize(this.engine, text, false);
+    return this.addon.tokenize(this.engine, text, false);
   }
 
   async score(
@@ -179,7 +179,7 @@ export class EngineManager {
     handle: RunHandle = createRunHandle(),
   ): Promise<ScoreResult> {
     if (!this.engine) throw new Error("no model loaded");
-    return this.enqueue(handle, () => this.vk.score(this.engine, ids, { prefill, decode, chunks }, onProgress));
+    return this.enqueue(handle, () => this.addon.score(this.engine, ids, { prefill, decode, chunks }, onProgress));
   }
 
   async chat(
@@ -206,7 +206,7 @@ export class EngineManager {
     if (!this.engine) throw new Error("no model loaded");
     return this.enqueue(handle, async () => {
       const started = Date.now();
-      const result = await this.vk.generate(this.engine, ids, { ...sampling, maxNew }, (ev: any) => {
+      const result = await this.addon.generate(this.engine, ids, { ...sampling, maxNew }, (ev: any) => {
         if (ev.delta) onDelta(ev.delta);
       });
       return {

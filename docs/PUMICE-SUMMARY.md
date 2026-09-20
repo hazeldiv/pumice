@@ -1,11 +1,11 @@
-# VK Compute — Complete Technical Summary
+# Pumice — Complete Technical Summary
 
-A Vulkan-based GPU compute engine for running LLM inference — **multi-model** (any Qwen3.5/3.6-family checkpoint, currently **Qwen3.6-35B-A3B** (MoE), **Qwen3.5 9B**, and **Qwen3.5 2B**), all model dimensions **read at runtime from config files** (no per-model recompile) — with per-layer **hybrid quantization** (Q4_1 with 32/64/128/256-element blocks, INT8, FP16) and **MoE expert offloading** (per-layer expert pools split between VRAM and host-visible RAM) on AMD RDNA1-class GPUs (RX 580: 36 CUs, wave64). Four entry points — three gated by `main.exe` plus a **Node.js native addon** (`bin/vk_compute.node`) that backs the React web UI:
+A Vulkan-based GPU compute engine for running LLM inference — **multi-model** (any Qwen3.5/3.6-family checkpoint, currently **Qwen3.6-35B-A3B** (MoE), **Qwen3.5 9B**, and **Qwen3.5 2B**), all model dimensions **read at runtime from config files** (no per-model recompile) — with per-layer **hybrid quantization** (Q4_1 with 32/64/128/256-element blocks, INT8, FP16) and **MoE expert offloading** (per-layer expert pools split between VRAM and host-visible RAM) on AMD RDNA1-class GPUs (RX 580: 36 CUs, wave64). Four entry points — three gated by `main.exe` plus a **Node.js native addon** (`bin/pumice.node`) that backs the React web UI:
 
-- **Server mode** (`main.exe`, default): a **persistent** inference daemon. It loads the real safetensors weights once (§4.7), then serves repeated "tokenize — generate" requests over a length-prefixed binary protocol on stdin/stdout (`[uint32 n][n×uint32 ids]` in — a stream of `[uint32 id]` tokens terminated by a `0xFFFFFFFF` sentinel; `n == 0` shuts down). Tokens are emitted **one at a time** as they are generated. The Python frontend `vk_llm.py` (repo root, run under `.venv` via **uv**) tokenizes text, drives the daemon, and detokenizes output.
+- **Server mode** (`main.exe`, default): a **persistent** inference daemon. It loads the real safetensors weights once (§4.7), then serves repeated "tokenize — generate" requests over a length-prefixed binary protocol on stdin/stdout (`[uint32 n][n×uint32 ids]` in — a stream of `[uint32 id]` tokens terminated by a `0xFFFFFFFF` sentinel; `n == 0` shuts down). Tokens are emitted **one at a time** as they are generated. The Python frontend `pumice_llm.py` (repo root, run under `.venv` via **uv**) tokenizes text, drives the daemon, and detokenizes output.
 - **Validation mode** (`main.exe val`): the original shader harness — randomized test data, weight transpose/quantize/upload, GPU dispatch, comparison against single-threaded CPU references.
 - **Memory-info mode** (`main.exe meminfo`): dumps the device memory heaps/types (§3.2) and exits — used to diagnose the VRAM budget (§12).
-- **Node addon mode** (`bin/vk_compute.node`, §14): the same engine core compiled into an N-API shared library. It owns the model, tokenizer (via the vendored `tokenizers-c` static lib, §14.2), and generation loop in-process, streaming tokens to JavaScript through a threadsafe function. The `webui/` React + Vite frontend talks to a small Node server that exposes model probe/load/unload, SSE chat, and **perplexity evaluation** (§15) endpoints. The same server also exposes an **[OI]-compatible `/v1` API** (§17) so an agent harness (opencode and friends) can drive it unchanged. The whole thing is published to npm as **`@h4zel/vk-compute`** (§14.9): `npm i -g @h4zel/vk-compute` then run `vk-compute` from a folder containing `model/` and `pruned-vocab/`.
+- **Node addon mode** (`bin/pumice.node`, §14): the same engine core compiled into an N-API shared library. It owns the model, tokenizer (via the vendored `tokenizers-c` static lib, §14.2), and generation loop in-process, streaming tokens to JavaScript through a threadsafe function. The `webui/` React + Vite frontend talks to a small Node server that exposes model probe/load/unload, SSE chat, and **perplexity evaluation** (§15) endpoints. The same server also exposes an **[OI]-compatible `/v1` API** (§17) so an agent harness (opencode and friends) can drive it unchanged. The whole thing is published to npm as **`@h4zel/pumice`** (§14.9): `npm i -g @h4zel/pumice` then run `pumice` from a folder containing `model/` and `pruned-vocab/`.
 
 Both the server and the harness share the same `operation` dispatch core (§3.3); the Node addon reuses the same `createGenerator`/`generateTokens` core through `src/engine.c`. The addon engine also carries a **tiered KV block cache** (VRAM live session, host RAM pool, disk mirror; §16) so conversations resume instead of re-prefilling the whole history each request.
 
@@ -56,13 +56,13 @@ The per-layer spec (attention type from `layer_types[]`, quant from `quant_confi
 ## 2. Repository Structure
 
 ```
-vk-compute/
-       package.json              # npm package @h4zel/vk-compute (bin: vk-compute -> cli.js)
+pumice/
+       package.json              # npm package @h4zel/pumice (bin: pumice -> cli.js)
        cli.js                    # CLI entry: args, platform-binary resolution, browser open
        pack.mjs                  # prepack: vite build + esbuild server bundle + runtime staging
        release.mjs               # version bump + publish (platform package, then main)
-       vk_llm.py                 # Python frontend: start_llm/tokenize/generate (uv venv, drives main.exe server)
-       webui.py                  # (legacy) Gradio web UI on top of vk_llm.py
+       pumice_llm.py                 # Python frontend: start_llm/tokenize/generate (uv venv, drives main.exe server)
+       webui.py                  # (legacy) Gradio web UI on top of pumice_llm.py
        test_webui.mjs            # Node end-to-end test for the addon + webui server
        test_kvcache.mjs          # KV cache resume/eviction/restart tests (§16.7)
        test_35b.mjs              # 35B-A3B KV restore + memory footprint (§16.7/16.9)
@@ -84,8 +84,8 @@ vk-compute/
             lib/libtokenizers_c.a    # MinGW (x86_64-pc-windows-gnu) Rust static lib, 29 MB
             lib/libtokenizers_cpp.a  # C++ wrapper static lib (unused)
        xxhash/                      # vendored XXH3 (BSD-2) single header, instantiated by src/xxhash.c
-       platform/win32-x64/          # npm platform package @h4zel/vk-compute-win32-x64 (§14.9)
-            package.json             # os/cpu restricted; ships vk_compute.node + shader/ (staged by pack.mjs)
+       platform/win32-x64/          # npm platform package @h4zel/pumice-win32-x64 (§14.9)
+            package.json             # os/cpu restricted; ships pumice.node + shader/ (staged by pack.mjs)
        webui/                       # React + Vite frontend and Node/Express server (§14)
             package.json  vite.config.ts  tsconfig.json  index.html  .npmignore
             server/index.ts          # Express API: probe/load/unload/chat(SSE)/score(SSE) + static dist
@@ -100,7 +100,7 @@ vk-compute/
             src/App.tsx  src/api.ts  src/styles.css
                  components/ModelTab.tsx  SamplingTab.tsx  ChatTab.tsx  QuantEditor.tsx
                  components/ScoreTab.tsx  # perplexity eval tab (§15)
-       Makefile                    # recursive shader build -> bin/shader/*.spv; builds main.exe + vk_compute.node
+       Makefile                    # recursive shader build -> bin/shader/*.spv; builds main.exe + pumice.node
        include/                    # C headers
             buffer.h  data.h  descriptor.h  device.h  dispatch.h
             fence.h  pipeline.h  session.h  validation.h
@@ -189,7 +189,7 @@ model/<name>/
            tokenizer.json  tokenizer_config.json  vocab.json
            mapping.npy                   # new-id — original-id int32[V]
 
-pruned-vocab/                            # repo root by default (PRUNED_VOCAB_DIR); VK_PRUNED_VOCAB_DIR overrides
+pruned-vocab/                            # repo root by default (PRUNED_VOCAB_DIR); PUMICE_PRUNED_VOCAB_DIR overrides
        mapping.npy                       # new-id — original-id int32[102400]
        tokenizer.json  tokenizer_config.json  vocab.json   # pruned tokenizer (renumbered ids)
        topp_tokens.json                  # union of top-p nuclei from the coding-token collection run
@@ -328,7 +328,7 @@ Loading is **cache-first and lazy at every level, for every weight class** (matr
    - **weight cache**: if `bin/weights/<name>/embed_<V>_FP16.bin` (and `lmHead_<V>_FP16.bin` for untied models) exists with a matching `{magic, K, V, FP16}` header, skip the gather entirely;
    - **vocab folder**: if `<modelDir>/vocab/embed_tokens.<V>.safetensors` (and `lm_head.<V>` for untied) exists, skip the gather;
    - **auto-prune**: open all shards (`model.safetensors*.safetensors` glob), read `pruned-vocab/mapping.npy` (int32[V], new-id — original-id; the npy header's version bytes must be skipped — gotcha 36; its length must equal V), and gather `row v` = source row `mapping[v]` from `embed_tokens` (and `lm_head` for untied models — the lm-head tensor can live in a different shard, so the multi-shard `safetensors_open` is required) into `vocab/embed_tokens.<V>.safetensors` / `vocab/lm_head.<V>.safetensors` (BF16, proper safetensors header).
-   - In every outcome the tokenizer files (`tokenizer.json`/`tokenizer_config.json`/`vocab.json`/`mapping.npy`) are ensured in `vocab/` from the root `pruned-vocab/` dir (`prunedVocabDir()` in src/prune.c — `VK_PRUNED_VOCAB_DIR` if set, else `PRUNED_VOCAB_DIR` `"../pruned-vocab"` from include/prune.h) — both `parseEos` and the Python frontend need them regardless of the gather decision.
+   - In every outcome the tokenizer files (`tokenizer.json`/`tokenizer_config.json`/`vocab.json`/`mapping.npy`) are ensured in `vocab/` from the root `pruned-vocab/` dir (`prunedVocabDir()` in src/prune.c — `PUMICE_PRUNED_VOCAB_DIR` if set, else `PRUNED_VOCAB_DIR` `"../pruned-vocab"` from include/prune.h) — both `parseEos` and the Python frontend need them regardless of the gather decision.
 3. `parseEos(&spec.dims, modelDir, pruned)` (src/model.c, public) derives **EOS from the tokenizer files** so it can never drift (gotcha 35: a hardcoded id from a stale header once made generation never stop). Pruned mode reads `vocab/tokenizer_config.json`'s `eos_token` name and resolves it in `vocab/vocab.json` (85992). Original mode reads the model-root `tokenizer_config.json` and resolves the name in the root `vocab.json` — but the original `vocab.json` contains **no special tokens**, so on miss it falls back to `tokenizer.json`'s `added_tokens` array (id 248046 for `<|im_end|>`). It runs *after* pruning (pruning is what materializes the vocab files on a fresh model dir) and before `createGenerator`.
 4. Weight tensor discovery globs `model.safetensors*.safetensors` (any shard count) instead of hardcoding 4 shards. Vocab-file discovery is V-exact: `findVocabFile` matches `embed_tokens.<V>.safetensors` by name, so a 248320 run ignores the 86016 files in `vocab/` and loads the full-size tensors straight from the shards (the pruned files are the wrong shape and must not be candidates).
 
@@ -401,11 +401,11 @@ endef
 $(foreach f,$(SHADERS),$(eval $(call COMPILE_SHADER,$(f))))
 ```
 
-Run: `make` builds shaders + `bin/main.exe` + `bin/vk_compute.node`; the executable is normally launched by the server/Python path (§11), the addon by the Node server (§14). `make clean` removes `bin/` and `build/` recursively. The quant suffix in shader names is `Q16`/`Q8`/`Q4` (fp16/int8/q4_1_*) and `shader/Prototype/` is **excluded from the build** — it holds the validation-harness and legacy shaders, so `main.exe val` no longer resolves its `.spv` files.
+Run: `make` builds shaders + `bin/main.exe` + `bin/pumice.node`; the executable is normally launched by the server/Python path (§11), the addon by the Node server (§14). `make clean` removes `bin/` and `build/` recursively. The quant suffix in shader names is `Q16`/`Q8`/`Q4` (fp16/int8/q4_1_*) and `shader/Prototype/` is **excluded from the build** — it holds the validation-harness and legacy shaders, so `main.exe val` no longer resolves its `.spv` files.
 
 The C build adds `-Ixxhash`; `src/xxhash.c` is the single translation unit that instantiates the vendored XXH3 implementation (`xxhash/xxhash.h`). It is part of `SRCS` and therefore linked into both `main.exe` and the addon.
 
-**Node addon target** (`bin/vk_compute.node`): the Makefile compiles `src/*.c` except `main.c`/`addon.c`/`engine.c` into `CORE_OBJS`, then links `build/addon.o build/engine.o $(CORE_OBJS)` against the tokenizers static lib and an N-API import library:
+**Node addon target** (`bin/pumice.node`): the Makefile compiles `src/*.c` except `main.c`/`addon.c`/`engine.c` into `CORE_OBJS`, then links `build/addon.o build/engine.o $(CORE_OBJS)` against the tokenizers static lib and an N-API import library:
 
 ```makefile
 CORE_SRCS    := $(filter-out $(SRC_DIR)/main.c $(SRC_DIR)/addon.c $(SRC_DIR)/engine.c,$(SRCS))
@@ -1340,7 +1340,7 @@ Token selection is a two-op chain built by `buildLmHead` (`src/generate.c`), thr
 | `presence_penalty` | `sampleParams.presencePenalty` | flat `logit -= presence_penalty` (raw-logit frame) for any id present ≥1× in the recent window — Qwen/vLLM semantics, applied once regardless of frequency (`0.0` = off) |
 | `seed` | `sampleRng[0]` | xorshift32 seed, reseeded per request |
 
-The repetition-penalty ring `sampleHistory` is a device buffer of `MAX_PENALTY_LEN = 1024` `uint32`, sentinel-filled (`0xFFFFFFFF`) in `resetGenerator`; empty slots never match a vocab id. Both penalties share the same membership bitmap — an id in the window gets the rep CTRL scaling (if `repPenalty != 1`) and the presence subtract (if `presencePenalty != 0`); a token is penalized once even if it occurs several times in the window. The Python frontend (`vk_llm.py`) drives all this via module-level constants — `is_sampling`, `temperature`, `rep_penalty`, `penalty_len`, `top_k`, `top_p`, `min_p`, `presence_penalty`, `seed` — and `_stream_ids` writes them as a fixed 32-byte header (`struct.pack("<ffIIfffI",  )`) between the length prefix and the token ids; `is_sampling == False` sends `temperature = 0.0` (greedy).
+The repetition-penalty ring `sampleHistory` is a device buffer of `MAX_PENALTY_LEN = 1024` `uint32`, sentinel-filled (`0xFFFFFFFF`) in `resetGenerator`; empty slots never match a vocab id. Both penalties share the same membership bitmap — an id in the window gets the rep CTRL scaling (if `repPenalty != 1`) and the presence subtract (if `presencePenalty != 0`); a token is penalized once even if it occurs several times in the window. The Python frontend (`pumice_llm.py`) drives all this via module-level constants — `is_sampling`, `temperature`, `rep_penalty`, `penalty_len`, `top_k`, `top_p`, `min_p`, `presence_penalty`, `seed` — and `_stream_ids` writes them as a fixed 32-byte header (`struct.pack("<ffIIfffI",  )`) between the length prefix and the token ids; `is_sampling == False` sends `temperature = 0.0` (greedy).
 
 **Cost.** Measured at ctx  130 with `--timing`: `LMHead-GEMV-FP16` 2.69 ms (same as the greedy `LMHead-GEMV-ArgMax-FP16` 2.81 ms — both stream the identical 671 MB lm_head matrix), `ArgMax-Reduce(mode 1)` 0.64 ms vs `(mode 0)` 0.03 ms — the sampling overhead is ~0.6 ms/token, under 1 tok/s end-to-end (24.4 vs 24.6 tok/s greedy). The original sampler rescanned the logits with scalar loads + `exp` per element across 48+48 bisection iterations and cost ~15 ms/token (sampling at ~20 tok/s vs 30+ greedy); see Â§7.1 for the optimized algorithm.
 
@@ -1515,7 +1515,7 @@ A separate `--debug-sampling` flag (`generatorDumpSamplingDebug`) reads back the
     them to zero. Related fixes in the same pass: `max_position_embeddings` is parsed from
     config.json (before `json_free` — gotcha 35's use-after-free trap) and clamps `maxCtx`;
     `generateTokens` rejects `nPrompt >= maxCtx` (previously an out-of-bounds KV write) and
-    `vk_llm.py` raises before sending; state creation now releases the KV-cache / `attScores`
+    `pumice_llm.py` raises before sending; state creation now releases the KV-cache / `attScores`
     staging allocations after the initial zero-copy (they are never re-uploaded) — **but**
     `stateS`/`convHist`/`sampleHistory` staging must stay alive: `resetGenerator` re-copies those
     still-intact staging buffers to re-zero state every request. Verified on the 2B at
@@ -1674,7 +1674,7 @@ The table above is the **validation harness** (M=64). The engine additionally se
 
 ```bash
 make clean          # removes bin/ and build/  (required after ANY header edit — see gotcha 12)
-make                # shaders -> bin/shader/*.spv, builds bin/main.exe + bin/vk_compute.node
+make                # shaders -> bin/shader/*.spv, builds bin/main.exe + bin/pumice.node
 
 cd bin && main.exe val       # validation harness (every validate* + max_err + timing)
 cd bin && main.exe meminfo   # dump memory heaps/types (device-local vs host-visible) and exit
@@ -1686,20 +1686,20 @@ Real weights are loaded by the **server** (`main.exe`, default). It reads a leng
 uv venv .venv                                  # once
 uv pip install --python .venv/Scripts/python.exe tokenizers   # once
 
-.venv/Scripts/python.exe vk_llm.py <model_dir> <max_ctx> "prompt text" [--think] [--prune] [--experts-vram N]
+.venv/Scripts/python.exe pumice_llm.py <model_dir> <max_ctx> "prompt text" [--think] [--prune] [--experts-vram N]
 # e.g.
-.venv/Scripts/python.exe vk_llm.py model/Qwen3.5-2B 8192 "why the sky is blue?" --think
-.venv/Scripts/python.exe vk_llm.py model/Qwen3.5-2B 131072 "long document question" --prune
-.venv/Scripts/python.exe vk_llm.py model/Qwen3.6-35B-A3B 8192 "why the sky is blue?" --think --prune --experts-vram 32
+.venv/Scripts/python.exe pumice_llm.py model/Qwen3.5-2B 8192 "why the sky is blue?" --think
+.venv/Scripts/python.exe pumice_llm.py model/Qwen3.5-2B 131072 "long document question" --prune
+.venv/Scripts/python.exe pumice_llm.py model/Qwen3.6-35B-A3B 8192 "why the sky is blue?" --think --prune --experts-vram 32
 ```
 
 No `--think` means non-thinking mode. `--prune` selects the **pruned 102,400-token vocab** and bootstraps a fresh model dir: the engine's `pruneVocab` resolves the vocab weights cache-first (weight cache → `<model>/vocab/` → auto-gather from the shards via `pruned-vocab/mapping.npy`, §4.7) and always ensures the tokenizer files in `<model>/vocab/` (the Python frontend copies them from the root `pruned-vocab/` before spawning the engine, since it needs the tokenizer first). Once the weight cache or `vocab/` exists, `--prune` is a no-op and can be dropped.
 
 **Without `--prune` the engine runs the original 248,320-token vocab** straight from the shards: `vocab` comes from `config.json`'s `vocab_size`, the tokenizer is the model-root `tokenizer.json` (original ids), and EOS resolves via the `added_tokens` fallback (§4.7). The two modes keep separate cache files (`embed_102400_FP16.bin` vs `embed_248320_FP16.bin`) and can be interleaved freely. **VRAM caveat**: the full vocab fits the 8 GB heap only on the 2B (~1 GB tied embed); the 9B's two untied FP16 heads (~4 GB) OOM — run the 9B with `--prune`.
 
-`vk_llm.py` exposes `start_llm(weight_dir, max_ctx, max_new_tokens, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0)`, `apply_chat_template(messages, enable_thinking=True)`, `tokenize`, `generate`, `generate_stream`, `detokenize`, `close`. `tokenize(text)` wraps the text in the **Qwen3.5 chat template** with the `<think>` control token (gotcha 32); the tokenizer comes from `<weight_dir>/vocab/tokenizer.json` (pruned ids, 85992 EOS) with `prune_vocab=True`, else the model-root `tokenizer.json` (original ids, 248046 EOS) — the choice must match the engine's `--prune` flag or ids desynchronize.
+`pumice_llm.py` exposes `start_llm(weight_dir, max_ctx, max_new_tokens, dump_dir=None, dump_layers=0, debug_sampling=False, prune_vocab=False, experts_vram=0)`, `apply_chat_template(messages, enable_thinking=True)`, `tokenize`, `generate`, `generate_stream`, `detokenize`, `close`. `tokenize(text)` wraps the text in the **Qwen3.5 chat template** with the `<think>` control token (gotcha 32); the tokenizer comes from `<weight_dir>/vocab/tokenizer.json` (pruned ids, 85992 EOS) with `prune_vocab=True`, else the model-root `tokenizer.json` (original ids, 248046 EOS) — the choice must match the engine's `--prune` flag or ids desynchronize.
 
-**Sampling** is opt-in and configured by module-level constants near the top of `vk_llm.py` — `is_sampling`, `temperature`, `rep_penalty`, `penalty_len`, `top_k`, `top_p`, `min_p`, `presence_penalty`, `seed`. With `is_sampling = False` (default/greedy) the request sends `temperature = 0.0`; with `is_sampling = True` it sends the constants and the backend runs the sampler (§7.7). These are consumed by `_stream_ids`, so `generate`/`generate_stream` take only `(llm, token_ids)`. Defaults follow Qwen3's thinking-mode recommendation: temperature 0.6 / top_k 20 / top_p 0.95 / rep_penalty 1.05 / penalty_len 64 (`min_p = 0.0` optional tail filter, `presence_penalty = 0.0` off — raise it to flat-penalize any token already present in the penalty window).
+**Sampling** is opt-in and configured by module-level constants near the top of `pumice_llm.py` — `is_sampling`, `temperature`, `rep_penalty`, `penalty_len`, `top_k`, `top_p`, `min_p`, `presence_penalty`, `seed`. With `is_sampling = False` (default/greedy) the request sends `temperature = 0.0`; with `is_sampling = True` it sends the constants and the backend runs the sampler (§7.7). These are consumed by `_stream_ids`, so `generate`/`generate_stream` take only `(llm, token_ids)`. Defaults follow Qwen3's thinking-mode recommendation: temperature 0.6 / top_k 20 / top_p 0.95 / rep_penalty 1.05 / penalty_len 64 (`min_p = 0.0` optional tail filter, `presence_penalty = 0.0` off — raise it to flat-penalize any token already present in the penalty window).
 
 Generation streams: `generate_stream(llm, ids)` yields **incremental decoded text** (reads token ids from the stream until the `0xFFFFFFFF` sentinel, accumulates them, and yields the new tail of `tokenizer.decode(...)` at each step), while `generate(llm, ids)` returns the full token-id list (used by tests / `detokenize`). The `_main()` CLI driver prints text incrementally (`print(..., end="", flush=True)`) and, after generation, reports **`N tokens, X.X tokens/s`** (timing measured host-side per token after the first 4).
 
@@ -1746,13 +1746,13 @@ probability) is the path to the all-VRAM ~25 tok/s.
 2. **(Resolved)** `rms_norm_eps = 1e-6` everywhere (shaders + `rms_norm_apply`), matching the model config.
 3. **(Resolved)** Partial RoPE (`0.25`): the engine now rotates only 64 of 256 dims (`MODEL_ROTARY_DIM`, 32 freqs, Î¸ base 1e7); dims 64..255 pass through.
 4. **(Resolved — no-op)** Qwen3.5 applies no final logit scaling: `logits = lm_head(rmsnorm(x))`, verified against the reference.
-5. **(Resolved)** Full-attention fidelity: `q_proj` q/g interleave (`buildQkvMatrix`), the GQA 16-head mapping (gotcha 25), and the `1/šhead_dim` QK scaling are all applied. `vk_llm.py` now applies the Qwen3.5 **chat template** (thinking mode) via `apply_chat_template`.
+5. **(Resolved)** Full-attention fidelity: `q_proj` q/g interleave (`buildQkvMatrix`), the GQA 16-head mapping (gotcha 25), and the `1/šhead_dim` QK scaling are all applied. `pumice_llm.py` now applies the Qwen3.5 **chat template** (thinking mode) via `apply_chat_template`.
 6. **VRAM OOM** (Â§12) blocks a full end-to-end generation on the 8 GB card at `max_ctx = 32768`.
 7. **(Resolved) End-to-end correctness, prefill and decode.** The engine now produces coherent, correct output against the real 9B weights in both thinking and non-thinking modes ("why the sky is blue?" — Rayleigh-scattering explanation, "2+2" — "4", "name a color" — "Blue"). A layer-by-layer differential (`--dump` + `cmp_layers.py`, run under `tools/pruner/.venv`) shows all 32 prefill layers tracking the HF reference at 0.96  0.9999 cosine correlation, and the decode trajectory matches the pruned-vocab-constrained HF greedy exactly, token-for-token. Eight bugs were fixed across prefill and decode (gotchas 27  32): the headline prefill bug was the full-attention output gate (`sigmoid` vs `silu`, gotcha 27), and the headline decode bug was `Att-full-{INT8,INT4}` dequantizing V with K's scale/zero (gotcha 31). The chat-template ` thinking` token fix (gotcha 32) was what finally enabled thinking-mode output. Greedy argmax remains the default and still matches the HF greedy reference; an optional sampling path (temperature / repetition penalty / top-k / top-p) is available (Â§7.7).
-8. **(Resolved) Streaming output + per-token pacing.** The server now emits token ids one at a time (with an `0xFFFFFFFF` terminator) instead of an `[m][ids]` burst, and `generateTokens` — whose GPU side still computes `DECODE_GROUP = 4` tokens per pass — simulates per-token cadence by sleeping between the 4 emitted tokens of a group (delay = the previous group's measured per-token time; first group constant 25 ms). `vk_llm.py`'s `generate_stream` yields decoded text incrementally and the CLI prints `N tokens, X.X tokens/s`. Weight loading prints a single stderr progress bar / spinner by default; the old per-tensor (and KV-cache allocation) lines are gated behind `--verbose-weights`.
+8. **(Resolved) Streaming output + per-token pacing.** The server now emits token ids one at a time (with an `0xFFFFFFFF` terminator) instead of an `[m][ids]` burst, and `generateTokens` — whose GPU side still computes `DECODE_GROUP = 4` tokens per pass — simulates per-token cadence by sleeping between the 4 emitted tokens of a group (delay = the previous group's measured per-token time; first group constant 25 ms). `pumice_llm.py`'s `generate_stream` yields decoded text incrementally and the CLI prints `N tokens, X.X tokens/s`. Weight loading prints a single stderr progress bar / spinner by default; the old per-tensor (and KV-cache allocation) lines are gated behind `--verbose-weights`.
 9. **(Resolved) Decode attention K-cache transpose.** The K cache was stored token-major (`[token][row]`), so the decode QK dot (`Att-SplitK2`/`Att-full`) read K in an uncoalesced, 1024-strided gather. Transposing K to dim-major (`kCache[rowÂ·MAXCTX + token]`) across the writers (`Rope-GEMM`, `Reduce-Rope`) and readers (`Att-QK2`, `Att-full`, `Att-SplitK2`), while leaving V token-major, coalesces those reads. Measured ~3Ã— faster decode attention (`Att-SplitK2` per-call avg 0.901—0.337 ms FP16 and 0.689—0.219 ms INT8/INT4 at 4k ctx); the prefill `Att-QK2` B-load became coalesced too. The `--timing` CLI flag (plus `isTimingEnabled()`) drives the Â§8.4 per-op log, added to measure this.
 10. **MTP and vision tensors are ignored** (text-only baseline).
-11. **(Resolved) Sampling — temperature / repetition penalty / presence penalty / top-k / top-p.** `ArgMax-Reduce` was extended into a `mode`-selected sampler over a new full-logits buffer (Â§7.7), with a per-request `sampleParams` block, a sentinel-filled repetition-penalty ring (`sampleHistory`), and an on-GPU xorshift32 RNG (`sampleRng`). `g->sampling = (temperature > 0)`; greedy (`mode 0`) is byte-identical to the prior behavior. Sampling is opt-in from Python via module constants (`is_sampling`, `temperature`, `rep_penalty`, `penalty_len`, `top_k`, `top_p`, `min_p`, `presence_penalty`, `seed`), and a `--debug-sampling` flag dumps the history ring / position / generated tokens for diagnostics. The initial sampler cost ~15 ms/token (sampling at ~20 tok/s vs 30+ greedy); the Â§7.1 rewrite (probability-space conversion, per-thread early-outs, vec4 access, 28 bisections, subgroup reductions, TS 256—1024) cut it to 0.64 ms/token — the sampling/greedy gap is now under 1 tok/s. A second-round fix replaced the per-logit repetition-penalty history scan with a shared-memory membership bitmap, making the penalty cost independent of `penalty_len` (penalty_len=256 previously dropped sampling ~30 — ~26 tok/s; now parity with 16) and restoring once-only CTRL scaling for duplicated ids; `validateArgMaxSampler` (Â§6) plus the re-enabled `validateLmHeadArgMaxFP16` cover both modes against a fp64 CPU reference. A `min_p` filter (`p < min_p` dropped; trivial in prob space, Â§7.1) was added as a fourth knob with its own validator case. A fifth knob, **`presence_penalty`** (2026-09), implements Qwen/vLLM semantics: flat `logit -= presence_penalty` in the raw-logit frame for any id present ≥1× in the window, applied in the temperature-scaled frame as `pres × 1/T` so it commutes with temperature exactly like the rep penalty; it reuses the shared membership bitmap (active when `repPenalty != 1` or `presencePenalty != 0`), and the request header grew 28 → 32 bytes (`<ffIIfffI`) with the wire format updated in `vk_llm.py` and `tools/vocab_collect/collect.py` in lockstep; validator case D covers presence-only (`rep 1.0, presence 0.3, penLen 256`) against the fp64 reference.
+11. **(Resolved) Sampling — temperature / repetition penalty / presence penalty / top-k / top-p.** `ArgMax-Reduce` was extended into a `mode`-selected sampler over a new full-logits buffer (Â§7.7), with a per-request `sampleParams` block, a sentinel-filled repetition-penalty ring (`sampleHistory`), and an on-GPU xorshift32 RNG (`sampleRng`). `g->sampling = (temperature > 0)`; greedy (`mode 0`) is byte-identical to the prior behavior. Sampling is opt-in from Python via module constants (`is_sampling`, `temperature`, `rep_penalty`, `penalty_len`, `top_k`, `top_p`, `min_p`, `presence_penalty`, `seed`), and a `--debug-sampling` flag dumps the history ring / position / generated tokens for diagnostics. The initial sampler cost ~15 ms/token (sampling at ~20 tok/s vs 30+ greedy); the Â§7.1 rewrite (probability-space conversion, per-thread early-outs, vec4 access, 28 bisections, subgroup reductions, TS 256—1024) cut it to 0.64 ms/token — the sampling/greedy gap is now under 1 tok/s. A second-round fix replaced the per-logit repetition-penalty history scan with a shared-memory membership bitmap, making the penalty cost independent of `penalty_len` (penalty_len=256 previously dropped sampling ~30 — ~26 tok/s; now parity with 16) and restoring once-only CTRL scaling for duplicated ids; `validateArgMaxSampler` (Â§6) plus the re-enabled `validateLmHeadArgMaxFP16` cover both modes against a fp64 CPU reference. A `min_p` filter (`p < min_p` dropped; trivial in prob space, Â§7.1) was added as a fourth knob with its own validator case. A fifth knob, **`presence_penalty`** (2026-09), implements Qwen/vLLM semantics: flat `logit -= presence_penalty` in the raw-logit frame for any id present ≥1× in the window, applied in the temperature-scaled frame as `pres × 1/T` so it commutes with temperature exactly like the rep penalty; it reuses the shared membership bitmap (active when `repPenalty != 1` or `presencePenalty != 0`), and the request header grew 28 → 32 bytes (`<ffIIfffI`) with the wire format updated in `pumice_llm.py` and `tools/vocab_collect/collect.py` in lockstep; validator case D covers presence-only (`rep 1.0, presence 0.3, penLen 256`) against the fp64 reference.
 12. **(Resolved) Thinking-mode degeneration — pruned vocab was missing the model's reasoning-starter tokens.** Symptom: sampling at temp 0.6+ produced spurious `</thinking>` close-tags assembled from plain tokens, repeated answers, or early EOS; greedy degenerated into `1. 1. 1.` loops. Diagnostics: same-seed runs were reproducible, `top_k=1` matched greedy exactly, and the engine matched the **pruned-constrained** HF greedy 159/160 tokens — the engine was numerically correct. The real cause: HF's top-1 token after `<think>\n` was `'Thinking'` (logit margin +4.75 over rank 1) and `'Okay'`/`'Looking'`/`'Trying'` were also top-10 — all pruned away by the Wikipedia-corpus frequency trim. Every thinking generation started off-distribution. Fix: data-driven protection — teacher-forced HF over diverse engine-generated sequences to collect top-10 missing tokens (772 ids, `chat_protect.npy`), a `--protect-ids` option added to the pruner (`tools/pruner`), re-selected/re-applied the 81920 vocab, and re-gathered the embed/lm-head rows. **Gotcha: `bin/weights/` caches quantized tensors on disk — after any vocab change delete `embed_81920_FP16.bin`/`lmHead_81920_FP16.bin` or every generation is gibberish.** After the re-prune the engine matches unconstrained HF greedy from the very first token (`'Thinking'` — id 40378), thinking closes exactly once, and 6/6 sampled runs at temp 0.6 are structurally clean (previously ~50% broken).
 
 13. **(Resolved) Multi-model support — Qwen3.5 2B.** All model dimensions, the layer spec, and the per-layer quantization now come from the model folder's config.json + quant_config.json (§1, §4.7) — no engine rebuild or shader recompile per model. Three model-specific bugs were found and fixed while enabling the 2B (heads 8 / kvHeads 2 / K 2048 / tied embeddings): the GQA mapping assumption heads == kvHeads² (gotcha 34 — the 9B's 16/4 only worked by coincidence; the stable fix pushes gqa and the real heads as separate push members), the q_proj de-interleave dims (gotcha 33), and prefill pad-token state poisoning (gotcha 38). The 2B runs at ~46 tok/s (all-FP16, pruned vocab, max_ctx 32768, ~3.5 GB VRAM), greedy-matches HF through long-context decode, and its sampling path is clean past ctx 256 (the exact failure the Reduce-Att2 head-count bug caused). A fresh model dir is bootstrapped by the `--prune` flag, which gathers the pruned-row vocab from the shards via the root `pruned-vocab/mapping.npy` (§4.7, §11).
@@ -1819,7 +1819,7 @@ probability) is the path to the all-VRAM ~25 tok/s.
     startup), clamped to config.json `max_position_embeddings`; the decode split-K attention cap
     was lifted from 32768 to 262144 tokens (`ATT_MAX_CHUNKS 1024` shared by the four `Att-SplitK2`/
     `Reduce-Att2` shaders, the dispatch geometry, and the state sizing — gotcha 49); over-long
-    prompts are rejected (`generateTokens` guard + `vk_llm.py` ValueError) instead of writing
+    prompts are rejected (`generateTokens` guard + `pumice_llm.py` ValueError) instead of writing
     out-of-bounds KV; and state staging is released after the initial zero-copy (except the
     `resetGenerator`-relied-upon `stateS`/`convHist`/`sampleHistory` staging). Validated on the 2B
     at `max_ctx = 131072`: a 41698-token prompt with a needle past position 32768 (unreachable
@@ -1831,18 +1831,18 @@ probability) is the path to the all-VRAM ~25 tok/s.
 ## 14. Node addon & Web UI
 
 The React web UI runs on top of the same C engine, compiled into a Node native addon instead of the
-stdin/stdout daemon. The Python frontend (`vk_llm.py`, `webui.py`) is kept and still works — both
+stdin/stdout daemon. The Python frontend (`pumice_llm.py`, `webui.py`) is kept and still works — both
 frontends share `createGenerator`/`generateTokens`.
 
 ### 14.1 Layout
 
 ```
-package.json               # npm package @h4zel/vk-compute (bin: vk-compute)
+package.json               # npm package @h4zel/pumice (bin: pumice)
 cli.js                     # CLI: args, platform-package resolution, browser open
 pack.mjs                   # prepack: build webui + stage runtime into platform/win32-x64
 release.mjs                # version bump + publish both packages
-platform/win32-x64/        # @h4zel/vk-compute-win32-x64: vk_compute.node + shader/ (staged)
-bin/vk_compute.node        # N-API addon (make target)
+platform/win32-x64/        # @h4zel/pumice-win32-x64: pumice.node + shader/ (staged)
+bin/pumice.node        # N-API addon (make target)
 include/engine.h           # engine_options, engine_* API
 src/engine.c               # engineOpen/Close/Tokenize/Decode/Generate + tokenizer loading
 src/addon.c                # N-API bindings (C only, no C++ wrapper)
@@ -1878,7 +1878,7 @@ aborts the process — hence the format is exact.
 
 `engineGenerate` accumulates generated ids and, per token, calls `tokenizers_decode` on the full
 list, computes the suffix delta against the previous decode, and hands `(token, delta)` to the emit
-callback. This mirrors `vk_llm.generate_stream_tokens`.
+callback. This mirrors `pumice_llm.generate_stream_tokens`.
 
 ### 14.3 Engine layer (`src/engine.c`)
 
@@ -1912,10 +1912,10 @@ rejects concurrent calls. `createEngine` returns a Promise; the engine handle is
 
 A small Express + TypeScript server (default `127.0.0.1:8787`) that loads the addon and serves the
 built React app. `paths.ts` centralizes path resolution so the server works both from the repo and
-from an npm install: the runtime dir (addon + `shader/`, `VK_COMPUTE_RUNTIME`), the served `dist`,
+from an npm install: the runtime dir (addon + `shader/`, `PUMICE_RUNTIME`), the served `dist`,
 and the model root are environment-driven, and `process.chdir(runtimeDir)` is done before any engine
 use (the engine's shader lookup is cwd-relative). The model root defaults to the launch cwd's
-`model/`, `pruned-vocab/` to the launch cwd's (passed to C through `VK_PRUNED_VOCAB_DIR`, §4.7), the
+`model/`, `pruned-vocab/` to the launch cwd's (passed to C through `PUMICE_PRUNED_VOCAB_DIR`, §4.7), the
 quant temp file to the OS temp dir, and exports to the launch cwd's `exported/`.
 
 | Route | Method | Purpose |
@@ -1967,7 +1967,7 @@ Three tabs, matching the Gradio feature set:
 From the repo:
 
 ```bash
-make                       # also builds bin/vk_compute.node
+make                       # also builds bin/pumice.node
 
 cd webui
 npm install                # once
@@ -1985,9 +1985,9 @@ pruned 2B HQM, streams a chat reply, serves the built UI, and unloads.
 Installed as a global command (see §14.9):
 
 ```bash
-npm install -g @h4zel/vk-compute
-vk-compute                 # from a folder containing model/ and pruned-vocab/
-vk-compute --port 9000 --models D:\models --no-open
+npm install -g @h4zel/pumice
+pumice                 # from a folder containing model/ and pruned-vocab/
+pumice --port 9000 --models D:\models --no-open
 ```
 
 ### 14.8 In-process reload fixes (2026-09)
@@ -2016,7 +2016,7 @@ never did), and it exposed two long-standing bugs that the old exit-immediately 
 UI can load/unload/reload models repeatedly — `test_webui.mjs` covers HQM → chat → unload →
 safetensors(+UI quant+prune) → chat → unload.
 
-### 14.9 npm packaging (`@h4zel/vk-compute`)
+### 14.9 npm packaging (`@h4zel/pumice`)
 
 The web UI ships as a global npm command. The native binary cannot be built by `node-gyp` (the
 tokenizers staticlib is MinGW-only), so the package follows the esbuild/better-sqlite3 pattern:
@@ -2024,16 +2024,16 @@ a **pure-JS main package** plus a **platform companion package** pulled in throu
 `optionalDependencies`.
 
 ```
-@h4zel/vk-compute              # main (JS only): cli.js, webui/dist, webui/dist-server
+@h4zel/pumice              # main (JS only): cli.js, webui/dist, webui/dist-server
   optionalDependencies:
-    @h4zel/vk-compute-win32-x64  # prebuilt: vk_compute.node + shader/*.spv (~14.7 MB unpacked)
+    @h4zel/pumice-win32-x64  # prebuilt: pumice.node + shader/*.spv (~14.7 MB unpacked)
 ```
 
 - **`cli.js`** parses `--port` / `--models` / `--no-open`, resolves the platform package with
-  `require.resolve("@h4zel/vk-compute-win32-x64/package.json")` (clear error if the platform is
-  unsupported or the optional dep failed to install), exports `VK_COMPUTE_RUNTIME`,
-  `VK_COMPUTE_CWD`, `VK_COMPUTE_MODELS`, `VK_PRUNED_VOCAB_DIR`, `VK_COMPUTE_EXPORT_DIR`,
-  `VK_COMPUTE_QUANT_TMP`, `VK_COMPUTE_OPEN` and `PORT`, then imports the bundled server. Models
+  `require.resolve("@h4zel/pumice-win32-x64/package.json")` (clear error if the platform is
+  unsupported or the optional dep failed to install), exports `PUMICE_RUNTIME`,
+  `PUMICE_CWD`, `PUMICE_MODELS`, `PUMICE_PRUNED_VOCAB_DIR`, `PUMICE_EXPORT_DIR`,
+  `PUMICE_QUANT_TMP`, `PUMICE_OPEN` and `PORT`, then imports the bundled server. Models
   default to `./model` and pruned-vocab to `./pruned-vocab` **relative to the directory where the
   command was run** (not the install dir); the browser is opened on listen unless `--no-open`.
 - **Server bundling.** `webui/package.json`'s `build:server` runs esbuild
@@ -2041,7 +2041,7 @@ a **pure-JS main package** plus a **platform companion package** pulled in throu
   `webui/dist-server/index.mjs`; the only runtime dependency is `express`, so the installed CLI needs
   no TypeScript toolchain.
 - **`pack.mjs`** (the `prepack` hook) verifies the main and platform versions match and the engine
-  artifacts exist, runs `build:all`, then stages `bin/vk_compute.node` + `bin/shader/` into
+  artifacts exist, runs `build:all`, then stages `bin/pumice.node` + `bin/shader/` into
   `platform/win32-x64/`. `files` whitelists in both `package.json`s (plus `webui/.npmignore`, which
   overrides the nested `dist/` gitignore rule) control the tarball contents.
 - **`release.mjs <major|minor|patch|x.y.z>`** bumps both versions in lockstep (and the
@@ -2060,9 +2060,9 @@ in `.npmrc` to bypass the OTP prompt.
 Install and run:
 
 ```bash
-npm install -g @h4zel/vk-compute
+npm install -g @h4zel/pumice
 cd D:\models\my-project       # contains model/ and pruned-vocab/
-vk-compute                    # http://127.0.0.1:8787 opens automatically
+pumice                    # http://127.0.0.1:8787 opens automatically
 ```
 
 Requirements: Windows x64, a Vulkan-capable GPU with a current driver, and Node ≥ 18.
@@ -2338,7 +2338,7 @@ dispatches per run.
 
 - `kvRamBudget` (bytes, default 512 MB), `kvDiskBudget` (bytes, default 1 GB) and `kvStoreDir` (default
   `kvstore` under the runtime dir) are engine options; the addon exposes them on `createEngine` and the
-  web UI passes them through `LoadOptions`. `VK_PRUNED_VOCAB_DIR` still governs the pruner source.
+  web UI passes them through `LoadOptions`. `PUMICE_PRUNED_VOCAB_DIR` still governs the pruner source.
 - `engineInfo` returns `kvEnabled`, `kvBlocks` (commits this session), `kvEntries` (resident entries),
   `kvSnapshots` (live GDN snapshots), `kvHits`, `kvColdHits`, `kvRestores`, `kvEvictions`,
   `kvColdDeletes`, `kvUsedBytes`, `kvRamBudget`, `kvDiskBudget`, `kvColdBytes`, `kvRestoreMs`.
@@ -2347,7 +2347,7 @@ dispatches per run.
   `hostVisibleBytes` / `deviceLocalBytes` (see gotcha 59: the counters are decremented on free). `kvOpen`
   additionally warns before allocating when `kvRamBudget` plus the host memory already in use would exceed
   the host heap.
-- `VK_COMPUTE_LOG_CACHE=1` makes each restore print `kvcache: restored N tokens (M blocks, T ms)`; the
+- `PUMICE_LOG_CACHE=1` makes each restore print `kvcache: restored N tokens (M blocks, T ms)`; the
   `/v1` non-stream responses carry the same value in the `X-Vk-Cache-Cached-Tokens` header and in
   `usage.prompt_tokens_details.cached_tokens`.
 
@@ -2419,7 +2419,7 @@ position-independent GDN prefill (a separate investigation).
 The webui server also exposes an [OI]-compatible HTTP API on `/v1` so an agent harness (opencode and
 friends) can drive the engine unchanged. It sits directly on `EngineManager`; the KV block cache makes a
 growing conversation resume instead of re-prefilling. The base URL is printed at startup
-(`vk-compute: api http://127.0.0.1:<port>/v1`) and by `vk-compute`.
+(`pumice: api http://127.0.0.1:<port>/v1`) and by `pumice`.
 
 ### 17.1 Endpoints
 
@@ -2429,7 +2429,7 @@ growing conversation resume instead of re-prefilling. The base URL is printed at
 | POST | `/v1/chat/completions` | streaming and non-streaming; tools; usage |
 | POST | `/v1/completions` | legacy text completion (streaming and non-streaming) |
 
-Auth: if `VK_COMPUTE_API_KEY` is set (or `--api-key` is passed to the CLI), every `/v1` request must send
+Auth: if `PUMICE_API_KEY` is set (or `--api-key` is passed to the CLI), every `/v1` request must send
 `Authorization: Bearer <key>`; otherwise it returns 401 `invalid_api_key`. Errors use the [OI] envelope
 `{error:{message, type, param, code}}`.
 
@@ -2439,7 +2439,7 @@ Auth: if `VK_COMPUTE_API_KEY` is set (or `--api-key` is passed to the CLI), ever
 path, and a trailing `provider/` prefix is stripped. If nothing is loaded (or a different model is
 requested) the server probes and loads it with default options — `buildLoadOptions` in
 `webui/server/load.ts` uses the probe's quant/context/prefill values, `prune` defaults on for
-safetensors/gguf (override with `VK_COMPUTE_AUTOLOAD_PRUNE=0`) and KV budgets default to 512 MB RAM /
+safetensors/gguf (override with `PUMICE_AUTOLOAD_PRUNE=0`) and KV budgets default to 512 MB RAM /
 1 GB disk. This means a harness only needs a base URL; the first request warms the model. An unknown id
 returns 404 `model_not_found`.
 
@@ -2488,7 +2488,7 @@ rest into `content`, in both streaming (`delta.reasoning_content`) and non-strea
   failing; the 9th concurrent request returns 429 `rate_limit_exceeded`. Auto-load is de-duplicated so
   concurrent first requests share one model load, and loads run through the same queue as generation.
   Each request carries a `RunHandle`, so a client that disconnects only stops its own run.
-- `--host` / `VK_COMPUTE_HOST` sets the bind address (default `127.0.0.1`).
+- `--host` / `PUMICE_HOST` sets the bind address (default `127.0.0.1`).
 
 ### 17.5 Files
 
@@ -2534,9 +2534,9 @@ surface above. Add a custom provider (README has the copy-paste block):
 ```json
 {
   "provider": {
-    "vk-compute": {
+    "pumice": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "VK Compute (local)",
+      "name": "Pumice (local)",
       "options": { "baseURL": "http://127.0.0.1:8787/v1" },
       "models": { "Qwen3.5-2B-1.6gb.hqm": { "name": "Qwen3.5 2B (local)", "limit": { "context": 32768, "output": 8192 } } }
     }

@@ -25,7 +25,7 @@ if (mainVersion !== platformVersion) {
 if (!fs.existsSync(path.join(webui, "node_modules"))) {
   fail("webui dependencies missing, run: npm --prefix webui install");
 }
-if (!fs.existsSync(path.join(bin, "vk_compute.node")) || !fs.existsSync(path.join(bin, "shader"))) {
+if (!fs.existsSync(path.join(bin, "pumice.node")) || !fs.existsSync(path.join(bin, "shader"))) {
   fail("engine artifacts missing, run: make");
 }
 
@@ -35,7 +35,7 @@ execSync("npm run build:all", { cwd: webui, stdio: "inherit" });
 console.log("pack: staging runtime");
 fs.rmSync(path.join(platform, "shader"), { recursive: true, force: true });
 fs.mkdirSync(platform, { recursive: true });
-fs.copyFileSync(path.join(bin, "vk_compute.node"), path.join(platform, "vk_compute.node"));
+fs.copyFileSync(path.join(bin, "pumice.node"), path.join(platform, "pumice.node"));
 fs.cpSync(path.join(bin, "shader"), path.join(platform, "shader"), { recursive: true });
 
 console.log(`pack: ready (${mainVersion})`);

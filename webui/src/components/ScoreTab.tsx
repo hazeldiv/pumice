@@ -24,7 +24,7 @@ interface ChunkStat {
   count: number;
 }
 
-const STORAGE_KEY = "vk-eval-settings";
+const STORAGE_KEY = "pumice-eval-settings";
 
 const DEFAULT_SETTINGS: Settings = {
   prefill: 4096,

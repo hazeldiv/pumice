@@ -528,7 +528,7 @@ void engineGenerate(engine* e, const uint32_t* prompt, size_t count, const sampl
             e->kv.statRestores++;
             e->kv.statRestoreBytes += (int64_t)bc * e->kv.slotBytes;
             e->lastResume = resume;
-            if (getenv("VK_COMPUTE_LOG_CACHE") != NULL) {
+            if (getenv("PUMICE_LOG_CACHE") != NULL) {
                 fprintf(stderr, "kvcache: restored %d tokens (%d blocks, %.1f ms)\n", resume, bc,
                         nowMs() - t0);
             }

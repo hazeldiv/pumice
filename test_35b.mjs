@@ -5,9 +5,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
-const addon = require("./bin/vk_compute.node");
+const addon = require("./bin/pumice.node");
 const root = path.dirname(fileURLToPath(import.meta.url));
-process.env.VK_PRUNED_VOCAB_DIR = path.join(root, "pruned-vocab");
+process.env.PUMICE_PRUNED_VOCAB_DIR = path.join(root, "pruned-vocab");
 process.chdir(path.join(root, "bin"));
 
 const MB = 1024 * 1024;
