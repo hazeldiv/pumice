@@ -5,9 +5,9 @@ A Vulkan-based GPU compute engine for running LLM inference — **multi-model** 
 - **Server mode** (`main.exe`, default): a **persistent** inference daemon. It loads the real safetensors weights once (§4.7), then serves repeated "tokenize — generate" requests over a length-prefixed binary protocol on stdin/stdout (`[uint32 n][n×uint32 ids]` in — a stream of `[uint32 id]` tokens terminated by a `0xFFFFFFFF` sentinel; `n == 0` shuts down). Tokens are emitted **one at a time** as they are generated. The Python frontend `vk_llm.py` (repo root, run under `.venv` via **uv**) tokenizes text, drives the daemon, and detokenizes output.
 - **Validation mode** (`main.exe val`): the original shader harness — randomized test data, weight transpose/quantize/upload, GPU dispatch, comparison against single-threaded CPU references.
 - **Memory-info mode** (`main.exe meminfo`): dumps the device memory heaps/types (§3.2) and exits — used to diagnose the VRAM budget (§12).
-- **Node addon mode** (`bin/vk_compute.node`, §14): the same engine core compiled into an N-API shared library. It owns the model, tokenizer (via the vendored `tokenizers-c` static lib, §14.2), and generation loop in-process, streaming tokens to JavaScript through a threadsafe function. The `webui/` React + Vite frontend talks to a small Node server that exposes model probe/load/unload, SSE chat, and **perplexity evaluation** (§15) endpoints. The whole thing is published to npm as **`@h4zel/vk-compute`** (§14.9): `npm i -g @h4zel/vk-compute` then run `vk-compute` from a folder containing `model/` and `pruned-vocab/`.
+- **Node addon mode** (`bin/vk_compute.node`, §14): the same engine core compiled into an N-API shared library. It owns the model, tokenizer (via the vendored `tokenizers-c` static lib, §14.2), and generation loop in-process, streaming tokens to JavaScript through a threadsafe function. The `webui/` React + Vite frontend talks to a small Node server that exposes model probe/load/unload, SSE chat, and **perplexity evaluation** (§15) endpoints. The same server also exposes an **[OI]-compatible `/v1` API** (§17) so an agent harness (opencode and friends) can drive it unchanged. The whole thing is published to npm as **`@h4zel/vk-compute`** (§14.9): `npm i -g @h4zel/vk-compute` then run `vk-compute` from a folder containing `model/` and `pruned-vocab/`.
 
-Both the server and the harness share the same `operation` dispatch core (§3.3); the Node addon reuses the same `createGenerator`/`generateTokens` core through `src/engine.c`.
+Both the server and the harness share the same `operation` dispatch core (§3.3); the Node addon reuses the same `createGenerator`/`generateTokens` core through `src/engine.c`. The addon engine also carries a **tiered KV block cache** (VRAM live session, host RAM pool, disk mirror; §16) so conversations resume instead of re-prefilling the whole history each request.
 
 > **Model status.** The engine runs the **text stack only** (the `mtp.*` and `model.visual.*` tensors are ignored) — and it runs it **perfectly** against the real Qwen3.5 weights, both 9B and 2B, and the **Qwen3.6-35B-A3B MoE** (40 layers: 30 gated delta-net + 10 full-attention, every FFN a 256-expert top-8 MoE with a shared expert — §7.8). The **gated delta-net** is HF-identical to the Qwen3.5 block (§7.3), and the full-attention / FFN layers match the reference, including the **runtime-generalized GQA head mapping** (`kvh = head / gqa`, `gqa = heads/kv_heads` — any ratio, not just 16/4), the attention `1/sqrt(head_dim)` scaling, partial RoPE (64/256), and the `Qwen3_5RMSNorm` `1+weight` convention. Prefill layers track the HF reference at 0.96–0.9999 cosine correlation, and the decode trajectory matches the pruned-vocab-constrained HF greedy exactly, token-for-token (§13). Both **thinking** and **non-thinking** modes produce coherent, correct output (see §13). The 2B additionally validated greedy token-for-token against HF through long-context decode (past the split-K threshold at ctx 256). The 35B-A3B runs with 32 experts/layer in VRAM + 224 in host RAM at ~10.7 tok/s decode (pruned vocab, gqa 8 verified layer-by-layer against a CPU safetensors reference: delta L0 corr 0.9999, attention L3 corr 0.998, all 9 MoE slots >= 0.986).
 
@@ -64,6 +64,9 @@ vk-compute/
        vk_llm.py                 # Python frontend: start_llm/tokenize/generate (uv venv, drives main.exe server)
        webui.py                  # (legacy) Gradio web UI on top of vk_llm.py
        test_webui.mjs            # Node end-to-end test for the addon + webui server
+       test_kvcache.mjs          # KV cache resume/eviction/restart tests (§16.7)
+       test_35b.mjs              # 35B-A3B KV restore + memory footprint (§16.7/16.9)
+       test_v1.mjs               # [OI] API end-to-end tests (§17.6)
        tools/tokenize_cli.py  tools/detokenize.py   # standalone tokenize/detokenize helpers
        tools/json_reader.py  tools/cmp_layers.py    # vocab / HF layer-comparison helpers
        tools/ppl_ref.py  tools/ppl_ref_windows.py   # HF perplexity references (§15.5)
@@ -80,11 +83,16 @@ vk-compute/
             include/tokenizers_cpp.h # C++ wrapper (unused; the addon uses the C API)
             lib/libtokenizers_c.a    # MinGW (x86_64-pc-windows-gnu) Rust static lib, 29 MB
             lib/libtokenizers_cpp.a  # C++ wrapper static lib (unused)
+       xxhash/                      # vendored XXH3 (BSD-2) single header, instantiated by src/xxhash.c
        platform/win32-x64/          # npm platform package @h4zel/vk-compute-win32-x64 (§14.9)
             package.json             # os/cpu restricted; ships vk_compute.node + shader/ (staged by pack.mjs)
        webui/                       # React + Vite frontend and Node/Express server (§14)
             package.json  vite.config.ts  tsconfig.json  index.html  .npmignore
             server/index.ts          # Express API: probe/load/unload/chat(SSE)/score(SSE) + static dist
+            server/v1.ts             # [OI]-compatible /v1 router (§17)
+            server/chatTemplate.ts   # Qwen chat template (roles, tools, thinking)
+            server/toolParser.ts     # <tool_call> / JSON tool-call parser
+            server/load.ts           # shared resolveInput/buildLoadOptions for /api/load + /v1
             server/paths.ts          # runtime/dist/models/export/pruned-vocab path resolution + chdir
             server/engine.ts         # EngineManager: wraps the addon, chat template, streaming, scoring
             server/probe.ts          # model probe: safetensors shard/config checks, gguf+hqm meta
@@ -104,6 +112,7 @@ vk-compute/
             state.h                 # activation / KV-cache / scratch buffers
             generate.h              # generator struct + prefill/generateTokens/reset
             engine.h                # engine lifecycle shared by the addon (engineOpen/Close/Generate)
+            kvcache.h               # tiered KV block cache: chain hashes, index, RAM pool, snapshots
        src/
             main.c                  # arg dispatch: default=server, `val`=harness, `meminfo`
             compute.c               # serverMain (server loop) + memInfo
@@ -113,6 +122,8 @@ vk-compute/
             safetensors.c           # safetensors header parse + BF16—F32 load
             validation.c            # CPU reference impls + all validate* functions
             generate.c              # op compiler: chunked prefill, decode groups, lm head
+            kvcache.c               # KV block cache core (see 16)
+            xxhash.c                # XXH3 single-header implementation unit (xxhash/xxhash.h)
             weights.c  state.c      # cache-first weight upload, state buffers (all dims runtime)
             engine.c                # engineOpen/Tokenize/Decode/Generate/Close + tokenizer loading
             addon.c                 # N-API bindings (createEngine/tokenize/decode/generate/destroy)
@@ -132,6 +143,7 @@ vk-compute/
                 Reduce-GEMV-ADD.comp         # split-K reduce + residual add
                 ArgMax-Reduce.comp           # token selection: greedy argmax / sampler / perplexity scoring
                 Gate-Sigmoid.comp            # sigmoid gate for the delta-net output
+                KV-Restripe.comp  KV-Unstripe.comp   # live KV <-> block-contiguous pool (section 16.5)
            Full-Attention/         # QKV projection + RoPE + full attention
                 Q16/ Q8/ Q4/        # RmsNorm-QKV-SplitK-* + Reduce-Rope-* (decode)
                 Q16/ Q8/ Q4/        # RmsNorm-QKV-GEMM2-* + Rope-GEMM-* (prefill, split passes)
@@ -390,6 +402,8 @@ $(foreach f,$(SHADERS),$(eval $(call COMPILE_SHADER,$(f))))
 ```
 
 Run: `make` builds shaders + `bin/main.exe` + `bin/vk_compute.node`; the executable is normally launched by the server/Python path (§11), the addon by the Node server (§14). `make clean` removes `bin/` and `build/` recursively. The quant suffix in shader names is `Q16`/`Q8`/`Q4` (fp16/int8/q4_1_*) and `shader/Prototype/` is **excluded from the build** — it holds the validation-harness and legacy shaders, so `main.exe val` no longer resolves its `.spv` files.
+
+The C build adds `-Ixxhash`; `src/xxhash.c` is the single translation unit that instantiates the vendored XXH3 implementation (`xxhash/xxhash.h`). It is part of `SRCS` and therefore linked into both `main.exe` and the addon.
 
 **Node addon target** (`bin/vk_compute.node`): the Makefile compiles `src/*.c` except `main.c`/`addon.c`/`engine.c` into `CORE_OBJS`, then links `build/addon.o build/engine.o $(CORE_OBJS)` against the tokenizers static lib and an N-API import library:
 
@@ -1524,6 +1538,64 @@ A separate `--debug-sampling` flag (`generatorDumpSamplingDebug`) reads back the
     the 16-byte `result` buffer into a single `uint32_t`, a 12-byte stack smash (UB) on the first
     window of every scoring run; it now reads into `uint32_t[4]` like every other call site.
 
+52. **Staging buffers are not necessarily zeros - `resetGenerator` must clear them.** The GDN snapshot
+    restore writes real `stateS`/`convHist` data into the retained staging memory (`writeStaging`) and
+    copies it to VRAM. `resetGenerator` originally relied on the staging still holding the zeros from
+    `createState`; after a restore it would have re-copied the snapshot instead of clearing. It now calls
+    `clearStaging` on every state buffer before `createTransferAndCopy`. (Same class as gotcha 50: the
+    staging buffer is shared state between "initialize" and "reset".)
+
+53. **A block and a snapshot share the same chain hash.** Block `b` is keyed by `h[b]`, and a snapshot at
+    position `16(b+1)` is keyed by `h[b]` - the same 64-bit value. Snapshots therefore live in their own
+    4-deep ring, not in the block table; the block table only ever maps block hashes to slots.
+
+54. **Allocate and commit cache blocks incrementally, not all-then-commit.** The first flush version
+    allocated every slot for the turn before inserting any index entry, so when the pool was smaller than
+    the turn's block count, LFRU had no victims (the entries did not exist yet) and the flush gave up with
+    `pool full`. `engineFlush` now processes 32 blocks at a time and commits them before allocating the
+    next chunk, so earlier chunks are valid eviction candidates.
+
+55. **Admitting a cold block must clear its cold offset.** An entry can otherwise be both RAM-resident and
+    cold; a later disk-budget eviction would then delete the entry (and its RAM slot mapping) while it is
+    still in RAM. `kvAdmit` marks the old cold record dead and clears `coldOffset` before taking the slot.
+
+56. **A snapshot lookup must match the key, not just the position.** The ring stores several snapshots that
+    can share a position (every prompt snapshots at its own last 16-boundary, so many prompts have a
+    snapshot at 16). Selecting `snapData` by `ringPos == best` alone picked the *last* entry at that
+    position, i.e. another conversation's GDN state, and restored it into the wrong conversation (a
+    different prompt produced a plausible but unrelated continuation). `kvPlan` now requires
+    `ringKey == hashes[pos/16 - 1]` as well. This only surfaced once two prompts shared a boundary; the
+    single-conversation tests could not catch it.
+
+57. **Never cache or restore decode-written KV.** Decode (`GEMV`/`Att-full`) and prefill (`GEMM2`/
+   `Att-QK2`) are different kernels, so the same token's K/V can differ in the last bits. Restoring a
+   block whose tokens were written by decode into a prefill path therefore does **not** reproduce a fresh
+   prefill: the first generated token already differed (a turn-end snapshot made the continuation start
+   ~3 tokens into the cold output). `engineFlush` now admits only blocks `[0, promptLen/16)` and snapshots
+   only during prefill, so the reply is always re-prefilled. The prefill-end snapshot still lets turn 2
+   resume at the prompt end (e.g. 592 of a 600-token prompt), which is the win that matters for agents.
+
+58. **A fixed-slot snapshot ring silently starves interleaved conversations.** The first snapshot store was
+    a `ringCount % KV_RING` ring of 4. Storing `A,A,B,B,C,C` (three 2000-token conversations) overwrote
+    A's two snapshots with C's, so A's next turn found no matching snapshot and fell back to a full
+    prefill (`cachedTokens == 0`) -- with no error, just lost work. It is now an LRU table keyed by
+    `(pos, key)` with `KV_SNAP_MAX` slots (`snapFind` / `snapAlloc`), so the same workload resumes all
+    three. The regression test deliberately uses three conversations because two would still fit in 4.
+
+59. **The host/device byte counters were cumulative, not live.** `allocateBufferMemory` incremented
+    `g_deviceLocalBytes` / `g_hostVisibleBytes` but `releaseStaging` and `destroyBuffer` never decremented
+    them. Every weight that passed through a VRAM staging buffer was therefore counted as host memory
+    *forever*, so a diagnostic or OOM message after loading the 35B reported ~20 GB of host-visible memory
+    even though the VRAM staging had long been freed -- exactly the "weights that went to VRAM are still in
+    RAM" illusion. Both frees now subtract the allocation (via `vkGetBufferMemoryRequirements`), so the
+    counters track live bytes (`engineInfo` exposes them as `hostVisibleBytes` / `deviceLocalBytes`).
+
+60. **Small weight vectors kept their staging because the registry stored copies.** `registerWeightBufferSmall`
+    took a `buffer` by value; `weightFlush` released staging only for the pointer-based registry, so the
+    originals (norms, `conv1d`, router, shared gate) held their host staging for the process lifetime
+    (~45 MB on the 35B, more on wider models). It is now pointer-based and released alongside the large
+    weights, and the three loaders register at the storage site (`&w.router[L]`, etc.).
+
 
 ---
 
@@ -2101,3 +2173,290 @@ const r = await vk.score(engine, ids, { prefill: 4096, decode: 4096, chunks: 1 }
 ```
 
 Requirements: `prefill + decode ≤ maxCtx`, and at least `prefill + decode + 1` tokens of text.
+---
+
+## 16. KV Cache Infrastructure (VRAM / RAM / Disk)
+
+A block-granular prefix cache lets a conversation resume instead of re-prefilling the whole history on
+every request (`engineGenerate` used to call `resetGenerator` unconditionally). Design notes live in
+`this-is-custom-from-inherited-giraffe.md`. The implemented tiers, chain hashing and snapshots are below.
+
+### 16.1 Block format and chain hashing
+
+- **Block = 16 tokens** of KV across all full-attention layers. Full-attention KV is append-only, so a
+  complete block never changes (only the tail partial block mutates during decode).
+- `include/kvcache.h` + `src/kvcache.c` build a per-slot layout from the runtime dims: for every
+  full-attention layer, `K` (`kvRows x 16`), `V` (16 x `kvRows`), plus fp32 `kScale/kZero/vScale/vZero`
+  (`kvHeads x 16`) when the layer is INT8/Q4. `slotBytes` is the sum (2B: 133,120 bytes).
+- **Chain hash** (XXH3-64, `xxhash/xxhash.h` vendored via `src/xxhash.c`):
+  `h[b] = XXH3_64(t[16b..16b+16], seed = h[b-1])`, `h[-1] = XXH3_64(modelFingerprint)`. A stored block can
+  only match if every ancestor matched, so the chain is the prefix-validity proof.
+- **Model fingerprint** = name + vocab + layer count + K + kvHeads + headDim + per-layer attn quant,
+  hashed into the store directory name (`kvstore/<name>-<16hex>/`). A to B to A restores A's pool.
+
+### 16.2 Tiers and LFRU
+
+- **VRAM** -- the live contiguous KV cache (unchanged; sized at load from `maxCtx`). Not an eviction tier.
+- **RAM** -- one host-visible `MEMORY_RAM` pool buffer (`kvPool`, `kvRamBudget` bytes), slot-indexed.
+  This is the authority tier: every resident block has a copy here.
+- **Disk** -- `mirror.bin` is a raw image of the RAM pool (slot `i` at `i x slotBytes`); `cold.bin` is an
+  append-only log of blocks demoted from RAM (each record `{key, bytes, crc32, flags}` + slot bytes);
+  `index.bin` persists every entry (`key`, `child`, `coldOffset`, `slot`, `freq`, `lastUse`, `blockIndex`);
+  `snapshots.bin` holds the fp16 GDN anchors. On open the pool is bulk-loaded from `mirror.bin` and the
+  index/cold tiers rebuilt, so a restart is warm.
+- **In-memory index**: one open-addressing table `key -> entry` plus an entry array. Each entry tracks its
+  RAM slot and/or cold offset, its chain `child` hash, `freq`, `lastUse` and a `pin` count.
+- **LFRU** (RAM and disk): `freq` is incremented on every match/insert and halved every 64 inserts
+  (aging); the victim is the lowest `freq`, tie-broken by oldest `lastUse`. **Chain-leaf preference**: a
+  block whose `child` is absent or non-resident is a leaf and is evicted first, so dead conversations
+  collapse tail-ward instead of orphaning live suffixes. Pinned blocks (part of an in-flight restore) are
+  never victims.
+- **Demotion** (RAM over budget): the victim's slot is appended to `cold.bin` (CRC'd) and its slot freed.
+  **Deletion** (cold over `kvDiskBudget`): the coldest cold leaf is tombstoned and removed from the index
+  -- the only destructive eviction. `cold.bin` is compacted (live records rewritten, offsets updated)
+  once dead bytes reach live bytes.
+- **Admission**: a cold block hit during restore is always streamed through the stage buffer; if
+  `freq >= 2` (proven reusable) it is also copied into a RAM slot permanently. One-hit blocks are not
+  admitted, so a long one-off prefix cannot flush the hot shared prefix out of RAM.
+- A pool smaller than the prefix is fine: cold blocks are loaded `KV_STAGE_SLOTS` (8) at a time into the
+  host-visible `kvStage` ring and unstripe'd, while RAM-resident blocks are unstripe'd directly from the
+  pool. If even the stage path cannot satisfy a restore, `engineGenerate` falls back to a full prefill.
+
+### 16.3 GDN snapshots
+
+Every model in the family has gated delta-net layers, whose recurrent state cannot be reconstructed
+from KV alone -- resuming at position R needs the state at R. Snapshots are therefore required for any
+restore, not just for the 35B.
+
+- Taken **during prefill**, at every 1024-token boundary **and at the last 16-token boundary of the
+  prompt**. `runPrefill` splits its chunk at whichever of those comes next when a boundary hook is
+  installed, so the state is captured at an exact token position. The state after P tokens is keyed by
+  `h[P/16 - 1]`. The final boundary matters for short prompts: a 600-token conversation snapshots at 592
+  instead of never, so turn 2 resumes at 592 and re-prefills only the remainder. Splitting changes the
+  final chunk's size only; per-token GEMM results are chunk-size independent, so the KV is unchanged
+  (verified: warm == cold in the tests).
+- Stored **fp16** for `stateS` and fp32 for `convHist` in a fixed-capacity **LRU table** (`KV_SNAP_MAX` =
+  16 entries, lazily allocated so only used entries cost RAM). A store is keyed by `(pos, key)`; if the
+  table is full the least-recently-used entry is replaced, and a hit touches `lastUse`. All entries are
+  persisted to `snapshots.bin` (`{magic, count, gdnBytes}` + per-record `{pos, lastUse, key}` + data) and
+  reloaded on open, so a restart keeps every conversation's anchor, not just the latest. Copy-out uses
+  `generatorReadGdn` / `generatorWriteGdn` (`readBuffer` + `writeStaging` + `createTransferAndCopy`); the
+  state buffers keep their staging alive so `resetGenerator` can re-zero them (gotcha 50).
+- **Resume point** `R` = largest snapshot position `<= R_kv` (longest matching block run) whose key
+  matches, capped below the new prompt length. The suffix `[R, count)` is then re-prefilled: attention
+  rewrites those KV slots deterministically and the window rebuilds GDN state, so the fallback is an
+  idempotent overwrite.
+- **Only prefill-written state is cached** (gotcha 57): `engineFlush` admits blocks `[0, promptLen/16)`
+  and snapshots only during prefill. Generated tokens are decode-written, and the decode and prefill
+  kernels differ in accumulation order, so a decode-written block restored into a prefill path is *not*
+  bit-identical to the same prefix computed by prefill. Caching the reply therefore broke warm == cold
+  (a shifted continuation); the reply is now always re-prefilled and only the prompt is cached.
+- **Multiple conversations coexist.** The LRU table replaced a fixed 4-slot ring that let interleaved
+  conversations evict each other: with three 2000-token conversations (6 snapshots) a 4-slot store left
+  none of them resumable, while the 16-entry table resumes all three (and across a restart). Snapshots
+  live in their own table rather than the block table because a snapshot at position `16(b+1)` shares
+  block `b`'s hash. The capacity is compile-time (`KV_SNAP_MAX`); worst-case RAM is `KV_SNAP_MAX x
+  gdnBytes` (2B: 160 MB, 35B: 480 MB) but only for that many distinct live snapshots.
+
+### 16.4 Restore and flush pipeline
+
+`engineGenerate` (src/engine.c):
+
+1. copy the prompt into `sessionIds`, chain-hash it, and plan `R` + the matched block slots + snapshot
+   (matching entries are LFRU-touched and pinned);
+2. `resetGenerator` (clears GDN + penalty history, matching the cold path exactly); unstripe the
+   RAM-resident blocks from the pool and the cold blocks from the stage ring (`generatorKvRestoreCold`),
+   admitting `freq >= 2` cold blocks into RAM; `generatorWriteGdn` (snapshot -> state buffers),
+   `stateSetPosition(R)`, `g->nextPos = R`; unpin. On failure fall back to `R = 0`;
+3. install the boundary hook and call `generateTokens(prompt + R, count - R, ...)`; the hook copies GDN
+   state into the ring at each 1024 boundary and at the prompt's final 16-boundary;
+4. after generation (EOS, stop, or limit) `engineFlush(e, promptLen)` admits the complete prompt blocks
+   not already indexed via
+   `generatorKvRestripe` (live cache -> pool) in chunks of 32 (so committed entries are available as
+   eviction victims while the same flush is still allocating), then `kvPersist` writes the dirty mirror
+   slots, `index.bin`, `snapshots.bin`, enforces the disk budget and compacts if needed. The partial tail
+   block is discarded.
+
+`runPrefill` now starts at `g->nextPos` instead of 0 (token index `done - start`), so the suffix prefill
+writes KV at absolute positions; the existing shaders already take a chunk-absolute offset.
+
+**Scoring is isolated by design**: `engineScore` clears the hooks, and `generateScore` uses the VRAM
+cache directly without reading or writing the store. The next generate request simply restores the live
+session from the RAM pool (verified: a scored-then-regenerated turn is byte-identical).
+
+### 16.5 Shaders
+
+`shader/Utility/KV-Restripe.comp` and `KV-Unstripe.comp` are byte-generic (uint8 storage) gather/scatter
+kernels over one region and a run of contiguous slots. Push constants:
+`{srcStride, tokBase, rows, blocks, dstBase, dstStride, elemBytes, transpose}` (Restripe) and the inverse
+(Unstripe). `transpose=0` covers K and scale/zero (`row x 16`), `transpose=1` covers V (live token-major
+to pool row-major). One dispatch per layer per region per contiguous slot run; 2B flushes in ~28
+dispatches per run.
+
+### 16.6 Config and stats
+
+- `kvRamBudget` (bytes, default 512 MB), `kvDiskBudget` (bytes, default 1 GB) and `kvStoreDir` (default
+  `kvstore` under the runtime dir) are engine options; the addon exposes them on `createEngine` and the
+  web UI passes them through `LoadOptions`. `VK_PRUNED_VOCAB_DIR` still governs the pruner source.
+- `engineInfo` returns `kvEnabled`, `kvBlocks` (commits this session), `kvEntries` (resident entries),
+  `kvSnapshots` (live GDN snapshots), `kvHits`, `kvColdHits`, `kvRestores`, `kvEvictions`,
+  `kvColdDeletes`, `kvUsedBytes`, `kvRamBudget`, `kvDiskBudget`, `kvColdBytes`, `kvRestoreMs`.
+- The RAM pool and the stage ring are metered by `createBufferNamed` alongside the MoE expert pool, so the
+  existing host-visible OOM report covers all of them. `engineInfo` also exposes the live totals as
+  `hostVisibleBytes` / `deviceLocalBytes` (see gotcha 59: the counters are decremented on free).
+- `VK_COMPUTE_LOG_CACHE=1` makes each restore print `kvcache: restored N tokens (M blocks, T ms)`; the
+  `/v1` non-stream responses carry the same value in the `X-Vk-Cache-Cached-Tokens` header and in
+  `usage.prompt_tokens_details.cached_tokens`.
+
+### 16.7 Verification
+
+`node test_kvcache.mjs` (2B safetensors, 3000-token wikitext prompt, greedy). A large budget exercises
+the M1 path; a 10 MB pool exercises eviction, cold restore and disk budgets.
+
+| Check | Result |
+|---|---|
+| turn 1 caches 188 blocks | 25.0 MB pool |
+| turn 2 restore (188 blocks, R=2048) | warm output == cold, token-for-token |
+| turn 3 restore | warm output == cold, token-for-token |
+| restart (reload from `mirror.bin` + `snapshots.bin`) | 188 entries resident, restores correctly |
+| score mid-session then regenerate | byte-identical to pre-score output |
+| 10 MB pool, 3000-token prompt | 110 evictions, 14.6 MB cold, output matches |
+| cold restore (109 cold blocks) | output matches the warm/cold reference |
+| restart with a populated cold tier | 189 entries, 14.8 MB cold, output matches |
+| 512 KB disk budget | 282 cold deletions, generation still correct |
+| 600-token prompt + 96-token reply, turn 2 | resumes at 592 (prompt end), warm == cold |
+| 3 interleaved 2000-token conversations | 6 snapshots, all resume at 2000; survives restart |
+
+**35B-A3B** (`node test_35b.mjs`, `expertsVram=64`, `model/Qwen3.6-35B-A3B-5.8gb.hqm`, 600-token prompt):
+load 68 s, turn 1 generates, turn 2 restores at 592, warm == cold, snapshots survive restart.
+
+### 16.9 35B memory footprint (and the "VRAM weights live in RAM" illusion)
+
+At `expertsVram=64` the 35B needs **7.25 GB device** and **12.56 GB host-visible**, which is exactly the
+design: the 192 routed experts that are not in VRAM must live in the host RAM pool.
+
+- Device: expert VRAM pool (65 experts x 1.59 MB x 40 layers) 4.1 GB, embed + lm-head fp16 2.0 GB,
+  attention weights ~0.6 GB, KV cache ~0.4 GB.
+- Host: **RAM expert pool 12.24 GB** (192 experts x 1.59 MB x 40), KV pool 256 MB (configurable), stage
+  ring ~1.6 MB, tokenizer/misc. VRAM staging is freed at upload, so **no VRAM weight is retained in RAM**
+  (the pool size scales exactly with `expertsVram`: at `expertsVram=1` the host pool alone reached 15.5 GB
+  and hit the 16 GB host-visible heap).
+
+The only levers on the host pool are the VRAM/CPU split (VRAM is 7.9 GB here, so ~64 experts is the
+practical maximum), reducing the non-expert device footprint to admit more experts, or backing the pool
+with the on-disk HQM (a future LFRU/mmap swap). Note that at 64 experts prefill is PCIe-bound: the
+prompt is re-read against ~192 host experts per token per layer (~9 s/token at 1400 tokens, far slower
+than the documented decode figure, which used a short prompt).
+
+### 16.8 Deferred
+
+`cache_restore` SSE phase reporting (the non-stream header and `cached_tokens` cover the value today;
+streaming only exposes it in the final usage chunk); a disk/mmap-backed expert pool to shrink the host
+footprint. Caching the generated reply (a decode-time snapshot) is deliberately not done -- see gotcha 57.
+BPE prefix instability (a re-split can break the chain ~1 block per turn) is accepted for now; per-message
+tokenization is the fix if measured.
+
+**35B long-prompt bit-exactness caveat:** the 35B restore is functionally correct (coherent output, warm
+outputs stable across runs and restarts) and matches cold bit-for-bit up to ~1100-token prompts, but at
+longer prompts (e.g. 1400) warm and cold diverge after a few tokens. The cause is not the fp16 GDN
+snapshot (forcing fp32 gave the identical warm output) but the GDN prefill state at a chunk boundary:
+`runPrefill` splits the final chunk at the prompt's last 16-boundary, so the snapshot position is a chunk
+boundary in the warm path but falls mid-chunk in the cold path. The 2B is bit-exact under the same
+scheme, so the 35B's larger delta state appears to make that chunk-size rounding observable. Functional
+validation of the 35B is therefore done at <=1100-token prompts; making the 35B bit-exact would need
+position-independent GDN prefill (a separate investigation).
+
+---
+
+## 17. [OI]-Compatible API (agent harness)
+
+The webui server also exposes an [OI]-compatible HTTP API on `/v1` so an agent harness (opencode and
+friends) can drive the engine unchanged. It sits directly on `EngineManager`; the KV block cache makes a
+growing conversation resume instead of re-prefilling. The base URL is printed at startup
+(`vk-compute: api http://127.0.0.1:<port>/v1`) and by `vk-compute`.
+
+### 17.1 Endpoints
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/v1/models` | `{object:"list", data:[{id, object:"model", ...}]}` — scanned models + the loaded one |
+| POST | `/v1/chat/completions` | streaming and non-streaming; tools; usage |
+| POST | `/v1/completions` | legacy text completion (streaming and non-streaming) |
+
+Auth: if `VK_COMPUTE_API_KEY` is set (or `--api-key` is passed to the CLI), every `/v1` request must send
+`Authorization: Bearer <key>`; otherwise it returns 401 `invalid_api_key`. Errors use the [OI] envelope
+`{error:{message, type, param, code}}`.
+
+### 17.2 Model resolution and auto-load
+
+`model` is matched (case-insensitively) against the scanned label, the probe name, the basename, or the
+path, and a trailing `provider/` prefix is stripped. If nothing is loaded (or a different model is
+requested) the server probes and loads it with default options — `buildLoadOptions` in
+`webui/server/load.ts` uses the probe's quant/context/prefill values, `prune` defaults on for
+safetensors/gguf (override with `VK_COMPUTE_AUTOLOAD_PRUNE=0`) and KV budgets default to 512 MB RAM /
+1 GB disk. This means a harness only needs a base URL; the first request warms the model. An unknown id
+returns 404 `model_not_found`.
+
+### 17.3 Chat template and tools
+
+`webui/server/chatTemplate.ts` ports the model's own Jinja template (`tokenizer_config.json`) to
+TypeScript for the text path: system/user/assistant/tool roles, `content` as a string or a `[{type,
+text}]` array, assistant `reasoning_content` / `<think>` splitting, tool-call rendering
+(`<function=...><parameter=...>`), consecutive `tool` messages grouped under one `<|im_start|>user` with
+`<tool_response>`, and the `enable_thinking` generation prompt. Thinking is **off** by default
+(`<think>\n\n</think>\n\n`); enable it with `enable_thinking: true` or
+`chat_template_kwargs.enable_thinking`. `tool_choice:"none"` drops the tools block.
+
+Responses are parsed by `webui/server/toolParser.ts`, which handles both the XML form
+(`<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`) and the JSON form. Values
+are coerced back to JSON types; the result is emitted as [OI] `tool_calls` with
+`finish_reason:"tool_calls"`.
+
+### 17.4 Request/response mapping
+
+- `max_tokens` / `max_completion_tokens` → generator `maxNew`, clamped to `maxCtx - promptTokens`.
+- `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `presence_penalty`, `seed` →
+  `sample_params`; `penalty_length` (non-standard) defaults to 64 when a repetition/presence penalty is
+  set. Sampling `seed` defaults to the engine's deterministic seed.
+- `stop` (string or array) is enforced server-side by a hold-back filter so a stop sequence split across
+  tokens is never emitted; the engine is stopped early and `finish_reason` is `stop`.
+- `finish_reason` comes from `engineFinishReason` (`src/generate.c` tracks `finishReason`: 0 = EOS or user
+  stop, 1 = length/context limit); the addon resolves `generate` with `{tokens, finishReason,
+  cachedTokens}` (`cachedTokens` = `engineLastResume`, the restored prefix length).
+- `usage` reports `prompt_tokens` (the full prompt, as sent), `completion_tokens`, `total_tokens`, and
+  `prompt_tokens_details.cached_tokens` (the KV prefix reused, clamped to `prompt_tokens`); non-stream
+  responses also carry it in the `X-Vk-Cache-Cached-Tokens` header, and `stream_options.include_usage`
+  adds the final usage-only chunk.
+- A prompt at or over `maxCtx` is rejected before any GPU work with 400 `context_length_exceeded`.
+- With tools the output is buffered (tool XML cannot be streamed as content) and emitted as one
+  `tool_calls` delta; without tools content streams token-by-token. Non-streaming returns the full
+  `message`.
+
+### 17.5 Files
+
+`webui/server/v1.ts` (router, stop filter, [OI] serialization), `chatTemplate.ts`, `toolParser.ts`,
+`load.ts` (shared `resolveInput` / `buildLoadOptions`, also used by `/api/load`), mounted in
+`server/index.ts` as `app.use("/v1", createV1Router(engine))`. `test_v1.mjs` drives it end-to-end.
+
+### 17.6 Verification
+
+`node test_v1.mjs` (2B HQM auto-loaded, greedy):
+
+| Check | Result |
+|---|---|
+| `/v1/models` | lists 5 scanned models |
+| chat non-stream + usage | `"Hello there!"`, prompt 19 / completion 3 |
+| chat stream == non-stream | byte-identical |
+| `max_tokens:1` | `finish_reason:"length"`, completion_tokens 1 |
+| `stop` sequence | content truncated to the prefix before the stop |
+| tools | `finish_reason:"tool_calls"`, `get_weather{"city":"Paris"}` |
+| tools stream | terminates with `tool_calls` |
+| `/v1/completions` | `text_completion` object with text |
+| `context_length_exceeded` | 400 with the matching code |
+| unknown model | 404 `model_not_found` |
+| multi-turn (long shared system) | KV restore, `cached_tokens` 800, coherent reply |
+| API key | 401 without, 200 with |
+
+`cached_tokens` depends on the shared prefix being block-aligned: a 19-token prompt whose 16th token is
+the changing `<think>`/reply token correctly caches nothing (the chain hash invalidates it), which is why
+the test uses a long shared system prompt.

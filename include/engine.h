@@ -14,7 +14,27 @@ typedef struct {
     int expertsVram;
     int exportModel;
     const char* exportDir;
+    int64_t kvRamBudget;
+    int64_t kvDiskBudget;
+    const char* kvStoreDir;
 } engine_options;
+
+typedef struct {
+    int enabled;
+    uint64_t blocks;
+    uint64_t entries;
+    uint64_t snapshots;
+    uint64_t hits;
+    uint64_t coldHits;
+    uint64_t restores;
+    uint64_t evictions;
+    uint64_t coldDeletes;
+    int64_t usedBytes;
+    int64_t ramBudget;
+    int64_t diskBudget;
+    int64_t coldBytes;
+    double restoreMs;
+} engine_kv_stats;
 
 typedef struct engine engine;
 
@@ -36,5 +56,9 @@ int engineVocab(const engine* e);
 int engineEos(const engine* e);
 int engineMaxCtx(const engine* e);
 void engineRequestStop(engine* e);
+int engineFinishReason(const engine* e);
+int engineLastResume(const engine* e);
+void engineMemoryStats(int64_t* hostVisible, int64_t* deviceLocal);
+void engineKvStats(const engine* e, engine_kv_stats* out);
 
 #endif

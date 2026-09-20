@@ -11,6 +11,9 @@ export interface ModelForm {
   lmHead: Quant;
   embedLm: Quant;
   expertsVram: number;
+  kvRamBudgetMB: number;
+  kvDiskBudgetMB: number;
+  kvStoreDir: string;
   prune: boolean;
   exportModel: boolean;
   exportDir: string;
@@ -116,6 +119,21 @@ export function ModelTab(props: Props) {
               onChange={(e) => props.onForm({ expertsVram: Number(e.target.value) })} />
           </label>
         )}
+        <label className="field">
+          KV cache RAM (MB)
+          <input type="number" value={form.kvRamBudgetMB} min={8}
+            onChange={(e) => props.onForm({ kvRamBudgetMB: Number(e.target.value) })} />
+        </label>
+        <label className="field">
+          KV cache disk (MB)
+          <input type="number" value={form.kvDiskBudgetMB} min={0}
+            onChange={(e) => props.onForm({ kvDiskBudgetMB: Number(e.target.value) })} />
+        </label>
+        <label className="field">
+          KV store dir
+          <input type="text" value={form.kvStoreDir}
+            onChange={(e) => props.onForm({ kvStoreDir: e.target.value })} />
+        </label>
       </div>
 
       <div className="row">

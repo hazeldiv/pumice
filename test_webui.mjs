@@ -93,8 +93,7 @@ async function main() {
     `${models.models.length} entries`);
 
   for (const [name, target, kind] of [
-    ["probe hqm", "model/qwen3.5-2b-pruned-1.7gb.hqm", "hqm"],
-    ["probe gguf", "model/Qwen3.5-2B-BF16.gguf", "gguf"],
+    ["probe hqm", "model/Qwen3.5-2B-1.6gb.hqm", "hqm"],
     ["probe safetensors", "model/Qwen3.6-35B-A3B", "safetensors"],
   ]) {
     const { data } = await post("/api/probe", { path: target });
@@ -106,7 +105,7 @@ async function main() {
   check("probe missing shards rejected", bad.data?.ok === false && bad.data.errors.length > 0);
 
   const load = await post("/api/load", {
-    path: "model/qwen3.5-2b-pruned-1.7gb.hqm",
+    path: "model/Qwen3.5-2B-1.6gb.hqm",
     maxCtx: 8192,
     exportModel: false,
   });

@@ -19,6 +19,11 @@ static uint32_t findMemoryType(VkPhysicalDevice physicalDevice, VkMemoryRequirem
 static int64_t g_deviceLocalBytes = 0;
 static int64_t g_hostVisibleBytes = 0;
 
+void bufferMemoryTotals(int64_t* deviceLocal, int64_t* hostVisible) {
+    if (deviceLocal != NULL) *deviceLocal = g_deviceLocalBytes;
+    if (hostVisible != NULL) *hostVisible = g_hostVisibleBytes;
+}
+
 static void allocateBufferMemory(VkDevice device, VkPhysicalDevice physicalDevice, VkBuffer buffer, VkMemoryRequirements memReqs, VkMemoryPropertyFlags properties, VkDeviceMemory* memory, const char* name) {
     uint32_t memoryTypeIndex = findMemoryType(physicalDevice, memReqs, properties);
     if (memoryTypeIndex == UINT32_MAX) {
@@ -136,19 +141,46 @@ void createTransferAndCopy(VkDevice device, VkQueue queue, buffer* buffers, int 
 }
 
 void destroyBuffer(VkDevice device, buffer buf) {
+    if (buf.buffer == VK_NULL_HANDLE) return;
     if (buf.stagingBuffer != VK_NULL_HANDLE) {
+        VkMemoryRequirements reqs;
+        vkGetBufferMemoryRequirements(device, buf.stagingBuffer, &reqs);
+        g_hostVisibleBytes -= (int64_t)reqs.size;
         vkDestroyBuffer(device, buf.stagingBuffer, NULL);
         vkFreeMemory(device, buf.stagingMemory, NULL);
     }
     if (buf.mappedMemory != NULL) {
         vkUnmapMemory(device, buf.memory);
     }
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(device, buf.buffer, &reqs);
+    if (buf.memoryType == MEMORY_RAM) g_hostVisibleBytes -= (int64_t)reqs.size;
+    else g_deviceLocalBytes -= (int64_t)reqs.size;
     vkDestroyBuffer(device, buf.buffer, NULL);
     vkFreeMemory(device, buf.memory, NULL);
 }
 
+void writeStaging(VkDevice device, buffer* buf, const void* data, int64_t size) {
+    if (buf->stagingMemory == VK_NULL_HANDLE) return;
+    void* mapped;
+    vkMapMemory(device, buf->stagingMemory, 0, size, 0, &mapped);
+    memcpy(mapped, data, (size_t)size);
+    vkUnmapMemory(device, buf->stagingMemory);
+}
+
+void clearStaging(VkDevice device, buffer* buf) {
+    if (buf->stagingMemory == VK_NULL_HANDLE) return;
+    void* mapped;
+    vkMapMemory(device, buf->stagingMemory, 0, buf->size, 0, &mapped);
+    memset(mapped, 0, (size_t)buf->size);
+    vkUnmapMemory(device, buf->stagingMemory);
+}
+
 void releaseStaging(VkDevice device, buffer* buf) {
     if (buf->stagingBuffer != VK_NULL_HANDLE) {
+        VkMemoryRequirements reqs;
+        vkGetBufferMemoryRequirements(device, buf->stagingBuffer, &reqs);
+        g_hostVisibleBytes -= (int64_t)reqs.size;
         vkDestroyBuffer(device, buf->stagingBuffer, NULL);
         vkFreeMemory(device, buf->stagingMemory, NULL);
         buf->stagingBuffer = VK_NULL_HANDLE;

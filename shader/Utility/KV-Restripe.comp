@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint srcStride;
+    uint tokBase;
+    uint rows;
+    uint blocks;
+    uint dstBase;
+    uint dstStride;
+    uint elemBytes;
+    uint transpose;
+} param;
+
+layout(set = 0, binding = 0) readonly restrict buffer SrcBuffer { uint8_t src[]; };
+layout(set = 0, binding = 1) writeonly restrict buffer DstBuffer { uint8_t dst[]; };
+
+void main() {
+    uint total = param.blocks * param.rows * 16u;
+    uint e = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    if (e >= total) return;
+    uint blk = e / (param.rows * 16u);
+    uint rem = e - blk * param.rows * 16u;
+    uint row = rem / 16u;
+    uint t = rem - row * 16u;
+    uint srcElem;
+    if (param.transpose == 1u) {
+        srcElem = (param.tokBase + blk * 16u + t) * param.srcStride + row;
+    } else {
+        srcElem = row * param.srcStride + param.tokBase + blk * 16u + t;
+    }
+    uint srcByte = srcElem * param.elemBytes;
+    uint dstByte = param.dstBase + blk * param.dstStride + rem * param.elemBytes;
+    for (uint b = 0u; b < param.elemBytes; b++) {
+        dst[dstByte + b] = src[srcByte + b];
+    }
+}

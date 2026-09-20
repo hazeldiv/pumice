@@ -5,7 +5,7 @@ NODE_EXE     := $(shell node -p "process.execPath")
 NODE_CACHE   := $(subst \,/,$(LOCALAPPDATA))/node-gyp/Cache
 NODE_INC     ?= $(firstword $(wildcard $(NODE_CACHE)/*/include/node))
 
-CFLAGS       := -O2 -Wall -Wextra -Iinclude $(VULKAN_INC) -I"$(TOKENIZERS)/include"
+CFLAGS       := -O2 -Wall -Wextra -Iinclude -Ixxhash $(VULKAN_INC) -I"$(TOKENIZERS)/include"
 ifneq ($(NODE_INC),)
 CFLAGS       += -I"$(NODE_INC)"
 endif

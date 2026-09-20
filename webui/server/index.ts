@@ -2,26 +2,17 @@ import express from "express";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { EngineManager, type LoadOptions } from "./engine";
-import { addonPath, distDir, exportRoot, launchCwd, modelRoot, quantTmp } from "./paths";
+import { EngineManager } from "./engine";
+import { buildLoadOptions, resolveInput } from "./load";
+import { addonPath, distDir, modelRoot, quantTmp } from "./paths";
 import { probeModel, scanModels } from "./probe";
-import type { ChatMessage, Quant, QuantConfig, Sampling } from "./types";
+import { createV1Router } from "./v1";
+import type { ChatMessage, Sampling } from "./types";
 
 const engine = new EngineManager(addonPath, quantTmp);
 const app = express();
 app.use(express.json({ limit: "64mb" }));
-
-function resolveInput(target: string): string {
-  if (!target) return target;
-  return path.isAbsolute(target) ? target : path.resolve(launchCwd, target);
-}
-
-const QUANT_VALUES = new Set(["fp16", "int8", "q4_1_32", "q4_1_64", "q4_1_128", "q4_1_256"]);
-
-function toQuant(value: unknown, fallback: Quant = "fp16"): Quant {
-  const s = String(value ?? "");
-  return (QUANT_VALUES.has(s) ? s : fallback) as Quant;
-}
+app.use("/v1", createV1Router(engine));
 
 app.get("/api/status", (_req, res) => {
   res.json({ ...engine.status(), engine: engine.engineInfo() });
@@ -52,32 +43,7 @@ app.post("/api/load", async (req, res) => {
     return;
   }
   const body = req.body ?? {};
-  const maxCtx = Number(body.maxCtx ?? info.maxCtx);
-  const prefillChunk = Number(body.prefillChunk ?? info.prefillChunk);
-  const expertsVram = Number(body.expertsVram ?? 0);
-  const layers: { attn: Quant; ffn: Quant }[] = Array.isArray(body.layers)
-    ? body.layers.map((l: any) => ({ attn: toQuant(l.attn), ffn: toQuant(l.ffn) }))
-    : Array.from({ length: info.layers }, () => ({ attn: "fp16" as Quant, ffn: "fp16" as Quant }));
-
-  const quant: QuantConfig | null = info.kind === "hqm" ? null : {
-    name: info.name,
-    maxCtx,
-    prefillChunk,
-    embed: toQuant(body.embed ?? info.embed),
-    lmHead: toQuant(body.lmHead ?? info.lmHead),
-    layers,
-  };
-  if (quant && info.experts > 0) quant.expertsVram = expertsVram;
-
-  const opts: LoadOptions = {
-    path: target,
-    quant,
-    prune: Boolean(body.prune) && info.kind !== "hqm",
-    exportModel: Boolean(body.exportModel),
-    exportDir: resolveInput(String(body.exportDir ?? exportRoot)),
-    maxCtx,
-    expertsVram: info.experts > 0 ? expertsVram : 0,
-  };
+  const opts = buildLoadOptions(target, info, body);
 
   try {
     await engine.load(opts, info);
@@ -260,6 +226,7 @@ function openBrowser(url: string): void {
 app.listen(port, "127.0.0.1", () => {
   const url = `http://127.0.0.1:${port}`;
   console.log(`vk-compute webui server on ${url}`);
+  console.log(`vk-compute [OI] api on ${url}/v1`);
   if (!fs.existsSync(addonPath)) {
     console.warn(`missing addon: ${addonPath} (run make)`);
   }

@@ -2,12 +2,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <windows.h>
 #include "engine.h"
 #include "generate.h"
 #include "weights.h"
 #include "prune.h"
 #include "hqm.h"
 #include "gguf.h"
+#include "kvcache.h"
 #include "tokenizers_c.h"
 
 struct engine {
@@ -20,6 +22,16 @@ struct engine {
     size_t idCap;
     char* decoded;
     size_t decodedCap;
+    kvcache kv;
+    int kvEnabled;
+    uint32_t* sessionIds;
+    size_t sessionLen;
+    size_t sessionCap;
+    uint64_t* hashes;
+    size_t hashCap;
+    uint8_t* gdnScratch;
+    int64_t gdnScratchBytes;
+    int lastResume;
 };
 
 typedef struct {
@@ -268,6 +280,18 @@ static void setError(char* err, size_t cap, const char* msg) {
     if (err != NULL && cap > 0) snprintf(err, cap, "%s", msg);
 }
 
+static double nowMs(void) {
+    static double freq = 0.0;
+    if (freq == 0.0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = (double)f.QuadPart / 1000.0;
+    }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / freq;
+}
+
 engine* engineOpen(const engine_options* opts, char* err, size_t errCap) {
     engine* e = (engine*)calloc(1, sizeof(engine));
     if (e == NULL) {
@@ -296,16 +320,28 @@ engine* engineOpen(const engine_options* opts, char* err, size_t errCap) {
         setError(err, errCap, "cannot load tokenizer");
         return NULL;
     }
+
+    int64_t kvBudget = opts->kvRamBudget > 0 ? opts->kvRamBudget : (int64_t)512 * 1024 * 1024;
+    int64_t kvDisk = opts->kvDiskBudget > 0 ? opts->kvDiskBudget : (int64_t)1024 * 1024 * 1024;
+    if (kvOpen(&e->kv, e->s, &e->spec, opts->kvStoreDir, kvBudget, kvDisk, 1)) {
+        e->kvEnabled = 1;
+        e->gdnScratchBytes = e->kv.gdnBytes;
+        if (e->gdnScratchBytes > 0) e->gdnScratch = (uint8_t*)malloc((size_t)e->gdnScratchBytes);
+    }
     return e;
 }
 
 void engineClose(engine* e) {
     if (e == NULL) return;
+    if (e->kvEnabled) kvClose(&e->kv);
     if (e->g != NULL) destroyGenerator(e->g);
     destroySession(e->s);
     if (e->tok != NULL) tokenizers_free(e->tok);
     free(e->ids);
     free(e->decoded);
+    free(e->sessionIds);
+    free(e->hashes);
+    free(e->gdnScratch);
     free(e);
 }
 
@@ -361,6 +397,11 @@ typedef struct {
 static void onToken(uint32_t token, void* ctx) {
     emitContext* ec = (emitContext*)ctx;
     engine* e = ec->e;
+    if (e->sessionLen + 1 > e->sessionCap) {
+        e->sessionCap = e->sessionCap ? e->sessionCap * 2 : 4096;
+        e->sessionIds = (uint32_t*)realloc(e->sessionIds, e->sessionCap * sizeof(uint32_t));
+    }
+    e->sessionIds[e->sessionLen++] = token;
     appendId(e, token);
     tokenizers_decode(e->tok, e->ids, e->idCount, 1);
     const char* data = NULL;
@@ -371,20 +412,152 @@ static void onToken(uint32_t token, void* ctx) {
     storeDecoded(e, data, len);
 }
 
+static void onBoundary(void* ctx, int pos) {
+    engine* e = (engine*)ctx;
+    if (!e->kvEnabled || e->gdnScratch == NULL || e->hashes == NULL) return;
+    if (pos <= 0 || (pos % KV_BLOCK_TOKENS) != 0) return;
+    generatorReadGdn(e->g, &e->kv, e->gdnScratch);
+    kvStoreSnapshot(&e->kv, e->hashes, pos, e->gdnScratch);
+}
+
+static void ensureSession(engine* e, size_t count) {
+    if (e->sessionCap >= count) return;
+    e->sessionCap = e->sessionCap ? e->sessionCap : 4096;
+    while (e->sessionCap < count) e->sessionCap *= 2;
+    e->sessionIds = (uint32_t*)realloc(e->sessionIds, e->sessionCap * sizeof(uint32_t));
+}
+
+static void ensureHashes(engine* e, size_t count) {
+    if (e->hashCap >= count) return;
+    e->hashCap = e->hashCap ? e->hashCap : 4096;
+    while (e->hashCap < count) e->hashCap *= 2;
+    e->hashes = (uint64_t*)realloc(e->hashes, e->hashCap * sizeof(uint64_t));
+}
+
+static void engineFlush(engine* e, int count) {
+    int nb = count / KV_BLOCK_TOKENS;
+    if (nb <= 0) return;
+    ensureHashes(e, (size_t)nb);
+    kvChainHashes(&e->kv, e->sessionIds, count, e->hashes);
+    int* blockIndices = (int*)malloc(sizeof(int) * (size_t)nb);
+    int* slots = (int*)malloc(sizeof(int) * (size_t)nb);
+    const int chunk = 32;
+    for (int b = 0; b < nb; ) {
+        int end = b + chunk;
+        if (end > nb) end = nb;
+        int n = 0;
+        int full = 0;
+        for (int i = b; i < end; i++) {
+            if (kvHasBlock(&e->kv, e->hashes[i])) continue;
+            int slot = kvAllocSlot(&e->kv);
+            if (slot < 0) {
+                full = 1;
+                break;
+            }
+            blockIndices[n] = i;
+            slots[n] = slot;
+            n++;
+        }
+        if (n > 0) {
+            generatorKvRestripe(e->g, &e->kv, blockIndices, slots, n);
+            for (int i = 0; i < n; i++) {
+                int bi = blockIndices[i];
+                uint64_t parent = bi > 0 ? e->hashes[bi - 1] : 0;
+                uint64_t child = (bi + 1 < nb) ? e->hashes[bi + 1] : 0;
+                kvCommitBlock(&e->kv, e->hashes[bi], parent, child, slots[i], bi);
+            }
+        }
+        if (full) {
+            fprintf(stderr, "kvcache: pool full, %d blocks not cached\n", nb - b);
+            break;
+        }
+        b = end;
+    }
+    free(blockIndices);
+    free(slots);
+}
+
 void engineGenerate(engine* e, const uint32_t* prompt, size_t count, const sample_params* params,
                     uint32_t seed, int maxNew, engine_emit emit, void* ctx) {
     if (e == NULL || e->g == NULL) return;
     e->idCount = 0;
     if (e->decoded != NULL) e->decoded[0] = '\0';
     generatorSetSampling(e->g, params, seed);
+
+    ensureSession(e, count + 1);
+    if (count > 0) memcpy(e->sessionIds, prompt, sizeof(uint32_t) * count);
+    e->sessionLen = count;
+
+    int resume = 0;
+    e->lastResume = 0;
+    kv_plan plan;
+    memset(&plan, 0, sizeof(plan));
+    if (e->kvEnabled && count > 0) {
+        ensureHashes(e, count / KV_BLOCK_TOKENS + 1);
+        kvChainHashes(&e->kv, prompt, (int)count, e->hashes);
+        kvPlan(&e->kv, e->hashes, (int)count, &plan);
+        resume = plan.resume;
+    }
+
     resetGenerator(e->g);
+    if (resume > 0) {
+        int bc = plan.blockCount;
+        int* blockIndices = (int*)malloc(sizeof(int) * (size_t)(bc > 0 ? bc : 1));
+        int* slots = (int*)malloc(sizeof(int) * (size_t)(bc > 0 ? bc : 1));
+        int rn = 0;
+        for (int i = 0; i < bc; i++) {
+            if (plan.blocks[i].source != 0) continue;
+            blockIndices[rn] = i;
+            slots[rn] = plan.blocks[i].slot;
+            rn++;
+        }
+        double t0 = nowMs();
+        int ok = 1;
+        if (rn > 0) generatorKvUnstripe(e->g, &e->kv, e->kv.pool, blockIndices, slots, rn);
+        if (!generatorKvRestoreCold(e->g, &e->kv, plan.blocks, bc)) ok = 0;
+        free(blockIndices);
+        free(slots);
+        if (ok) {
+            kvAddRestoreTime(&e->kv, nowMs() - t0);
+            if (plan.snapData != NULL) {
+                generatorWriteGdn(e->g, &e->kv, plan.snapData);
+                kvStoreSnapshot(&e->kv, e->hashes, resume, plan.snapData);
+            }
+            stateSetPosition(e->s, &e->g->st, (uint32_t)resume);
+            e->g->nextPos = (uint32_t)resume;
+            e->kv.statRestores++;
+            e->kv.statRestoreBytes += (int64_t)bc * e->kv.slotBytes;
+            e->lastResume = resume;
+            if (getenv("VK_COMPUTE_LOG_CACHE") != NULL) {
+                fprintf(stderr, "kvcache: restored %d tokens (%d blocks, %.1f ms)\n", resume, bc,
+                        nowMs() - t0);
+            }
+        } else {
+            resume = 0;
+        }
+    }
+    kvUnpin(&e->kv, &plan);
+
+    e->g->boundaryHook = onBoundary;
+    e->g->boundaryHookCtx = e;
+    e->g->boundaryInterval = KV_SNAP_INTERVAL;
     emitContext ec = {e, emit, ctx};
-    generateTokens(e->g, prompt, (int)count, maxNew, onToken, &ec);
+    generateTokens(e->g, prompt + resume, (int)count - resume, maxNew, onToken, &ec);
+    e->g->boundaryHook = NULL;
+    e->g->boundaryHookCtx = NULL;
+
+    if (e->kvEnabled) {
+        engineFlush(e, (int)count);
+        kvPersist(&e->kv);
+    }
+    kvPlanFree(&plan);
 }
 
 void engineScore(engine* e, const uint32_t* ids, size_t count, int prefillN, int decodeN, int chunks,
                  engine_progress progress, void* ctx, double* outLoss, long long* outCount) {
     if (e == NULL || e->g == NULL) return;
+    e->g->boundaryHook = NULL;
+    e->g->boundaryHookCtx = NULL;
     generatorSetScoring(e->g, 1);
     generateScore(e->g, ids, count, prefillN, decodeN, chunks, progress, ctx, outLoss, outCount);
 }
@@ -403,4 +576,37 @@ int engineMaxCtx(const engine* e) {
 
 void engineRequestStop(engine* e) {
     if (e != NULL && e->g != NULL) generatorRequestStop(e->g);
+}
+
+int engineFinishReason(const engine* e) {
+    if (e == NULL || e->g == NULL) return 0;
+    return generatorFinishReason(e->g);
+}
+
+int engineLastResume(const engine* e) {
+    return e != NULL ? e->lastResume : 0;
+}
+
+void engineMemoryStats(int64_t* hostVisible, int64_t* deviceLocal) {
+    bufferMemoryTotals(deviceLocal, hostVisible);
+}
+
+void engineKvStats(const engine* e, engine_kv_stats* out) {
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    if (e == NULL) return;
+    out->enabled = e->kvEnabled;
+    out->blocks = e->kv.statBlocks;
+    out->entries = (uint64_t)e->kv.entryCount;
+    out->snapshots = (uint64_t)e->kv.snapUsed;
+    out->hits = e->kv.statHits;
+    out->coldHits = e->kv.statColdHits;
+    out->restores = e->kv.statRestores;
+    out->evictions = e->kv.statEvictions;
+    out->coldDeletes = e->kv.statColdDeletes;
+    out->usedBytes = (int64_t)e->kv.usedSlots * e->kv.slotBytes;
+    out->ramBudget = e->kv.ramBudget;
+    out->diskBudget = e->kv.diskBudget;
+    out->coldBytes = e->kv.coldBytes;
+    out->restoreMs = e->kv.statRestoreMs;
 }

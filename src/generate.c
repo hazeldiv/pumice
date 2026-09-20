@@ -843,13 +843,24 @@ uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens) {
     const model_dims* d = g->dims;
     int m = g->maxM;
 
-    int done = 0;
+    if (nTokens <= 0) return 0;
+    int start = (int)g->nextPos;
+    int end = start + nTokens;
+    int finalAligned = end - (end % KV_BLOCK_TOKENS);
+    int done = start;
     int lastCur = 0;
-    while (done < nTokens) {
-        int cur = nTokens - done;
+    while (done < end) {
+        int cur = end - done;
         if (cur > m) cur = m;
+        if (g->boundaryHook != NULL && g->boundaryInterval > 0) {
+            int stop = end;
+            int next = ((done / g->boundaryInterval) + 1) * g->boundaryInterval;
+            if (next < stop) stop = next;
+            if (finalAligned > done && finalAligned < stop) stop = finalAligned;
+            if (done + cur > stop) cur = stop - done;
+        }
         int padded = (cur + 15) & ~15;
-        memcpy(st->tokenIds.mappedMemory, tokens + done, sizeof(uint32_t) * cur);
+        memcpy(st->tokenIds.mappedMemory, tokens + (done - start), sizeof(uint32_t) * cur);
         for (int i = cur; i < padded; i++) ((uint32_t*)st->tokenIds.mappedMemory)[i] = 0;
 
         if (g->dumpLayers > 0) {
@@ -955,6 +966,10 @@ uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens) {
         }
         done += cur;
         lastCur = cur;
+        if (g->boundaryHook != NULL && g->boundaryInterval > 0 &&
+            ((done % g->boundaryInterval) == 0 || done == finalAligned)) {
+            g->boundaryHook(g->boundaryHookCtx, done);
+        }
     }
 
     float* hCpu = (float*)malloc(sizeof(float) * m * d->K);
@@ -992,21 +1007,31 @@ void generatorRequestStop(generator* g) {
     if (g != NULL) g->stop = 1;
 }
 
+int generatorFinishReason(const generator* g) {
+    return g != NULL ? g->finishReason : 0;
+}
+
 void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNewTokens, void (*emit)(uint32_t token, void* ctx), void* ctx) {
     g->stop = 0;
     g->skipFinal = 0;
-    if (nPrompt >= g->maxCtx) {
-        fprintf(stderr, "prompt length %d exceeds max ctx %d\n", nPrompt, g->maxCtx);
+    g->finishReason = 1;
+    int used = (int)g->nextPos + nPrompt;
+    if (used >= g->maxCtx) {
+        fprintf(stderr, "prompt length %d exceeds max ctx %d\n", used, g->maxCtx);
         return;
     }
-    int limit = g->maxCtx - nPrompt;
+    int limit = g->maxCtx - used;
     if (limit < 1) limit = 1;
     if (maxNewTokens > limit) maxNewTokens = limit;
 
     uint32_t token = runPrefill(g, prompt, nPrompt);
     int count = 1;
     emit(token, ctx);
-    if (token == (uint32_t)g->eos || maxNewTokens <= 1) {
+    if (token == (uint32_t)g->eos) {
+        g->finishReason = 0;
+        return;
+    }
+    if (maxNewTokens <= 1) {
         return;
     }
 
@@ -1029,7 +1054,10 @@ void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNe
             emit(token, ctx);
             count++;
             g->nextPos++;
-            if (token == (uint32_t)g->eos) break;
+            if (token == (uint32_t)g->eos) {
+                g->finishReason = 0;
+                break;
+            }
         }
         return;
     }
@@ -1113,6 +1141,7 @@ void generateTokens(generator* g, const uint32_t* prompt, int nPrompt, int maxNe
         curOps = nextOps;
         curCount = nextCount;
     }
+    if (eos || g->stop) g->finishReason = 0;
     executeWaitLast(&g->s);
 }
 
@@ -1203,9 +1232,167 @@ void resetGenerator(generator* g) {
         }
     }
     states[count++] = g->st.sampleHistory;
+    for (int i = 0; i < count; i++) clearStaging(g->s.dev.device, &states[i]);
     createTransferAndCopy(g->s.dev.device, g->s.dev.queue, states, count);
     free(states);
     g->nextPos = 0;
+}
+
+static int kvDispatch(int elements) {
+    return (elements + 255) / 256;
+}
+
+void generatorKvUnstripe(generator* g, kvcache* kv, buffer src, const int* blockIndices, const int* slots, int count) {
+    model_state* st = &g->st;
+    const model_dims* d = g->dims;
+    int n = 0;
+    for (int i = 0; i < count; ) {
+        int run = 1;
+        while (i + run < count && slots[i + run] == slots[i] + run &&
+               blockIndices[i + run] == blockIndices[i] + run) run++;
+        int64_t slot0 = slots[i];
+        int tokBase = blockIndices[i] * KV_BLOCK_TOKENS;
+        for (int f = 0; f < kv->fullCount; f++) {
+            kv_layer_layout* ly = &kv->layout[f];
+            int L = ly->layer;
+            int elem = ly->quantized ? 1 : 2;
+            buffer kBufs[2] = {src, st->kCache[L]};
+            int pushK[8] = {(int)(slot0 * kv->slotBytes + ly->kOff), (int)kv->slotBytes,
+                            tokBase, d->kvRows, run, d->maxCtx, elem, 0};
+            addOp(g->prefillOps, &n, "KV-Unstripe.spv", L, kBufs, 2, pushK, 8,
+                  kvDispatch(run * d->kvRows * KV_BLOCK_TOKENS), 1);
+            buffer vBufs[2] = {src, st->vCache[L]};
+            int pushV[8] = {(int)(slot0 * kv->slotBytes + ly->vOff), (int)kv->slotBytes,
+                            tokBase, d->kvRows, run, d->kvRows, elem, 1};
+            addOp(g->prefillOps, &n, "KV-Unstripe.spv", L, vBufs, 2, pushV, 8,
+                  kvDispatch(run * d->kvRows * KV_BLOCK_TOKENS), 1);
+            if (ly->quantized) {
+                int64_t offs[4] = {ly->kScaleOff, ly->kZeroOff, ly->vScaleOff, ly->vZeroOff};
+                buffer* dsts[4] = {&st->kScale[L], &st->kZero[L], &st->vScale[L], &st->vZero[L]};
+                for (int r = 0; r < 4; r++) {
+                    buffer b[2] = {src, *dsts[r]};
+                    int push[8] = {(int)(slot0 * kv->slotBytes + offs[r]), (int)kv->slotBytes,
+                                   tokBase, d->kvHeads, run, d->maxCtx, 4, 0};
+                    addOp(g->prefillOps, &n, "KV-Unstripe.spv", L, b, 2, push, 8,
+                          kvDispatch(run * d->kvHeads * KV_BLOCK_TOKENS), 1);
+                }
+            }
+        }
+        i += run;
+    }
+    executeLogged(g->s, g->prefillOps, n, "restore", 0);
+}
+
+int generatorKvRestoreCold(generator* g, kvcache* kv, const kv_restore_block* blocks, int count) {
+    int cap = kv->stageSlots;
+    int* bi = (int*)malloc(sizeof(int) * (size_t)cap);
+    int* si = (int*)malloc(sizeof(int) * (size_t)cap);
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        if (blocks[i].source != 1) continue;
+        if (!kvColdLoad(kv, blocks[i].key, n)) {
+            free(bi);
+            free(si);
+            return 0;
+        }
+        bi[n] = i;
+        si[n] = n;
+        n++;
+        if (n == cap) {
+            generatorKvUnstripe(g, kv, kv->stage, bi, si, n);
+            for (int k = 0; k < n; k++) kvAdmit(kv, blocks[bi[k]].key, k);
+            n = 0;
+        }
+    }
+    if (n > 0) {
+        generatorKvUnstripe(g, kv, kv->stage, bi, si, n);
+        for (int k = 0; k < n; k++) kvAdmit(kv, blocks[bi[k]].key, k);
+    }
+    free(bi);
+    free(si);
+    return 1;
+}
+
+void generatorKvRestripe(generator* g, kvcache* kv, const int* blockIndices, const int* slots, int count) {
+    model_state* st = &g->st;
+    const model_dims* d = g->dims;
+    int n = 0;
+    for (int i = 0; i < count; ) {
+        int run = 1;
+        while (i + run < count && slots[i + run] == slots[i] + run &&
+               blockIndices[i + run] == blockIndices[i] + run) run++;
+        int64_t slot0 = slots[i];
+        int tokBase = blockIndices[i] * KV_BLOCK_TOKENS;
+        for (int f = 0; f < kv->fullCount; f++) {
+            kv_layer_layout* ly = &kv->layout[f];
+            int L = ly->layer;
+            int elem = ly->quantized ? 1 : 2;
+            buffer kBufs[2] = {st->kCache[L], kv->pool};
+            int pushK[8] = {d->maxCtx, tokBase, d->kvRows, run,
+                            (int)(slot0 * kv->slotBytes + ly->kOff), (int)kv->slotBytes, elem, 0};
+            addOp(g->prefillOps, &n, "KV-Restripe.spv", L, kBufs, 2, pushK, 8,
+                  kvDispatch(run * d->kvRows * KV_BLOCK_TOKENS), 1);
+            buffer vBufs[2] = {st->vCache[L], kv->pool};
+            int pushV[8] = {d->kvRows, tokBase, d->kvRows, run,
+                            (int)(slot0 * kv->slotBytes + ly->vOff), (int)kv->slotBytes, elem, 1};
+            addOp(g->prefillOps, &n, "KV-Restripe.spv", L, vBufs, 2, pushV, 8,
+                  kvDispatch(run * d->kvRows * KV_BLOCK_TOKENS), 1);
+            if (ly->quantized) {
+                int64_t offs[4] = {ly->kScaleOff, ly->kZeroOff, ly->vScaleOff, ly->vZeroOff};
+                buffer* srcs[4] = {&st->kScale[L], &st->kZero[L], &st->vScale[L], &st->vZero[L]};
+                for (int r = 0; r < 4; r++) {
+                    buffer b[2] = {*srcs[r], kv->pool};
+                    int push[8] = {d->maxCtx, tokBase, d->kvHeads, run,
+                                   (int)(slot0 * kv->slotBytes + offs[r]), (int)kv->slotBytes, 4, 0};
+                    addOp(g->prefillOps, &n, "KV-Restripe.spv", L, b, 2, push, 8,
+                          kvDispatch(run * d->kvHeads * KV_BLOCK_TOKENS), 1);
+                }
+            }
+        }
+        i += run;
+    }
+    executeLogged(g->s, g->prefillOps, n, "flush", 0);
+}
+
+void generatorReadGdn(generator* g, kvcache* kv, void* out) {
+    const model_dims* d = g->dims;
+    int64_t stateSFloats = (int64_t)d->nV * d->dim * d->dim;
+    int64_t convFloats = (int64_t)d->convHist * d->zqkvN;
+    float* tmp = (float*)malloc(sizeof(float) * (size_t)stateSFloats);
+    uint8_t* p = (uint8_t*)out;
+    for (int k = 0; k < kv->deltaCount; k++) {
+        int L = kv->deltaLayers[k];
+        readBuffer(g->s.dev.device, g->s.dev.physicalDevice, g->s.dev.queue, g->st.stateS[L], tmp);
+        uint16_t* dst = (uint16_t*)p;
+        for (int64_t i = 0; i < stateSFloats; i++) dst[i] = float_to_fp16(tmp[i]);
+        p += stateSFloats * 2;
+        readBuffer(g->s.dev.device, g->s.dev.physicalDevice, g->s.dev.queue, g->st.convHist[L], p);
+        p += convFloats * 4;
+    }
+    free(tmp);
+}
+
+void generatorWriteGdn(generator* g, kvcache* kv, const void* in) {
+    const model_dims* d = g->dims;
+    int64_t stateSFloats = (int64_t)d->nV * d->dim * d->dim;
+    int64_t convFloats = (int64_t)d->convHist * d->zqkvN;
+    float* tmp = (float*)malloc(sizeof(float) * (size_t)stateSFloats);
+    const uint8_t* p = (const uint8_t*)in;
+    buffer bufs[2 * MODEL_MAX_LAYERS];
+    int count = 0;
+    for (int k = 0; k < kv->deltaCount; k++) {
+        int L = kv->deltaLayers[k];
+        const uint16_t* src = (const uint16_t*)p;
+        for (int64_t i = 0; i < stateSFloats; i++) tmp[i] = fp16_to_float(src[i]);
+        writeStaging(g->s.dev.device, &g->st.stateS[L], tmp, stateSFloats * 4);
+        p += stateSFloats * 2;
+        writeStaging(g->s.dev.device, &g->st.convHist[L], p, convFloats * 4);
+        p += convFloats * 4;
+        bufs[count++] = g->st.stateS[L];
+        bufs[count++] = g->st.convHist[L];
+    }
+    createTransferAndCopy(g->s.dev.device, g->s.dev.queue, bufs, count);
+    free(tmp);
 }
 
 void generatorSetSampling(generator* g, const sample_params* p, uint32_t seed) {

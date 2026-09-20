@@ -13,6 +13,9 @@ export interface LoadPayload {
   embed: Quant;
   lmHead: Quant;
   expertsVram: number;
+  kvRamBudget: number;
+  kvDiskBudget: number;
+  kvStoreDir: string;
   prune: boolean;
   exportModel: boolean;
   exportDir: string;

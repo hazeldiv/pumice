@@ -35,7 +35,24 @@ The UI opens automatically at `http://127.0.0.1:8787`.
 | -------------------- | ------------------------------------------- |
 | `-p, --port <port>`  | port to listen on (default 8787)            |
 | `-m, --models <dir>` | model directory to scan (default `./model`) |
+| `--api-key <key>`    | require `Authorization: Bearer <key>` on `/v1` (or set `VK_COMPUTE_API_KEY`) |
 | `--no-open`          | do not open the browser                     |
+
+### Agent API
+
+The same server exposes an [OI]-compatible API on `/v1`, so an agent harness (opencode and friends) can use it directly. Point the harness at `http://127.0.0.1:8787/v1`, set the model to any id from `GET /v1/models`, and the model auto-loads on the first request.
+
+- `GET /v1/models`
+- `POST /v1/chat/completions` — streaming and non-streaming, `tools` / tool calls, `usage`
+- `POST /v1/completions` — legacy text completion
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen3.5-2B-1.6gb.hqm","messages":[{"role":"user","content":"Say hi in three words."}],"max_tokens":32}'
+```
+
+A growing conversation resumes from the KV cache instead of re-prefilling, so multi-turn agents stay fast.
 
 ### Model tab
 

@@ -7,6 +7,7 @@
 #include "weights.h"
 #include "state.h"
 #include "dispatch.h"
+#include "kvcache.h"
 
 #define DECODE_GROUP 4
 
@@ -40,6 +41,10 @@ typedef struct generator {
     uint32_t dumpTopPStep;
     volatile int stop;
     int skipFinal;
+    int finishReason;
+    void (*boundaryHook)(void* ctx, int pos);
+    void* boundaryHookCtx;
+    int boundaryInterval;
 } generator;
 
 generator* createGenerator(session s, const model_config* spec, const char* weightDir, int verboseWeights);
@@ -51,8 +56,14 @@ void generateScore(generator* g, const uint32_t* ids, size_t idCount, int prefil
                                     double lossSum, long long count),
                    void* ctx, double* outLoss, long long* outCount);
 void generatorRequestStop(generator* g);
+int generatorFinishReason(const generator* g);
 void generatorSetScoring(generator* g, int enabled);
 void resetGenerator(generator* g);
+void generatorKvUnstripe(generator* g, kvcache* kv, buffer src, const int* blockIndices, const int* slots, int count);
+int generatorKvRestoreCold(generator* g, kvcache* kv, const kv_restore_block* blocks, int count);
+void generatorKvRestripe(generator* g, kvcache* kv, const int* blockIndices, const int* slots, int count);
+void generatorReadGdn(generator* g, kvcache* kv, void* out);
+void generatorWriteGdn(generator* g, kvcache* kv, const void* in);
 void generatorSetDumpDir(generator* g, const char* dir);
 void generatorDumpPrefill(generator* g, int rows);
 void generatorSetDumpLayers(generator* g, int layers);

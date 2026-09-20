@@ -59,7 +59,7 @@ static void fatal(const char* msg) {
 static session g_wbufSession;
 static buffer* g_wbufs[MAX_WEIGHT_BUFS];
 static int g_wbufsCount = 0;
-static buffer g_wbufSmall[MAX_WEIGHT_BUFS];
+static buffer* g_wbufSmall[MAX_WEIGHT_BUFS];
 static int g_wbufSmallCount = 0;
 
 static void weightFlush(void) {
@@ -67,9 +67,10 @@ static void weightFlush(void) {
     buffer tmp[WEIGHT_FLUSH_BATCH * 2];
     int n = 0;
     for (int i = 0; i < g_wbufsCount; i++) tmp[n++] = *g_wbufs[i];
-    for (int i = 0; i < g_wbufSmallCount; i++) tmp[n++] = g_wbufSmall[i];
+    for (int i = 0; i < g_wbufSmallCount; i++) tmp[n++] = *g_wbufSmall[i];
     createTransferAndCopy(g_wbufSession.dev.device, g_wbufSession.dev.queue, tmp, n);
     for (int i = 0; i < g_wbufsCount; i++) releaseStaging(g_wbufSession.dev.device, g_wbufs[i]);
+    for (int i = 0; i < g_wbufSmallCount; i++) releaseStaging(g_wbufSession.dev.device, g_wbufSmall[i]);
     g_wbufsCount = 0;
     g_wbufSmallCount = 0;
 }
@@ -81,7 +82,7 @@ static void registerWeightBuffer(buffer* b) {
     if (g_wbufsCount + g_wbufSmallCount >= WEIGHT_FLUSH_BATCH) weightFlush();
 }
 
-static void registerWeightBufferSmall(buffer b) {
+static void registerWeightBufferSmall(buffer* b) {
     if (g_wbufSmallCount < MAX_WEIGHT_BUFS) {
         g_wbufSmall[g_wbufSmallCount++] = b;
     }
@@ -393,7 +394,6 @@ static buffer loadVecBuffer(session s, const char* hfName, int len, const char* 
     }
     buffer b = createBufferNamed(s.dev.device, s.dev.physicalDevice, v, sizeof(float) * len, MEMORY_VRAM, label);
     countBuffer(label, layer, b);
-    registerWeightBufferSmall(b);
     free(v);
     return b;
 }
@@ -556,7 +556,6 @@ static buffer loadConv(session s, const char* name, int layer) {
     }
     buffer b = createBufferNamed(s.dev.device, s.dev.physicalDevice, v, sizeof(float) * n, MEMORY_VRAM, cacheName);
     countBuffer("conv", layer, b);
-    registerWeightBufferSmall(b);
     free(v);
     return b;
 }
@@ -587,7 +586,6 @@ static buffer loadRouterFp16(session s, const char* hfName, int K, int N, const 
     }
     buffer b = createBufferNamed(s.dev.device, s.dev.physicalDevice, ct->data, ct->dataBytes, MEMORY_VRAM, cacheName);
     countBuffer(cacheName, layer, b);
-    registerWeightBufferSmall(b);
     cacheRelease(ct);
     return b;
 }
@@ -917,6 +915,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     free(theta);
 
     w.gammaFinal = loadVecBuffer(s, "model.language_model.norm.weight", d->K, "gammaFinal", -1, 1);
+    registerWeightBufferSmall(&w.gammaFinal);
 
     int V = d->vocab;
     w.vocab = V;
@@ -985,8 +984,10 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
 
         lname(n1, sizeof(n1), L, "input_layernorm.weight");
         w.gammaIn[L] = loadVecBuffer(s, n1, d->K, "gammaIn", L, 1);
+        registerWeightBufferSmall(&w.gammaIn[L]);
         lname(n1, sizeof(n1), L, "post_attention_layernorm.weight");
         w.gammaF[L] = loadVecBuffer(s, n1, d->K, "gammaF", L, 1);
+        registerWeightBufferSmall(&w.gammaF[L]);
 
         char projName[64], outName[64];
         snprintf(projName, sizeof(projName), "proj_%d", L);
@@ -995,8 +996,10 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
         if (ly->attn.type == ATTENTION_FULL) {
             lname(n1, sizeof(n1), L, "self_attn.q_norm.weight");
             w.qNorm[L] = loadVecBuffer(s, n1, d->headDim, "qNorm", L, 1);
+            registerWeightBufferSmall(&w.qNorm[L]);
             lname(n1, sizeof(n1), L, "self_attn.k_norm.weight");
             w.kNorm[L] = loadVecBuffer(s, n1, d->headDim, "kNorm", L, 1);
+            registerWeightBufferSmall(&w.kNorm[L]);
 
             lname(n1, sizeof(n1), L, "self_attn.q_proj.weight");
             lname(n2, sizeof(n2), L, "self_attn.k_proj.weight");
@@ -1022,12 +1025,16 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
         } else {
             lname(n1, sizeof(n1), L, "linear_attn.conv1d.weight");
             w.conv[L] = loadConv(s, n1, L);
+            registerWeightBufferSmall(&w.conv[L]);
             lname(n1, sizeof(n1), L, "linear_attn.A_log");
             w.aLog[L] = loadVecBuffer(s, n1, d->nV, "aLog", L, 0);
+            registerWeightBufferSmall(&w.aLog[L]);
             lname(n1, sizeof(n1), L, "linear_attn.dt_bias");
             w.dtBias[L] = loadVecBuffer(s, n1, d->nV, "dtBias", L, 0);
+            registerWeightBufferSmall(&w.dtBias[L]);
             lname(n1, sizeof(n1), L, "linear_attn.norm.weight");
             w.attnNorm[L] = loadVecBuffer(s, n1, d->dim, "attnNorm", L, 0);
+            registerWeightBufferSmall(&w.attnNorm[L]);
 
             lname(n1, sizeof(n1), L, "linear_attn.in_proj_qkv.weight");
             lname(n2, sizeof(n2), L, "linear_attn.in_proj_z.weight");
@@ -1132,8 +1139,10 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
 
             lname(n1, sizeof(n1), L, "mlp.gate.weight");
             w.router[L] = loadRouterFp16(s, n1, d->K, d->experts, rtName, L);
+            registerWeightBufferSmall(&w.router[L]);
             lname(n1, sizeof(n1), L, "mlp.shared_expert_gate.weight");
             w.sharedGate[L] = loadRouterFp16(s, n1, d->K, 1, sgName, L);
+            registerWeightBufferSmall(&w.sharedGate[L]);
         }
     }
 

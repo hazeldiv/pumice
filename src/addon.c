@@ -17,6 +17,7 @@ typedef struct {
     char* weights;
     char* quantConfig;
     char* exportDir;
+    char* kvStoreDir;
     engine* result;
     char error[256];
 } openJob;
@@ -38,6 +39,8 @@ typedef struct {
     uint32_t seed;
     int maxNew;
     int generated;
+    int finishReason;
+    int cachedTokens;
     char error[256];
 } generateJob;
 
@@ -106,6 +109,7 @@ static void openExecute(napi_env env, void* data) {
     job->opts.weights = job->weights;
     job->opts.quantConfig = job->quantConfig;
     job->opts.exportDir = job->exportDir;
+    job->opts.kvStoreDir = job->kvStoreDir;
     job->result = engineOpen(&job->opts, job->error, sizeof(job->error));
 }
 
@@ -129,6 +133,7 @@ static void openComplete(napi_env env, napi_status status, void* data) {
     free(job->weights);
     free(job->quantConfig);
     free(job->exportDir);
+    free(job->kvStoreDir);
     free(job);
 }
 
@@ -143,10 +148,13 @@ static napi_value createEngine(napi_env env, napi_callback_info info) {
     getStringProp(env, argv[0], "weights", &job->weights);
     getStringProp(env, argv[0], "quantConfig", &job->quantConfig);
     getStringProp(env, argv[0], "exportDir", &job->exportDir);
+    getStringProp(env, argv[0], "kvStoreDir", &job->kvStoreDir);
     job->opts.maxCtx = (int)getDoubleProp(env, argv[0], "maxCtx", 0);
     job->opts.prune = getBoolProp(env, argv[0], "prune", 0);
     job->opts.expertsVram = (int)getDoubleProp(env, argv[0], "expertsVram", 0);
     job->opts.exportModel = getBoolProp(env, argv[0], "exportModel", 0);
+    job->opts.kvRamBudget = (int64_t)getDoubleProp(env, argv[0], "kvRamBudget", 0);
+    job->opts.kvDiskBudget = (int64_t)getDoubleProp(env, argv[0], "kvDiskBudget", 0);
 
     if (job->weights == NULL) {
         free(job);
@@ -191,6 +199,43 @@ static napi_value engineInfo(napi_env env, napi_callback_info info) {
     napi_set_named_property(env, obj, "eos", v);
     napi_create_int32(env, engineMaxCtx(e), &v);
     napi_set_named_property(env, obj, "maxCtx", v);
+    engine_kv_stats kv;
+    engineKvStats(e, &kv);
+    napi_get_boolean(env, kv.enabled != 0, &v);
+    napi_set_named_property(env, obj, "kvEnabled", v);
+    napi_create_double(env, (double)kv.blocks, &v);
+    napi_set_named_property(env, obj, "kvBlocks", v);
+    napi_create_double(env, (double)kv.entries, &v);
+    napi_set_named_property(env, obj, "kvEntries", v);
+    napi_create_double(env, (double)kv.snapshots, &v);
+    napi_set_named_property(env, obj, "kvSnapshots", v);
+    napi_create_double(env, (double)kv.hits, &v);
+    napi_set_named_property(env, obj, "kvHits", v);
+    napi_create_double(env, (double)kv.coldHits, &v);
+    napi_set_named_property(env, obj, "kvColdHits", v);
+    napi_create_double(env, (double)kv.restores, &v);
+    napi_set_named_property(env, obj, "kvRestores", v);
+    napi_create_double(env, (double)kv.evictions, &v);
+    napi_set_named_property(env, obj, "kvEvictions", v);
+    napi_create_double(env, (double)kv.coldDeletes, &v);
+    napi_set_named_property(env, obj, "kvColdDeletes", v);
+    napi_create_double(env, (double)kv.usedBytes, &v);
+    napi_set_named_property(env, obj, "kvUsedBytes", v);
+    napi_create_double(env, (double)kv.ramBudget, &v);
+    napi_set_named_property(env, obj, "kvRamBudget", v);
+    napi_create_double(env, (double)kv.diskBudget, &v);
+    napi_set_named_property(env, obj, "kvDiskBudget", v);
+    napi_create_double(env, (double)kv.coldBytes, &v);
+    napi_set_named_property(env, obj, "kvColdBytes", v);
+    napi_create_double(env, kv.restoreMs, &v);
+    napi_set_named_property(env, obj, "kvRestoreMs", v);
+    int64_t hostVisible = 0;
+    int64_t deviceLocal = 0;
+    engineMemoryStats(&hostVisible, &deviceLocal);
+    napi_create_double(env, (double)hostVisible, &v);
+    napi_set_named_property(env, obj, "hostVisibleBytes", v);
+    napi_create_double(env, (double)deviceLocal, &v);
+    napi_set_named_property(env, obj, "deviceLocalBytes", v);
     return obj;
 }
 
@@ -287,6 +332,8 @@ static void generateExecute(napi_env env, void* data) {
     generateJob* job = (generateJob*)data;
     engineGenerate(job->e, job->prompt, job->promptCount, &job->params, job->seed, job->maxNew,
                    emitToken, job);
+    job->finishReason = engineFinishReason(job->e);
+    job->cachedTokens = engineLastResume(job->e);
 }
 
 static void generateComplete(napi_env env, napi_status status, void* data) {
@@ -294,7 +341,14 @@ static void generateComplete(napi_env env, napi_status status, void* data) {
     generateJob* job = (generateJob*)data;
     napi_release_threadsafe_function(job->tsfn, napi_tsfn_release);
     napi_value result;
-    napi_create_int32(env, (int32_t)job->generated, &result);
+    napi_create_object(env, &result);
+    napi_value v;
+    napi_create_int32(env, (int32_t)job->generated, &v);
+    napi_set_named_property(env, result, "tokens", v);
+    napi_create_string_utf8(env, job->finishReason == 1 ? "length" : "stop", NAPI_AUTO_LENGTH, &v);
+    napi_set_named_property(env, result, "finishReason", v);
+    napi_create_int32(env, (int32_t)job->cachedTokens, &v);
+    napi_set_named_property(env, result, "cachedTokens", v);
     napi_resolve_deferred(env, job->deferred, result);
     napi_delete_async_work(env, job->work);
     free(job->prompt);

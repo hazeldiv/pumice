@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { createRequire } from "node:module";
+import { buildQwenPrompt, type ChatMessageInput } from "./chatTemplate";
 import type { ChatMessage, ProbeInfo, QuantConfig, Sampling } from "./types";
 
 const require = createRequire(import.meta.url);
@@ -12,11 +13,16 @@ export interface LoadOptions {
   exportDir: string;
   maxCtx: number;
   expertsVram: number;
+  kvRamBudget: number;
+  kvDiskBudget: number;
+  kvStoreDir: string;
 }
 
 export interface ChatResult {
   tokens: number;
   elapsedMs: number;
+  finishReason: "stop" | "length";
+  cachedTokens: number;
 }
 
 export interface ScoreProgress {
@@ -35,16 +41,10 @@ export interface ScoreResult {
   ppl: number;
 }
 
-const CHAT_BOS = "<|im_start|>";
-const CHAT_EOS = "<|im_end|>";
-
 export function buildChatTemplate(messages: ChatMessage[], system: string, thinking: boolean): string {
-  const parts: string[] = [];
-  if (system) parts.push(`${CHAT_BOS}system\n${system}${CHAT_EOS}\n`);
-  for (const msg of messages) parts.push(`${CHAT_BOS}${msg.role}\n${msg.content}${CHAT_EOS}\n`);
-  parts.push(`${CHAT_BOS}assistant\n`);
-  parts.push(thinking ? "<think>\n" : "<think>\n\n</think>\n\n");
-  return parts.join("");
+  const msgs: ChatMessageInput[] = messages.map((m) => ({ role: m.role, content: m.content }));
+  if (system) msgs.unshift({ role: "system", content: system });
+  return buildQwenPrompt(msgs, [], thinking);
 }
 
 export class EngineManager {
@@ -76,6 +76,9 @@ export class EngineManager {
       expertsVram: opts.expertsVram,
       exportModel: opts.exportModel,
       exportDir: opts.exportDir,
+      kvRamBudget: opts.kvRamBudget,
+      kvDiskBudget: opts.kvDiskBudget,
+      kvStoreDir: opts.kvStoreDir,
     });
     this.engine = engine;
     this.info = info;
@@ -89,7 +92,25 @@ export class EngineManager {
     this.info = null;
   }
 
-  engineInfo(): { vocab: number; eos: number; maxCtx: number } | null {
+  engineInfo(): {
+    vocab: number;
+    eos: number;
+    maxCtx: number;
+    kvEnabled: boolean;
+    kvBlocks: number;
+    kvEntries: number;
+    kvSnapshots: number;
+    kvHits: number;
+    kvColdHits: number;
+    kvRestores: number;
+    kvEvictions: number;
+    kvColdDeletes: number;
+    kvUsedBytes: number;
+    kvRamBudget: number;
+    kvDiskBudget: number;
+    kvColdBytes: number;
+    kvRestoreMs: number;
+  } | null {
     return this.engine ? this.vk.engineInfo(this.engine) : null;
   }
 
@@ -127,17 +148,31 @@ export class EngineManager {
     maxNew: number,
     onDelta: (delta: string) => void,
   ): Promise<ChatResult> {
+    const prompt = buildChatTemplate(messages, system, thinking);
+    const ids = this.tokenize(prompt);
+    return this.complete(ids, sampling, maxNew, onDelta);
+  }
+
+  async complete(
+    ids: Uint32Array,
+    sampling: Sampling,
+    maxNew: number,
+    onDelta: (delta: string) => void,
+  ): Promise<ChatResult> {
     if (!this.engine) throw new Error("no model loaded");
     if (this.busy) throw new Error("generation already in progress");
     this.busy = true;
     const started = Date.now();
     try {
-      const prompt = buildChatTemplate(messages, system, thinking);
-      const ids = this.vk.tokenize(this.engine, prompt, false);
-      const tokens = await this.vk.generate(this.engine, ids, { ...sampling, maxNew }, (ev: any) => {
+      const result = await this.vk.generate(this.engine, ids, { ...sampling, maxNew }, (ev: any) => {
         if (ev.delta) onDelta(ev.delta);
       });
-      return { tokens, elapsedMs: Date.now() - started };
+      return {
+        tokens: Number(result?.tokens ?? 0),
+        elapsedMs: Date.now() - started,
+        finishReason: result?.finishReason === "length" ? "length" : "stop",
+        cachedTokens: Number(result?.cachedTokens ?? 0),
+      };
     } finally {
       this.busy = false;
     }
