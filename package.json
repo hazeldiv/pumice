@@ -1,6 +1,6 @@
 {
   "name": "@h4zel/pumice",
-  "version": "1.0.1",
+  "version": "0.1.0",
   "description": "Vulkan LLM inference engine with a local web UI",
   "type": "module",
   "main": "cli.js",
@@ -22,7 +22,7 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@h4zel/pumice-win32-x64": "1.0.1"
+    "@h4zel/pumice-win32-x64": "0.1.0"
   },
   "dependencies": {
     "express": "^4.21.2"

@@ -1,6 +1,6 @@
 {
   "name": "@h4zel/pumice-win32-x64",
-  "version": "1.0.1",
+  "version": "0.1.0",
   "description": "Prebuilt Pumice engine binary for Windows x64",
   "os": [
     "win32"
