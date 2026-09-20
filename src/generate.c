@@ -847,6 +847,9 @@ uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens) {
     int start = (int)g->nextPos;
     int end = start + nTokens;
     int finalAligned = end - (end % KV_BLOCK_TOKENS);
+    int priorAligned = (finalAligned == end && end >= 2 * KV_BLOCK_TOKENS)
+                           ? end - KV_BLOCK_TOKENS
+                           : finalAligned;
     int done = start;
     int lastCur = 0;
     while (done < end) {
@@ -856,6 +859,7 @@ uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens) {
             int stop = end;
             int next = ((done / g->boundaryInterval) + 1) * g->boundaryInterval;
             if (next < stop) stop = next;
+            if (priorAligned > done && priorAligned < stop) stop = priorAligned;
             if (finalAligned > done && finalAligned < stop) stop = finalAligned;
             if (done + cur > stop) cur = stop - done;
         }
@@ -967,7 +971,7 @@ uint32_t runPrefill(generator* g, const uint32_t* tokens, int nTokens) {
         done += cur;
         lastCur = cur;
         if (g->boundaryHook != NULL && g->boundaryInterval > 0 &&
-            ((done % g->boundaryInterval) == 0 || done == finalAligned)) {
+            ((done % g->boundaryInterval) == 0 || done == priorAligned || done == finalAligned)) {
             g->boundaryHook(g->boundaryHookCtx, done);
         }
     }

@@ -18,15 +18,23 @@ function check(name, ok, detail = "") {
   if (!ok) failures++;
 }
 
-function openEngine(storeDir, kvRamBudget, kvDiskBudget) {
+function openWith(storeDir, overrides = {}) {
   return addon.createEngine({
     weights: path.join(root, "model", "Qwen3.5-2B"),
     maxCtx: 8192,
     prune: true,
     kvStoreDir: storeDir,
+    kvRamBudget: 512 * 1024 * 1024,
+    kvDiskBudget: 1024 * 1024 * 1024,
+    exportModel: false,
+    ...overrides,
+  });
+}
+
+function openEngine(storeDir, kvRamBudget, kvDiskBudget) {
+  return openWith(storeDir, {
     kvRamBudget: kvRamBudget ?? 512 * 1024 * 1024,
     kvDiskBudget: kvDiskBudget ?? 1024 * 1024 * 1024,
-    exportModel: false,
   });
 }
 
@@ -203,9 +211,73 @@ async function main() {
 
   e = await openEngine(interStore);
   const a2b = await genFull(e, turnA, 8);
-  check("snapshots survive restart", a2b.result.cachedTokens === a2.result.cachedTokens && eq(a2b.out, a2.out),
+  check("snapshots survive restart",
+    a2b.result.cachedTokens >= a2.result.cachedTokens && a2b.result.cachedTokens > 0 && eq(a2b.out, a2.out),
     `before=${a2.result.cachedTokens} after=${a2b.result.cachedTokens}`);
   addon.destroyEngine(e);
+
+  const switchStore = path.join(store, "switch");
+  e = await openWith(switchStore);
+  const switchIds = Array.from(addon.tokenize(e, text, false)).slice(0, 800);
+  await genFull(e, switchIds, 8);
+  const aEntries = addon.engineInfo(e).kvEntries;
+  addon.destroyEngine(e);
+
+  e = await openWith(switchStore, {
+    weights: path.join(root, "model", "Qwen3.5-2B-1.6gb.hqm"),
+    prune: false,
+  });
+  const bIds = Array.from(addon.tokenize(e, text, false)).slice(0, 800);
+  await genFull(e, bIds, 8);
+  addon.destroyEngine(e);
+
+  const stores = fs.readdirSync(switchStore).filter((d) => fs.statSync(path.join(switchStore, d)).isDirectory());
+  check("model fingerprints isolated", stores.length === 2, `stores=${stores.length}`);
+
+  e = await openWith(switchStore);
+  const a2c = await genFull(e, switchIds, 8);
+  check("A cache survives B", a2c.result.cachedTokens > 0 && addon.engineInfo(e).kvEntries >= aEntries,
+    `cached=${a2c.result.cachedTokens} entries=${addon.engineInfo(e).kvEntries} before=${aEntries}`);
+  addon.destroyEngine(e);
+
+  const ctxStore = path.join(store, "ctx");
+  e = await openWith(ctxStore, { maxCtx: 2048 });
+  const ctxIds = Array.from(addon.tokenize(e, text, false)).slice(0, 1500);
+  await genFull(e, ctxIds, 8);
+  addon.destroyEngine(e);
+
+  e = await openWith(ctxStore, { maxCtx: 8192 });
+  const ctx2 = await genFull(e, ctxIds, 8);
+  check("larger maxCtx reload restores", ctx2.result.cachedTokens > 0,
+    `cached=${ctx2.result.cachedTokens}`);
+  addon.destroyEngine(e);
+
+  const crcStore = path.join(store, "crc");
+  e = await openWith(crcStore);
+  const crcIds = Array.from(addon.tokenize(e, text, false)).slice(0, 800);
+  await genFull(e, crcIds, 8);
+  addon.destroyEngine(e);
+
+  const crcDir = path.join(crcStore, fs.readdirSync(crcStore)[0]);
+  const mirrorPath = path.join(crcDir, "mirror.bin");
+  const fd = fs.openSync(mirrorPath, "r+");
+  const byte = Buffer.alloc(1);
+  fs.readSync(fd, byte, 0, 1, 0);
+  byte[0] ^= 0xff;
+  fs.writeSync(fd, byte, 0, 1, 0);
+  fs.closeSync(fd);
+
+  e = await openWith(crcStore);
+  const crcAfter = await genFull(e, crcIds, 8);
+  addon.destroyEngine(e);
+
+  e = await openWith(path.join(store, "crc-cold"));
+  const crcCold = await genFull(e, crcIds, 8);
+  addon.destroyEngine(e);
+
+  check("corrupt mirror slot falls back to prefill",
+    eq(crcAfter.out, crcCold.out) && crcAfter.result.cachedTokens === 0,
+    `cached=${crcAfter.result.cachedTokens} out=[${crcAfter.out.slice(0, 6)}]`);
 
   console.log(failures === 0 ? "\nALL TESTS PASSED" : `\n${failures} TEST(S) FAILED`);
   fs.rmSync(store, { recursive: true, force: true });

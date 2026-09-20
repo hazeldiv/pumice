@@ -1596,6 +1596,29 @@ A separate `--debug-sampling` flag (`generatorDumpSamplingDebug`) reads back the
     (~45 MB on the 35B, more on wider models). It is now pointer-based and released alongside the large
     weights, and the three loaders register at the storage site (`&w.router[L]`, etc.).
 
+61. **A mirror slot that is not CRC-checked silently restores torn data.** `mirror.bin` is written
+    slot-by-slot at turn end; a crash mid-flush leaves the last slot half-written, and a lazy loader would
+    hand the stale bytes to the unstripe shader as if they were valid KV. `kvCommitBlock` / `kvAdmit` now
+    compute a CRC32 of the slot (`slotCrc`) into `kv_entry.crc`, `persistIndex` stores it, and `kvPlan`
+    validates each matched RAM slot (`slotValid`): on mismatch it frees the slot, drops to the cold copy if
+    one exists, and otherwise truncates the match so the turn falls back to a full prefill. The index
+    version was bumped to 3 so pre-CRC stores are discarded rather than mis-trusted.
+
+62. **A snapshot at `pos == promptLen` is unreachable for the same prompt.** `kvPlan` caps the resume point
+    at `promptLen - 1` (there must be at least one token left to prefill and produce logits), so when the
+    prompt length is an exact multiple of 16 the only prompt-end snapshot (`pos == promptLen`) is filtered
+    out and a same-prompt replay restores nothing. `runPrefill` now also snapshots at
+    `promptLen - 16` in that case, so a block-aligned prompt resumes one block short and re-prefills the
+    last block. The `pos == promptLen` snapshot is still kept for the usual case where the next turn is
+    longer.
+
+63. **A cold-only entry was never mirrored into RAM.** The inclusive-RAM rule says every VRAM-resident
+    block also has a RAM copy, but a block streamed back from `cold.bin` (not admitted, `freq < 2`) has
+    `slot == -1`, and `engineFlush` skipped it because it was already in the index. The next turn then
+    re-read it from disk forever. `engineFlush` now skips only blocks that are *RAM-resident*
+    (`kvBlockResident`), so any cold-only block used by the session is restriped into a RAM slot at turn
+    end. Cost is bounded: only the first turn after a cold restore mirrors anything.
+
 
 ---
 
@@ -2201,9 +2224,11 @@ every request (`engineGenerate` used to call `resetGenerator` unconditionally). 
   This is the authority tier: every resident block has a copy here.
 - **Disk** -- `mirror.bin` is a raw image of the RAM pool (slot `i` at `i x slotBytes`); `cold.bin` is an
   append-only log of blocks demoted from RAM (each record `{key, bytes, crc32, flags}` + slot bytes);
-  `index.bin` persists every entry (`key`, `child`, `coldOffset`, `slot`, `freq`, `lastUse`, `blockIndex`);
-  `snapshots.bin` holds the fp16 GDN anchors. On open the pool is bulk-loaded from `mirror.bin` and the
-  index/cold tiers rebuilt, so a restart is warm.
+  `index.bin` persists every entry (`key`, `child`, `coldOffset`, `slot`, `freq`, `lastUse`, `blockIndex`,
+  `crc`); `snapshots.bin` holds the fp16 GDN anchors. On open the pool is bulk-loaded from `mirror.bin` and
+  the index/cold tiers rebuilt, so a restart is warm. Each RAM slot carries a **CRC32** (gotcha 61) that is
+  validated lazily when the block is matched, so a torn `mirror.bin` slot falls back to cold or prefill
+  instead of restoring corrupt KV.
 - **In-memory index**: one open-addressing table `key -> entry` plus an entry array. Each entry tracks its
   RAM slot and/or cold offset, its chain `child` hash, `freq`, `lastUse` and a `pin` count.
 - **LFRU** (RAM and disk): `freq` is incremented on every match/insert and halved every 64 inserts
@@ -2234,7 +2259,9 @@ restore, not just for the 35B.
   `h[P/16 - 1]`. The final boundary matters for short prompts: a 600-token conversation snapshots at 592
   instead of never, so turn 2 resumes at 592 and re-prefills only the remainder. Splitting changes the
   final chunk's size only; per-token GEMM results are chunk-size independent, so the KV is unchanged
-  (verified: warm == cold in the tests).
+  (verified: warm == cold in the tests). When the prompt length is an exact multiple of 16, a second
+  snapshot is taken one block earlier (`promptLen - 16`), because `pos == promptLen` cannot be used by a
+  same-length replay (gotcha 62).
 - Stored **fp16** for `stateS` and fp32 for `convHist` in a fixed-capacity **LRU table** (`KV_SNAP_MAX` =
   16 entries, lazily allocated so only used entries cost RAM). A store is keyed by `(pos, key)`; if the
   table is full the least-recently-used entry is replaced, and a hit touches `lastUse`. All entries are
@@ -2271,7 +2298,8 @@ restore, not just for the 35B.
 3. install the boundary hook and call `generateTokens(prompt + R, count - R, ...)`; the hook copies GDN
    state into the ring at each 1024 boundary and at the prompt's final 16-boundary;
 4. after generation (EOS, stop, or limit) `engineFlush(e, promptLen)` admits the complete prompt blocks
-   not already indexed via
+   that are not already RAM-resident (`kvBlockResident`, so cold-only blocks get a RAM mirror too --
+   gotcha 63) via
    `generatorKvRestripe` (live cache -> pool) in chunks of 32 (so committed entries are available as
    eviction victims while the same flush is still allocating), then `kvPersist` writes the dirty mirror
    slots, `index.bin`, `snapshots.bin`, enforces the disk budget and compacts if needed. The partial tail
@@ -2303,7 +2331,9 @@ dispatches per run.
   `kvColdDeletes`, `kvUsedBytes`, `kvRamBudget`, `kvDiskBudget`, `kvColdBytes`, `kvRestoreMs`.
 - The RAM pool and the stage ring are metered by `createBufferNamed` alongside the MoE expert pool, so the
   existing host-visible OOM report covers all of them. `engineInfo` also exposes the live totals as
-  `hostVisibleBytes` / `deviceLocalBytes` (see gotcha 59: the counters are decremented on free).
+  `hostVisibleBytes` / `deviceLocalBytes` (see gotcha 59: the counters are decremented on free). `kvOpen`
+  additionally warns before allocating when `kvRamBudget` plus the host memory already in use would exceed
+  the host heap.
 - `VK_COMPUTE_LOG_CACHE=1` makes each restore print `kvcache: restored N tokens (M blocks, T ms)`; the
   `/v1` non-stream responses carry the same value in the `X-Vk-Cache-Cached-Tokens` header and in
   `usage.prompt_tokens_details.cached_tokens`.
@@ -2325,7 +2355,10 @@ the M1 path; a 10 MB pool exercises eviction, cold restore and disk budgets.
 | restart with a populated cold tier | 189 entries, 14.8 MB cold, output matches |
 | 512 KB disk budget | 282 cold deletions, generation still correct |
 | 600-token prompt + 96-token reply, turn 2 | resumes at 592 (prompt end), warm == cold |
-| 3 interleaved 2000-token conversations | 6 snapshots, all resume at 2000; survives restart |
+| 3 interleaved 2000-token conversations | 9 snapshots, all resume; survives restart |
+| model switch A (safetensors) -> B (HQM) -> A | 2 fingerprint dirs, A resumes at 784 |
+| reload with a larger `maxCtx` (2048 -> 8192) | cache preserved, resumes at 1488 |
+| corrupt one `mirror.bin` slot | CRC rejects it, full prefill, output == cold |
 
 **35B-A3B** (`node test_35b.mjs`, `expertsVram=64`, `model/Qwen3.6-35B-A3B-5.8gb.hqm`, 600-token prompt):
 load 68 s, turn 1 generates, turn 2 restores at 592, warm == cold, snapshots survive restart.

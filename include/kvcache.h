@@ -132,6 +132,7 @@ int kvAdmit(kvcache* kv, uint64_t key, int stageSlot);
 void kvUnpin(kvcache* kv, kv_plan* plan);
 void kvPlanFree(kv_plan* plan);
 int kvHasBlock(const kvcache* kv, uint64_t key);
+int kvBlockResident(const kvcache* kv, uint64_t key);
 int kvAllocSlot(kvcache* kv);
 void kvCommitBlock(kvcache* kv, uint64_t key, uint64_t parentKey, uint64_t childKey, int slot, int blockIndex);
 int kvStoreSnapshot(kvcache* kv, const uint64_t* hashes, int pos, const void* data);

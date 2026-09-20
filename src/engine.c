@@ -448,7 +448,7 @@ static void engineFlush(engine* e, int count) {
         int n = 0;
         int full = 0;
         for (int i = b; i < end; i++) {
-            if (kvHasBlock(&e->kv, e->hashes[i])) continue;
+            if (kvBlockResident(&e->kv, e->hashes[i])) continue;
             int slot = kvAllocSlot(&e->kv);
             if (slot < 0) {
                 full = 1;

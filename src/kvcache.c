@@ -8,7 +8,7 @@
 #include "xxhash.h"
 
 #define KV_INDEX_MAGIC 0x4349564Bu
-#define KV_INDEX_VERSION 2u
+#define KV_INDEX_VERSION 3u
 #define KV_COLD_DEAD 1u
 
 typedef struct {
@@ -77,6 +77,29 @@ static uint32_t crc32b(const void* data, size_t n) {
     for (size_t i = 0; i < n; i++) c = g_crcTable[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
     return c ^ 0xFFFFFFFFu;
 }
+
+static uint32_t slotCrc(const kvcache* kv, int slot) {
+    const uint8_t* p = (const uint8_t*)kv->pool.mappedMemory + (int64_t)slot * kv->slotBytes;
+    return crc32b(p, (size_t)kv->slotBytes);
+}
+
+static int slotValid(const kvcache* kv, const kv_entry* e) {
+    if (e->slot < 0 || e->slot >= kv->totalSlots) return 0;
+    return slotCrc(kv, e->slot) == e->crc;
+}
+
+static int64_t hostHeapBytes(VkPhysicalDevice physicalDevice) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &mp);
+    int64_t best = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++) {
+        if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) continue;
+        int64_t size = (int64_t)mp.memoryHeaps[i].size;
+        if (size > best) best = size;
+    }
+    return best;
+}
+
 
 static int ensureDir(const char* path) {
     if (_mkdir(path) == 0) return 1;
@@ -500,6 +523,18 @@ int kvOpen(kvcache* kv, session s, const model_config* spec, const char* root, i
     kv->ramBudget = ramBudget;
     kv->diskBudget = diskBudget;
     kv->totalSlots = ramBudget / kv->slotBytes;
+
+    int64_t hostUsed = 0;
+    int64_t deviceUsed = 0;
+    bufferMemoryTotals(&hostUsed, &deviceUsed);
+    int64_t hostHeap = hostHeapBytes(s.dev.physicalDevice);
+    if (hostHeap > 0 && hostUsed + kv->ramBudget > hostHeap) {
+        fprintf(stderr,
+                "kvcache: warning: kvRamBudget %.0f MB + host pool in use %.0f MB exceeds host heap %.0f MB\n",
+                (double)kv->ramBudget / (1024.0 * 1024.0), (double)hostUsed / (1024.0 * 1024.0),
+                (double)hostHeap / (1024.0 * 1024.0));
+    }
+
     kv->slotState = (uint8_t*)calloc((size_t)kv->totalSlots, 1);
     kv->slotDirty = (uint8_t*)calloc((size_t)kv->totalSlots, 1);
     kv->freeSlots = (int32_t*)malloc(sizeof(int32_t) * (size_t)kv->totalSlots);
@@ -572,12 +607,28 @@ int kvHasBlock(const kvcache* kv, uint64_t key) {
     return tableFind(kv, key) >= 0;
 }
 
+int kvBlockResident(const kvcache* kv, uint64_t key) {
+    int idx = tableFind(kv, key);
+    return idx >= 0 && kv->entries[idx].slot >= 0;
+}
+
 int kvPlan(kvcache* kv, const uint64_t* hashes, int tokenCount, kv_plan* plan) {
     memset(plan, 0, sizeof(*plan));
     plan->snapPos = -1;
     int nb = tokenCount / KV_BLOCK_TOKENS;
     int matched = 0;
-    while (matched < nb && tableFind(kv, hashes[matched]) >= 0) matched++;
+    while (matched < nb) {
+        int idx = tableFind(kv, hashes[matched]);
+        if (idx < 0) break;
+        kv_entry* e = &kv->entries[idx];
+        if (e->slot >= 0 && !slotValid(kv, e)) {
+            freeSlot(kv, e->slot);
+            e->slot = -1;
+            e->crc = 0;
+            if (e->coldOffset < 0) break;
+        }
+        matched++;
+    }
     int maxPos = matched * KV_BLOCK_TOKENS;
     if (maxPos > tokenCount - 1) maxPos = tokenCount - 1;
     for (int b = 0; b < matched; b++) {
@@ -646,6 +697,7 @@ int kvAdmit(kvcache* kv, uint64_t key, int stageSlot) {
         e->coldOffset = -1;
     }
     e->slot = slot;
+    e->crc = slotCrc(kv, slot);
     kv->slotDirty[slot] = 1;
     return 1;
 }
@@ -677,6 +729,7 @@ void kvCommitBlock(kvcache* kv, uint64_t key, uint64_t parentKey, uint64_t child
     e->blockIndex = blockIndex;
     e->lastUse = ++kv->tick;
     e->freq++;
+    e->crc = slotCrc(kv, slot);
     if (childKey != 0) e->child = childKey;
     if (parentKey != 0) {
         int pi = tableFind(kv, parentKey);
