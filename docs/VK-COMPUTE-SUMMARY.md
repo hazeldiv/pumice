@@ -90,11 +90,11 @@ vk-compute/
             package.json  vite.config.ts  tsconfig.json  index.html  .npmignore
             server/index.ts          # Express API: probe/load/unload/chat(SSE)/score(SSE) + static dist
             server/v1.ts             # [OI]-compatible /v1 router (§17)
-            server/chatTemplate.ts   # Qwen chat template (roles, tools, thinking)
-            server/toolParser.ts     # <tool_call> / JSON tool-call parser
+            server/chatTemplate.ts   # Qwen chat template (roles, tools, thinking) + ReasoningSplitter
+            server/toolParser.ts     # <tool_call> / JSON tool-call parser + ToolTagHoldBack
             server/load.ts           # shared resolveInput/buildLoadOptions for /api/load + /v1
             server/paths.ts          # runtime/dist/models/export/pruned-vocab path resolution + chdir
-            server/engine.ts         # EngineManager: wraps the addon, chat template, streaming, scoring
+            server/engine.ts         # EngineManager: addon wrapper, request queue, streaming, scoring
             server/probe.ts          # model probe: safetensors shard/config checks, gguf+hqm meta
             server/types.ts          # shared API types
             src/App.tsx  src/api.ts  src/styles.css
@@ -1619,6 +1619,19 @@ A separate `--debug-sampling` flag (`generatorDumpSamplingDebug`) reads back the
     (`kvBlockResident`), so any cold-only block used by the session is restriped into a RAM slot at turn
     end. Cost is bounded: only the first turn after a cold restore mirrors anything.
 
+64. **Concurrent first requests raced the auto-load.** `/v1` loads a model on demand, and two requests
+    arriving before the load finished both saw `loaded == false` and both called `engine.load` (which
+    unloads, then creates), so they could destroy each other's engine. `ensureModel` now memoizes the
+    in-flight load (`loadInFlight`) and re-checks status after awaiting it, and `EngineManager.load`
+    itself runs through the request queue so a load can never overlap a generation.
+
+65. **An unterminated thinking block was misclassified as content.** With `enable_thinking: true` the
+    prompt ends inside `<think>`, so the model's output is reasoning until it emits `</think>` — but if it
+    hits `max_tokens` first, the closing tag never arrives. The old splitter only produced
+    `reasoning_content` when `</think>` was present, so a truncated thought streamed as answer text. The
+    splitter now takes the `enable_thinking` expectation into account: if reasoning was expected and no
+    `</think>` appears, the whole output is reasoning (and `content` is empty).
+
 
 ---
 
@@ -2438,12 +2451,18 @@ text}]` array, assistant `reasoning_content` / `<think>` splitting, tool-call re
 (`<function=...><parameter=...>`), consecutive `tool` messages grouped under one `<|im_start|>user` with
 `<tool_response>`, and the `enable_thinking` generation prompt. Thinking is **off** by default
 (`<think>\n\n</think>\n\n`); enable it with `enable_thinking: true` or
-`chat_template_kwargs.enable_thinking`. `tool_choice:"none"` drops the tools block.
+`chat_template_kwargs.enable_thinking`. `tool_choice:"none"` drops the tools block; `"required"` or a
+specific `{type:"function",function:{name}}` appends a short instruction to the tools system block.
 
 Responses are parsed by `webui/server/toolParser.ts`, which handles both the XML form
 (`<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`) and the JSON form. Values
 are coerced back to JSON types; the result is emitted as [OI] `tool_calls` with
 `finish_reason:"tool_calls"`.
+
+Reasoning is split out always: `ReasoningSplitter` (`chatTemplate.ts`) routes a leading `<think>…</think>`
+block (or, when `enable_thinking` is set, everything before `</think>`) into `reasoning_content` and the
+rest into `content`, in both streaming (`delta.reasoning_content`) and non-stream
+(`message.reasoning_content`) responses.
 
 ### 17.4 Request/response mapping
 
@@ -2461,14 +2480,21 @@ are coerced back to JSON types; the result is emitted as [OI] `tool_calls` with
   responses also carry it in the `X-Vk-Cache-Cached-Tokens` header, and `stream_options.include_usage`
   adds the final usage-only chunk.
 - A prompt at or over `maxCtx` is rejected before any GPU work with 400 `context_length_exceeded`.
-- With tools the output is buffered (tool XML cannot be streamed as content) and emitted as one
-  `tool_calls` delta; without tools content streams token-by-token. Non-streaming returns the full
-  `message`.
+- Content streams token-by-token even when tools are attached: `ToolTagHoldBack` (`toolParser.ts`) holds
+  back only from a possible `<tool_call` opening tag, so text before the call is delivered live and the
+  call itself is emitted as one `tool_calls` delta. Non-streaming returns the full `message`.
+- Image/video content parts are rejected with 400 (the text stack has no vision tower).
+- Overlapping requests are serialized by a bounded FIFO queue in `EngineManager` (capacity 8) instead of
+  failing; the 9th concurrent request returns 429 `rate_limit_exceeded`. Auto-load is de-duplicated so
+  concurrent first requests share one model load, and loads run through the same queue as generation.
+  Each request carries a `RunHandle`, so a client that disconnects only stops its own run.
+- `--host` / `VK_COMPUTE_HOST` sets the bind address (default `127.0.0.1`).
 
 ### 17.5 Files
 
-`webui/server/v1.ts` (router, stop filter, [OI] serialization), `chatTemplate.ts`, `toolParser.ts`,
-`load.ts` (shared `resolveInput` / `buildLoadOptions`, also used by `/api/load`), mounted in
+`webui/server/v1.ts` (router, stop filter, [OI] serialization), `chatTemplate.ts` (template +
+`ReasoningSplitter`), `toolParser.ts` (parser + `ToolTagHoldBack`), `engine.ts` (request queue +
+`RunHandle`), `load.ts` (shared `resolveInput` / `buildLoadOptions`, also used by `/api/load`), mounted in
 `server/index.ts` as `app.use("/v1", createV1Router(engine))`. `test_v1.mjs` drives it end-to-end.
 
 ### 17.6 Verification
@@ -2477,13 +2503,19 @@ are coerced back to JSON types; the result is emitted as [OI] `tool_calls` with
 
 | Check | Result |
 |---|---|
-| `/v1/models` | lists 5 scanned models |
+| `/v1/models` | lists the scanned models |
 | chat non-stream + usage | `"Hello there!"`, prompt 19 / completion 3 |
 | chat stream == non-stream | byte-identical |
 | `max_tokens:1` | `finish_reason:"length"`, completion_tokens 1 |
 | `stop` sequence | content truncated to the prefix before the stop |
 | tools | `finish_reason:"tool_calls"`, `get_weather{"city":"Paris"}` |
-| tools stream | terminates with `tool_calls` |
+| tools stream | content deltas arrive before the `tool_calls` delta; shape has `index`/`id`/`function` |
+| `tool_choice:"required"` | accepted, `tool_calls` returned |
+| `enable_thinking: true` | `reasoning_content` (233 chars), `content` null; streams as `delta.reasoning_content` |
+| thinking disabled | no `reasoning_content` |
+| image part | 400 "image inputs are not supported" |
+| 2 concurrent requests | both 200 (queued) |
+| 20 concurrent requests | 8 ok, 12 × 429 `rate_limit_exceeded` |
 | `/v1/completions` | `text_completion` object with text |
 | `context_length_exceeded` | 400 with the matching code |
 | unknown model | 404 `model_not_found` |
@@ -2493,3 +2525,25 @@ are coerced back to JSON types; the result is emitted as [OI] `tool_calls` with
 `cached_tokens` depends on the shared prefix being block-aligned: a 19-token prompt whose 16th token is
 the changing `<think>`/reply token correctly caches nothing (the chain hash invalidates it), which is why
 the test uses a long shared system prompt.
+
+### 17.7 opencode
+
+opencode uses the AI SDK's `@ai-sdk/openai-compatible` provider, so it needs nothing beyond the `/v1`
+surface above. Add a custom provider (README has the copy-paste block):
+
+```json
+{
+  "provider": {
+    "vk-compute": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "VK Compute (local)",
+      "options": { "baseURL": "http://127.0.0.1:8787/v1" },
+      "models": { "Qwen3.5-2B-1.6gb.hqm": { "name": "Qwen3.5 2B (local)", "limit": { "context": 32768, "output": 8192 } } }
+    }
+  }
+}
+```
+
+The `models` keys must match `GET /v1/models` ids; `limit.context` should match the `maxCtx` the server
+loads with. With `--api-key`, add `apiKey` to `options`. Tool-calling quality is the model's, not the
+API's — the pruned 2B is a weak tool caller, so a coder-tuned checkpoint is recommended.

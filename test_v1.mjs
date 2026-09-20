@@ -66,6 +66,7 @@ async function chatStream(body) {
   const decoder = new TextDecoder();
   let buffer = "";
   let text = "";
+  let reasoning = "";
   let finish = null;
   const chunks = [];
   for (;;) {
@@ -87,10 +88,11 @@ async function chatStream(body) {
       chunks.push(ev);
       const choice = ev.choices?.[0];
       if (choice?.delta?.content) text += choice.delta.content;
+      if (choice?.delta?.reasoning_content) reasoning += choice.delta.reasoning_content;
       if (choice?.finish_reason) finish = choice.finish_reason;
     }
   }
-  return { status: res.status, text, finish, chunks };
+  return { status: res.status, text, reasoning, finish, chunks };
 }
 
 const chatBody = (content, extra = {}) => ({
@@ -248,6 +250,91 @@ async function main() {
   await hdrRes.json();
   const cacheHeader = hdrRes.headers.get("x-vk-cache-cached-tokens");
   check("cache header present", cacheHeader !== null, `x-vk-cache-cached-tokens=${cacheHeader}`);
+
+  const streamedTool = await chatStream({
+    model: MODEL,
+    messages: [{
+      role: "user",
+      content: "Explain in one short sentence what get_weather does, then call it for Paris.",
+    }],
+    tools,
+    temperature: 0,
+    seed: 1,
+    max_tokens: 256,
+  });
+  const firstContent = streamedTool.chunks.findIndex((c) => c.choices?.[0]?.delta?.content);
+  const firstTool = streamedTool.chunks.findIndex((c) => c.choices?.[0]?.delta?.tool_calls);
+  const streamedCall = firstTool >= 0 ? streamedTool.chunks[firstTool].choices[0].delta.tool_calls[0] : null;
+  check("streamed tool call has content deltas before tool_calls",
+    streamedTool.status === 200 && firstContent >= 0 && firstTool > firstContent,
+    `contentIdx=${firstContent} toolIdx=${firstTool}`);
+  check("streamed tool call shape",
+    streamedCall !== null && streamedCall.index === 0 && typeof streamedCall.id === "string" &&
+      streamedCall.type === "function" && streamedCall.function?.name === "get_weather",
+    `call=${JSON.stringify(streamedCall)}`);
+
+  const forced = await postJson("/v1/chat/completions", {
+    model: MODEL,
+    messages: [{ role: "user", content: "What is the weather in Paris?" }],
+    tools,
+    tool_choice: "required",
+    temperature: 0,
+    seed: 1,
+    max_tokens: 256,
+  });
+  check("tool_choice required accepted",
+    forced.status === 200 && ["tool_calls", "stop", "length"].includes(forced.data?.choices?.[0]?.finish_reason),
+    `finish=${forced.data?.choices?.[0]?.finish_reason}`);
+
+  const thinkBody = {
+    model: MODEL,
+    messages: [{ role: "user", content: "What is 17*23? Think step by step." }],
+    enable_thinking: true,
+    temperature: 0,
+    seed: 1,
+    max_tokens: 64,
+  };
+  const thought = await postJson("/v1/chat/completions", thinkBody);
+  const thoughtMsg = thought.data?.choices?.[0]?.message;
+  check("thinking split into reasoning_content",
+    thought.status === 200 && typeof thoughtMsg?.reasoning_content === "string" &&
+      thoughtMsg.reasoning_content.length > 0 && !String(thoughtMsg?.content ?? "").includes("<think>"),
+    `reasoning=${thoughtMsg?.reasoning_content?.length ?? 0} content=${JSON.stringify(thoughtMsg?.content ?? null).slice(0, 40)}`);
+
+  const thoughtStream = await chatStream(thinkBody);
+  check("thinking streams reasoning_content",
+    thoughtStream.status === 200 && thoughtStream.reasoning.length > 0 && thoughtStream.text.length === 0,
+    `reasoning=${thoughtStream.reasoning.length} content=${thoughtStream.text.length}`);
+
+  const plain = await postJson("/v1/chat/completions", chatBody("Say hello in exactly three words."));
+  check("no reasoning when thinking disabled",
+    plain.status === 200 && !plain.data?.choices?.[0]?.message?.reasoning_content,
+    `reasoning=${plain.data?.choices?.[0]?.message?.reasoning_content ?? null}`);
+
+  const withImage = await postJson("/v1/chat/completions", {
+    model: MODEL,
+    messages: [{ role: "user", content: [{ type: "text", text: "what is this" }, { type: "image_url", image_url: { url: "http://x/y.png" } }] }],
+    max_tokens: 8,
+  });
+  check("image input rejected", withImage.status === 400 &&
+    String(withImage.data?.error?.message ?? "").includes("image"), `status=${withImage.status}`);
+
+  const overlap = await Promise.all([
+    postJson("/v1/chat/completions", chatBody("Say hello in exactly three words.", { max_tokens: 4 })),
+    postJson("/v1/chat/completions", chatBody("Say goodbye in exactly three words.", { max_tokens: 4 })),
+  ]);
+  check("concurrent requests both succeed",
+    overlap.every((r) => r.status === 200), `statuses=${overlap.map((r) => r.status).join(",")}`);
+
+  const flood = await Promise.all(
+    Array.from({ length: 20 }, () => postJson("/v1/chat/completions", chatBody("hi", { max_tokens: 2 }))),
+  );
+  const okCount = flood.filter((r) => r.status === 200).length;
+  const busyCount = flood.filter((r) => r.status === 429 && r.data?.error?.code === "rate_limit_exceeded").length;
+  const other = flood.length - okCount - busyCount;
+  check("queue serializes and rejects overflow",
+    okCount >= 8 && busyCount >= 1 && other === 0,
+    `ok=${okCount} busy=${busyCount} other=${other}`);
 
   const authPort = port + 1;
   const authBase = `http://127.0.0.1:${authPort}`;

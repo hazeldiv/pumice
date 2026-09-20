@@ -67,10 +67,85 @@ function splitReasoning(content: string): { reasoning: string; visible: string }
   return { reasoning: inner.trim(), visible: tail.replace(/^\s+/, "") };
 }
 
-function toolsSystemBlock(tools: ToolDefinition[], systemContent: string): string {
+const THINK_OPEN = "<think>";
+const THINK_CLOSE = "</think>";
+
+export class ReasoningSplitter {
+  private buf = "";
+  private mode: "probe" | "reasoning" | "content" = "probe";
+  private started = false;
+
+  constructor(private expecting: boolean) {}
+
+  private lead(text: string): string {
+    if (this.started) return text;
+    this.started = true;
+    return text.replace(/^\s+/, "");
+  }
+
+  push(delta: string): { reasoning: string; content: string } {
+    if (this.mode === "content") return { reasoning: "", content: delta };
+    this.buf += delta;
+    if (this.mode === "probe") {
+      if (this.buf.startsWith(THINK_OPEN)) {
+        this.buf = this.buf.slice(THINK_OPEN.length);
+        this.mode = "reasoning";
+      } else if (this.expecting) {
+        const idx = this.buf.indexOf(THINK_CLOSE);
+        if (idx < 0) return { reasoning: "", content: "" };
+        const reasoning = this.lead(this.buf.slice(0, idx));
+        const content = this.buf.slice(idx + THINK_CLOSE.length).replace(/^\s+/, "");
+        this.buf = "";
+        this.mode = "content";
+        return { reasoning, content };
+      } else {
+        if (this.buf.length < 8) return { reasoning: "", content: "" };
+        this.mode = "content";
+        const out = this.buf;
+        this.buf = "";
+        return { reasoning: "", content: out };
+      }
+    }
+    const idx = this.buf.indexOf(THINK_CLOSE);
+    if (idx < 0) {
+      const keep = THINK_CLOSE.length - 1;
+      if (this.buf.length <= keep) return { reasoning: "", content: "" };
+      const out = this.lead(this.buf.slice(0, this.buf.length - keep));
+      this.buf = this.buf.slice(this.buf.length - keep);
+      return { reasoning: out, content: "" };
+    }
+    const reasoning = this.lead(this.buf.slice(0, idx));
+    const content = this.buf.slice(idx + THINK_CLOSE.length).replace(/^\s+/, "");
+    this.buf = "";
+    this.mode = "content";
+    return { reasoning, content };
+  }
+
+  flush(): { reasoning: string; content: string } {
+    const rest = this.buf;
+    this.buf = "";
+    if (this.mode === "reasoning") {
+      const idx = rest.indexOf(THINK_CLOSE);
+      if (idx < 0) return { reasoning: this.lead(rest), content: "" };
+      return {
+        reasoning: this.lead(rest.slice(0, idx)),
+        content: rest.slice(idx + THINK_CLOSE.length).replace(/^\s+/, ""),
+      };
+    }
+    if (this.mode === "probe") {
+      if (rest.startsWith(THINK_OPEN)) return { reasoning: this.lead(rest.slice(THINK_OPEN.length)), content: "" };
+      if (this.expecting) return { reasoning: this.lead(rest), content: "" };
+      return { reasoning: "", content: rest };
+    }
+    return { reasoning: "", content: rest };
+  }
+}
+
+function toolsSystemBlock(tools: ToolDefinition[], systemContent: string, toolHint: string): string {
   let out = "<|im_start|>system\n" + TOOL_HEADER + "<tools>";
   for (const tool of tools) out += "\n" + JSON.stringify(tool);
   out += "\n</tools>" + TOOL_FOOTER;
+  if (toolHint) out += "\n\n" + toolHint;
   if (systemContent) out += "\n\n" + systemContent;
   return out + "<|im_end|>\n";
 }
@@ -107,6 +182,7 @@ export function buildQwenPrompt(
   messages: ChatMessageInput[],
   tools: ToolDefinition[],
   enableThinking: boolean,
+  toolHint = "",
 ): string {
   const msgs = messages.filter((m) => m && typeof m.role === "string");
   if (!msgs.length) throw new Error("no messages provided");
@@ -116,7 +192,7 @@ export function buildQwenPrompt(
 
   let out = "";
   if (tools.length > 0) {
-    out += toolsSystemBlock(tools, systemContent);
+    out += toolsSystemBlock(tools, systemContent, toolHint);
   } else if (first.role === "system") {
     out += "<|im_start|>system\n" + systemContent + "<|im_end|>\n";
   }

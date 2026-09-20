@@ -5,6 +5,23 @@ import type { ChatMessage, ProbeInfo, QuantConfig, Sampling } from "./types";
 
 const require = createRequire(import.meta.url);
 
+const QUEUE_CAPACITY = 8;
+
+export interface RunHandle {
+  cancelled: boolean;
+}
+
+export function createRunHandle(): RunHandle {
+  return { cancelled: false };
+}
+
+export class CancelledError extends Error {
+  constructor() {
+    super("request cancelled");
+    this.name = "CancelledError";
+  }
+}
+
 export interface LoadOptions {
   path: string;
   quant: QuantConfig | null;
@@ -51,10 +68,32 @@ export class EngineManager {
   private vk: any;
   private engine: any = null;
   private info: ProbeInfo | null = null;
-  private busy = false;
+  private tail: Promise<unknown> = Promise.resolve();
+  private pending = 0;
+  private active: RunHandle | null = null;
 
   constructor(addonPath: string, private quantTmp: string) {
     this.vk = require(addonPath);
+  }
+
+  private enqueue<T>(handle: RunHandle, fn: () => Promise<T>, force = false): Promise<T> {
+    if (!force && this.pending >= QUEUE_CAPACITY) return Promise.reject(new Error("engine busy"));
+    this.pending++;
+    const execute = async (): Promise<T> => {
+      if (handle.cancelled) throw new CancelledError();
+      this.active = handle;
+      try {
+        return await fn();
+      } finally {
+        if (this.active === handle) this.active = null;
+      }
+    };
+    const run = this.tail.then(execute, execute);
+    const settle = () => {
+      this.pending--;
+    };
+    this.tail = run.then(settle, settle);
+    return run;
   }
 
   status(): { loaded: boolean; info: ProbeInfo | null } {
@@ -62,6 +101,10 @@ export class EngineManager {
   }
 
   async load(opts: LoadOptions, info: ProbeInfo): Promise<void> {
+    await this.enqueue(createRunHandle(), () => this.doLoad(opts, info), true);
+  }
+
+  private async doLoad(opts: LoadOptions, info: ProbeInfo): Promise<void> {
     if (this.engine) this.unload();
     let quantConfig: string | null = null;
     if (opts.quant) {
@@ -114,7 +157,11 @@ export class EngineManager {
     return this.engine ? this.vk.engineInfo(this.engine) : null;
   }
 
-  stopGeneration(): void {
+  stopGeneration(handle?: RunHandle): void {
+    if (handle) {
+      handle.cancelled = true;
+      if (this.active !== handle) return;
+    }
     if (this.engine) this.vk.requestStop(this.engine);
   }
 
@@ -129,15 +176,10 @@ export class EngineManager {
     decode: number,
     chunks: number,
     onProgress: (p: ScoreProgress) => void,
+    handle: RunHandle = createRunHandle(),
   ): Promise<ScoreResult> {
     if (!this.engine) throw new Error("no model loaded");
-    if (this.busy) throw new Error("generation already in progress");
-    this.busy = true;
-    try {
-      return await this.vk.score(this.engine, ids, { prefill, decode, chunks }, onProgress);
-    } finally {
-      this.busy = false;
-    }
+    return this.enqueue(handle, () => this.vk.score(this.engine, ids, { prefill, decode, chunks }, onProgress));
   }
 
   async chat(
@@ -147,10 +189,11 @@ export class EngineManager {
     sampling: Sampling,
     maxNew: number,
     onDelta: (delta: string) => void,
+    handle: RunHandle = createRunHandle(),
   ): Promise<ChatResult> {
     const prompt = buildChatTemplate(messages, system, thinking);
     const ids = this.tokenize(prompt);
-    return this.complete(ids, sampling, maxNew, onDelta);
+    return this.complete(ids, sampling, maxNew, onDelta, handle);
   }
 
   async complete(
@@ -158,12 +201,11 @@ export class EngineManager {
     sampling: Sampling,
     maxNew: number,
     onDelta: (delta: string) => void,
+    handle: RunHandle = createRunHandle(),
   ): Promise<ChatResult> {
     if (!this.engine) throw new Error("no model loaded");
-    if (this.busy) throw new Error("generation already in progress");
-    this.busy = true;
-    const started = Date.now();
-    try {
+    return this.enqueue(handle, async () => {
+      const started = Date.now();
       const result = await this.vk.generate(this.engine, ids, { ...sampling, maxNew }, (ev: any) => {
         if (ev.delta) onDelta(ev.delta);
       });
@@ -173,8 +215,6 @@ export class EngineManager {
         finishReason: result?.finishReason === "length" ? "length" : "stop",
         cachedTokens: Number(result?.cachedTokens ?? 0),
       };
-    } finally {
-      this.busy = false;
-    }
+    });
   }
 }

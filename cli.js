@@ -16,17 +16,19 @@ function usage() {
 Options:
   -p, --port <port>    port to listen on (default 8787)
   -m, --models <dir>   model directory to scan (default ./model)
+      --host <addr>    bind address (default 127.0.0.1, env VK_COMPUTE_HOST)
       --api-key <key>  require Authorization: Bearer <key> on /v1 (env VK_COMPUTE_API_KEY)
       --no-open        do not open the browser
   -h, --help           show this help`);
 }
 
 function parseArgs(argv) {
-  const opts = { port: 8787, models: null, open: true, apiKey: null };
+  const opts = { port: 8787, models: null, open: true, apiKey: null, host: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--port" || arg === "-p") opts.port = Number(argv[++i]);
     else if (arg === "--models" || arg === "-m") opts.models = argv[++i];
+    else if (arg === "--host") opts.host = argv[++i];
     else if (arg === "--api-key") opts.apiKey = argv[++i];
     else if (arg === "--no-open") opts.open = false;
     else if (arg === "--help" || arg === "-h") {
@@ -68,6 +70,7 @@ process.env.VK_COMPUTE_EXPORT_DIR = path.join(launchCwd, "exported");
 process.env.VK_COMPUTE_QUANT_TMP = path.join(os.tmpdir(), `vk-compute-quant-${process.pid}.json`);
 process.env.VK_COMPUTE_OPEN = opts.open ? "1" : "0";
 if (opts.apiKey) process.env.VK_COMPUTE_API_KEY = opts.apiKey;
+if (opts.host) process.env.VK_COMPUTE_HOST = opts.host;
 process.env.PORT = String(opts.port);
 
 const server = path.join(home, "webui", "dist-server", "index.mjs");
@@ -82,6 +85,6 @@ if (!fs.existsSync(path.join(runtimeDir, "vk_compute.node"))) {
 
 console.log(`vk-compute: models  ${modelsDir}`);
 console.log(`vk-compute: runtime ${runtimeDir}`);
-console.log(`vk-compute: api     http://127.0.0.1:${opts.port}/v1`);
+console.log(`vk-compute: api     http://${opts.host ?? "127.0.0.1"}:${opts.port}/v1`);
 
 await import(pathToFileURL(server).href);

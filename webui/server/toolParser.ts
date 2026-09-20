@@ -53,6 +53,38 @@ function parseJsonBlock(inner: string): { name: string; args: Record<string, unk
 
 let callSeq = 0;
 
+const TOOL_OPEN = "<tool_call";
+
+export class ToolTagHoldBack {
+  private buf = "";
+  private holding = false;
+
+  push(delta: string): string {
+    if (this.holding) return "";
+    this.buf += delta;
+    const idx = this.buf.indexOf(TOOL_OPEN);
+    if (idx >= 0) {
+      this.holding = true;
+      const out = this.buf.slice(0, idx);
+      this.buf = "";
+      return out;
+    }
+    const keep = TOOL_OPEN.length - 1;
+    if (this.buf.length > keep) {
+      const out = this.buf.slice(0, this.buf.length - keep);
+      this.buf = this.buf.slice(this.buf.length - keep);
+      return out;
+    }
+    return "";
+  }
+
+  flush(): string {
+    const out = this.buf;
+    this.buf = "";
+    return out;
+  }
+}
+
 export function parseToolCalls(text: string): { content: string; toolCalls: ParsedToolCall[] } {
   const toolCalls: ParsedToolCall[] = [];
   const re = /<tool_call>([\s\S]*?)<\/tool_call>/g;

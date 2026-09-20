@@ -2,7 +2,7 @@ import express from "express";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { EngineManager } from "./engine";
+import { EngineManager, createRunHandle } from "./engine";
 import { buildLoadOptions, resolveInput } from "./load";
 import { addonPath, distDir, modelRoot, quantTmp } from "./paths";
 import { probeModel, scanModels } from "./probe";
@@ -105,9 +105,10 @@ app.post("/api/score", async (req, res) => {
   res.flushHeaders?.();
 
   let closed = false;
+  const scoreHandle = createRunHandle();
   res.on("close", () => {
     closed = true;
-    engine.stopGeneration();
+    engine.stopGeneration(scoreHandle);
   });
   res.on("error", () => { closed = true; });
   const send = (event: unknown) => {
@@ -133,7 +134,7 @@ app.post("/api/score", async (req, res) => {
 
   const started = Date.now();
   try {
-    const result = await engine.score(ids, prefill, decode, chunks, (p) => send({ progress: p }));
+    const result = await engine.score(ids, prefill, decode, chunks, (p) => send({ progress: p }), scoreHandle);
     send({ done: true, ...result, chunks, tokens: ids.length, elapsedMs: Date.now() - started });
   } catch (e) {
     send({ error: String((e as Error)?.message ?? e) });
@@ -170,9 +171,10 @@ app.post("/api/chat", async (req, res) => {
   res.flushHeaders?.();
 
   let closed = false;
+  const chatHandle = createRunHandle();
   res.on("close", () => {
     closed = true;
-    engine.stopGeneration();
+    engine.stopGeneration(chatHandle);
   });
   res.on("error", () => { closed = true; });
   const send = (event: unknown) => {
@@ -192,6 +194,7 @@ app.post("/api/chat", async (req, res) => {
       sampling,
       maxNew,
       (delta) => send({ delta }),
+      chatHandle,
     );
     send({ done: true, ...result });
   } catch (e) {
@@ -209,6 +212,7 @@ if (fs.existsSync(distDir)) {
 }
 
 const port = Number(process.env.PORT ?? 8787);
+const host = process.env.VK_COMPUTE_HOST ?? "127.0.0.1";
 process.on("uncaughtException", (e) => console.error("uncaught:", e));
 process.on("unhandledRejection", (e) => console.error("unhandled:", e));
 
@@ -223,8 +227,8 @@ function openBrowser(url: string): void {
   } catch {}
 }
 
-app.listen(port, "127.0.0.1", () => {
-  const url = `http://127.0.0.1:${port}`;
+app.listen(port, host, () => {
+  const url = `http://${host}:${port}`;
   console.log(`vk-compute webui server on ${url}`);
   console.log(`vk-compute [OI] api on ${url}/v1`);
   if (!fs.existsSync(addonPath)) {

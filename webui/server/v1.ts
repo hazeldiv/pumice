@@ -1,12 +1,18 @@
 ﻿import { Router, type Request, type Response } from "express";
 import crypto from "node:crypto";
 import path from "node:path";
-import { EngineManager } from "./engine";
+import { EngineManager, CancelledError, createRunHandle } from "./engine";
 import { buildLoadOptions } from "./load";
 import { modelRoot } from "./paths";
 import { probeModel, scanModels } from "./probe";
-import { buildQwenPrompt, type ChatMessageInput, type ToolDefinition } from "./chatTemplate";
-import { parseToolCalls, type ParsedToolCall } from "./toolParser";
+import {
+  buildQwenPrompt,
+  ReasoningSplitter,
+  type ChatMessageInput,
+  type MessageContent,
+  type ToolDefinition,
+} from "./chatTemplate";
+import { parseToolCalls, ToolTagHoldBack, type ParsedToolCall } from "./toolParser";
 import type { ProbeInfo, Sampling } from "./types";
 
 const DEFAULT_MAX_TOKENS = 4096;
@@ -18,6 +24,28 @@ interface ResolvedModel {
 
 function apiError(res: Response, status: number, message: string, code: string | null = null): void {
   res.status(status).json({ error: { message, type: "invalid_request_error", param: null, code } });
+}
+
+function hasUnsupportedParts(messages: ChatMessageInput[]): boolean {
+  for (const message of messages) {
+    const content = message?.content as MessageContent;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      const type = (part as { type?: string })?.type;
+      if (type === "image" || type === "image_url" || type === "input_image" || type === "video") return true;
+    }
+  }
+  return false;
+}
+
+function buildToolHint(choice: unknown, tools: ToolDefinition[]): string {
+  if (tools.length === 0) return "";
+  if (choice === "required") return "You must call one of the available functions.";
+  if (choice !== null && typeof choice === "object") {
+    const name = (choice as { function?: { name?: string } }).function?.name;
+    if (name) return `You must call the function ${name}.`;
+  }
+  return "";
 }
 
 function num(value: unknown, fallback: number): number {
@@ -94,6 +122,8 @@ function matchesLoaded(info: ProbeInfo, requested: string): boolean {
   return candidates.includes(req) || candidates.includes(short);
 }
 
+let loadInFlight: Promise<void> | null = null;
+
 async function ensureModel(engine: EngineManager, requested?: string): Promise<ResolvedModel | null> {
   const status = engine.status();
   if (status.loaded && status.info) {
@@ -119,11 +149,19 @@ async function ensureModel(engine: EngineManager, requested?: string): Promise<R
     return { id: status.info.name, info: status.info };
   }
 
+  if (loadInFlight) {
+    await loadInFlight;
+    return ensureModel(engine, requested);
+  }
+
   const info = probeModel(target.path);
   if (!info.ok) {
     throw new Error(`model '${target.label}' failed validation: ${info.errors.join("; ")}`);
   }
-  await engine.load(buildLoadOptions(target.path, info, {}), info);
+  loadInFlight = engine.load(buildLoadOptions(target.path, info, {}), info).finally(() => {
+    loadInFlight = null;
+  });
+  await loadInFlight;
   return { id: info.name, info };
 }
 
@@ -191,6 +229,10 @@ export function createV1Router(engine: EngineManager): Router {
       apiError(res, 400, "messages is required");
       return;
     }
+    if (hasUnsupportedParts(messages)) {
+      apiError(res, 400, "image inputs are not supported by this model");
+      return;
+    }
 
     let resolved: ResolvedModel | null;
     try {
@@ -206,12 +248,13 @@ export function createV1Router(engine: EngineManager): Router {
 
     const tools: ToolDefinition[] = Array.isArray(body.tools) ? body.tools : [];
     const useTools = tools.length > 0 && body.tool_choice !== "none";
+    const toolHint = useTools ? buildToolHint(body.tool_choice, tools) : "";
     const kwargs = body.chat_template_kwargs ?? {};
     const enableThinking = Boolean(body.enable_thinking ?? kwargs.enable_thinking ?? false);
 
     let ids: Uint32Array;
     try {
-      ids = engine.tokenize(buildQwenPrompt(messages, useTools ? tools : [], enableThinking));
+      ids = engine.tokenize(buildQwenPrompt(messages, useTools ? tools : [], enableThinking, toolHint));
     } catch (e) {
       apiError(res, 400, String((e as Error)?.message ?? e));
       return;
@@ -233,6 +276,7 @@ export function createV1Router(engine: EngineManager): Router {
     const id = newId("chatcmpl-");
     const created = Math.floor(Date.now() / 1000);
     const modelId = resolved.id;
+    const handle = createRunHandle();
 
     let send: (chunk: unknown) => void = () => {};
     let sentRole = false;
@@ -245,7 +289,7 @@ export function createV1Router(engine: EngineManager): Router {
       res.flushHeaders?.();
       res.on("close", () => {
         clientClosed = true;
-        engine.stopGeneration();
+        engine.stopGeneration(handle);
       });
       send = (chunk: unknown) => {
         if (clientClosed || res.writableEnded) return;
@@ -259,16 +303,52 @@ export function createV1Router(engine: EngineManager): Router {
       sentRole = true;
       send({ ...base(), choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] });
     };
-    const sendContent = (text: string) => {
+    const emitReasoning = (text: string) => {
+      if (!text || !streaming) return;
+      ensureRole();
+      send({ ...base(), choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }] });
+    };
+    const emitContent = (text: string) => {
       if (!text || !streaming) return;
       ensureRole();
       send({ ...base(), choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
     };
 
     const filter = new StopFilter(stops);
-    let buffered = "";
-    const bufferedMode = !streaming || useTools;
+    const splitter = new ReasoningSplitter(enableThinking);
+    const holdBack = new ToolTagHoldBack();
+    let raw = "";
+    let reasoningText = "";
+    let contentText = "";
     let stopped = false;
+
+    const process = (text: string) => {
+      if (!text) return;
+      raw += text;
+      const split = splitter.push(text);
+      reasoningText += split.reasoning;
+      const held = useTools ? holdBack.push(split.content) : split.content;
+      contentText += held;
+      if (!streaming) return;
+      emitReasoning(split.reasoning);
+      emitContent(held);
+    };
+
+    const finish = () => {
+      const split = splitter.flush();
+      reasoningText += split.reasoning;
+      const held = useTools ? holdBack.push(split.content) : split.content;
+      contentText += held;
+      if (streaming) {
+        emitReasoning(split.reasoning);
+        emitContent(held);
+      }
+      if (useTools) {
+        const tail = holdBack.flush();
+        contentText += tail;
+        if (streaming) emitContent(tail);
+      }
+    };
 
     try {
       const result = await engine.complete(ids, sampling, maxNew, (delta) => {
@@ -276,30 +356,24 @@ export function createV1Router(engine: EngineManager): Router {
         const step = filter.push(delta);
         if (step.stop) {
           stopped = true;
-          engine.stopGeneration();
+          engine.stopGeneration(handle);
         }
-        if (bufferedMode) buffered += step.text;
-        else sendContent(step.text);
-      });
+        process(step.text);
+      }, handle);
 
-      if (!stopped) {
-        const tail = filter.flush();
-        if (bufferedMode) buffered += tail;
-        else sendContent(tail);
-      }
+      if (!stopped) process(filter.flush());
+      finish();
 
-      let content = buffered;
       let toolCalls: ParsedToolCall[] = [];
-      if (useTools) {
-        const parsed = parseToolCalls(buffered);
-        content = parsed.content;
-        toolCalls = parsed.toolCalls;
-      }
+      if (useTools) toolCalls = parseToolCalls(raw).toolCalls;
+      const reasoning = reasoningText;
+      const visible = contentText;
       const finishReason = toolCalls.length > 0 ? "tool_calls" : result.finishReason;
       const usage = buildUsage(ids.length, result.tokens, result.cachedTokens);
 
       if (!streaming) {
-        const message: Record<string, unknown> = { role: "assistant", content: content.length ? content : null };
+        const message: Record<string, unknown> = { role: "assistant", content: visible.length ? visible : null };
+        if (reasoning) message.reasoning_content = reasoning;
         if (toolCalls.length) message.tool_calls = toolCalls;
         res.setHeader("X-Vk-Cache-Cached-Tokens", String(usage.prompt_tokens_details.cached_tokens));
         res.json({
@@ -314,7 +388,6 @@ export function createV1Router(engine: EngineManager): Router {
       }
 
       ensureRole();
-      if (content) sendContent(content);
       if (toolCalls.length) {
         send({
           ...base(),
@@ -337,14 +410,18 @@ export function createV1Router(engine: EngineManager): Router {
       send("[DONE]");
       res.end();
     } catch (e) {
+      if (e instanceof CancelledError) {
+        if (streaming && !res.writableEnded) res.end();
+        return;
+      }
       const message = String((e as Error)?.message ?? e);
       if (streaming) {
         send({ error: { message, type: "server_error", code: null } });
         send("[DONE]");
         if (!res.writableEnded) res.end();
       } else {
-        const status = message.includes("in progress") ? 429 : 500;
-        apiError(res, status, message, message.includes("in progress") ? "rate_limit_exceeded" : null);
+        const busy = message.includes("engine busy");
+        apiError(res, busy ? 429 : 500, message, busy ? "rate_limit_exceeded" : null);
       }
     }
   });
@@ -393,6 +470,7 @@ export function createV1Router(engine: EngineManager): Router {
     const id = newId("cmpl-");
     const created = Math.floor(Date.now() / 1000);
     const modelId = resolved.id;
+    const handle = createRunHandle();
 
     let send: (chunk: unknown) => void = () => {};
     let clientClosed = false;
@@ -403,7 +481,7 @@ export function createV1Router(engine: EngineManager): Router {
       res.flushHeaders?.();
       res.on("close", () => {
         clientClosed = true;
-        engine.stopGeneration();
+        engine.stopGeneration(handle);
       });
       send = (chunk: unknown) => {
         if (clientClosed || res.writableEnded) return;
@@ -421,14 +499,14 @@ export function createV1Router(engine: EngineManager): Router {
         const step = filter.push(delta);
         if (step.stop) {
           stopped = true;
-          engine.stopGeneration();
+          engine.stopGeneration(handle);
         }
         if (streaming) {
           if (step.text) send({ id, object: "text_completion", created, model: modelId, choices: [{ text: step.text, index: 0, logprobs: null, finish_reason: null }] });
         } else {
           text += step.text;
         }
-      });
+      }, handle);
 
       if (!stopped) {
         const tail = filter.flush();
@@ -457,14 +535,18 @@ export function createV1Router(engine: EngineManager): Router {
       send("[DONE]");
       res.end();
     } catch (e) {
+      if (e instanceof CancelledError) {
+        if (streaming && !res.writableEnded) res.end();
+        return;
+      }
       const message = String((e as Error)?.message ?? e);
       if (streaming) {
         send({ error: { message, type: "server_error", code: null } });
         send("[DONE]");
         if (!res.writableEnded) res.end();
       } else {
-        const status = message.includes("in progress") ? 429 : 500;
-        apiError(res, status, message, message.includes("in progress") ? "rate_limit_exceeded" : null);
+        const busy = message.includes("engine busy");
+        apiError(res, busy ? 429 : 500, message, busy ? "rate_limit_exceeded" : null);
       }
     }
   });

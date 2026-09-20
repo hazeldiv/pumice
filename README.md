@@ -35,6 +35,7 @@ The UI opens automatically at `http://127.0.0.1:8787`.
 | -------------------- | ------------------------------------------- |
 | `-p, --port <port>`  | port to listen on (default 8787)            |
 | `-m, --models <dir>` | model directory to scan (default `./model`) |
+| `--host <addr>`      | bind address (default `127.0.0.1`)          |
 | `--api-key <key>`    | require `Authorization: Bearer <key>` on `/v1` (or set `VK_COMPUTE_API_KEY`) |
 | `--no-open`          | do not open the browser                     |
 
@@ -43,7 +44,7 @@ The UI opens automatically at `http://127.0.0.1:8787`.
 The same server exposes an [OI]-compatible API on `/v1`, so an agent harness (opencode and friends) can use it directly. Point the harness at `http://127.0.0.1:8787/v1`, set the model to any id from `GET /v1/models`, and the model auto-loads on the first request.
 
 - `GET /v1/models`
-- `POST /v1/chat/completions` — streaming and non-streaming, `tools` / tool calls, `usage`
+- `POST /v1/chat/completions` — streaming and non-streaming, `tools` / tool calls, `reasoning_content`, `usage`
 - `POST /v1/completions` — legacy text completion
 
 ```bash
@@ -52,7 +53,32 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"Qwen3.5-2B-1.6gb.hqm","messages":[{"role":"user","content":"Say hi in three words."}],"max_tokens":32}'
 ```
 
-A growing conversation resumes from the KV cache instead of re-prefilling, so multi-turn agents stay fast.
+A growing conversation resumes from the KV cache instead of re-prefilling, so multi-turn agents stay fast. Overlapping requests are queued (up to 8) rather than rejected, so parallel agent tasks (titles, summaries) work; beyond that the server returns 429.
+
+#### opencode
+
+Add a custom provider to `opencode.json` (the model id must match `GET /v1/models`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "vk-compute": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "VK Compute (local)",
+      "options": { "baseURL": "http://127.0.0.1:8787/v1" },
+      "models": {
+        "Qwen3.5-2B-1.6gb.hqm": {
+          "name": "Qwen3.5 2B (local)",
+          "limit": { "context": 32768, "output": 8192 }
+        }
+      }
+    }
+  }
+}
+```
+
+Set `limit.context` to the `maxCtx` you load with. If the server was started with `--api-key`, add `"apiKey"` to `options`. Tool calling depends on the model — a coder-tuned checkpoint calls tools far more reliably than the pruned 2B.
 
 ### Model tab
 
