@@ -929,6 +929,10 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     }
 
     w.layerBufs = (buffer*)calloc((size_t)d->layerCount * 13, sizeof(buffer));
+    if (w.layerBufs == NULL) {
+        bufferAllocFail("out of host memory: weight layer table");
+        return w;
+    }
     w.gammaIn = w.layerBufs + 0 * d->layerCount;
     w.gammaF = w.layerBufs + 1 * d->layerCount;
     w.qNorm = w.layerBufs + 2 * d->layerCount;
@@ -938,6 +942,10 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     w.dtBias = w.layerBufs + 6 * d->layerCount;
     w.attnNorm = w.layerBufs + 7 * d->layerCount;
     w.tensorBufs = (tensor*)calloc((size_t)d->layerCount * 5, sizeof(tensor));
+    if (w.tensorBufs == NULL) {
+        bufferAllocFail("out of host memory: weight tensor table");
+        return w;
+    }
     w.proj = w.tensorBufs + 0 * d->layerCount;
     w.out = w.tensorBufs + 1 * d->layerCount;
     w.gate = w.tensorBufs + 2 * d->layerCount;
@@ -953,10 +961,14 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     }
     if (isMoe) {
         w.poolBufs = (expert_pool*)calloc((size_t)d->layerCount * 2, sizeof(expert_pool));
-        w.guPool = w.poolBufs + 0 * d->layerCount;
-        w.dnPool = w.poolBufs + 1 * d->layerCount;
         w.router = (buffer*)calloc((size_t)d->layerCount, sizeof(buffer));
         w.sharedGate = (buffer*)calloc((size_t)d->layerCount, sizeof(buffer));
+        if (w.poolBufs == NULL || w.router == NULL || w.sharedGate == NULL) {
+            bufferAllocFail("out of host memory: expert pool table");
+            return w;
+        }
+        w.guPool = w.poolBufs + 0 * d->layerCount;
+        w.dnPool = w.poolBufs + 1 * d->layerCount;
     }
 
     const char* embedCands[2];
@@ -1175,22 +1187,24 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
 }
 
 void destroyWeights(session s, model_weights* w) {
-    for (int L = 0; L < w->layerCount; L++) {
-        destroyTensor(s, &w->proj[L]);
-        destroyTensor(s, &w->out[L]);
-        destroyTensor(s, &w->gate[L]);
-        destroyTensor(s, &w->up[L]);
-        destroyTensor(s, &w->down[L]);
-        destroyBuffer(s.dev.device, w->gammaIn[L]);
-        destroyBuffer(s.dev.device, w->gammaF[L]);
-        if (w->qNorm[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->qNorm[L]);
-        if (w->kNorm[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->kNorm[L]);
-        if (w->conv[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->conv[L]);
-        if (w->aLog[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->aLog[L]);
-        if (w->dtBias[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->dtBias[L]);
-        if (w->attnNorm[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->attnNorm[L]);
+    if (w->layerBufs != NULL && w->tensorBufs != NULL) {
+        for (int L = 0; L < w->layerCount; L++) {
+            destroyTensor(s, &w->proj[L]);
+            destroyTensor(s, &w->out[L]);
+            destroyTensor(s, &w->gate[L]);
+            destroyTensor(s, &w->up[L]);
+            destroyTensor(s, &w->down[L]);
+            destroyBuffer(s.dev.device, w->gammaIn[L]);
+            destroyBuffer(s.dev.device, w->gammaF[L]);
+            if (w->qNorm[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->qNorm[L]);
+            if (w->kNorm[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->kNorm[L]);
+            if (w->conv[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->conv[L]);
+            if (w->aLog[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->aLog[L]);
+            if (w->dtBias[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->dtBias[L]);
+            if (w->attnNorm[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, w->attnNorm[L]);
+        }
     }
-    if (w->poolBufs != NULL) {
+    if (w->poolBufs != NULL && w->router != NULL && w->sharedGate != NULL) {
         for (int L = 0; L < w->layerCount; L++) {
             destroyExpertPool(s, &w->guPool[L]);
             destroyExpertPool(s, &w->dnPool[L]);

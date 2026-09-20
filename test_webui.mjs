@@ -74,6 +74,7 @@ async function main() {
     server = spawn(process.execPath, [tsxCli, "server/index.ts"], {
       cwd: webui,
       stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, PUMICE_MODELS: path.join(root, "model") },
     });
     const log = fs.createWriteStream(path.join(os.tmpdir(), "pumice-webui-test-server.log"));
     server.stdout.pipe(log);
@@ -91,6 +92,24 @@ async function main() {
   const models = await fetch(`${base}/api/models`).then((r) => r.json());
   check("model scan", Array.isArray(models.models) && models.models.length > 0,
     `${models.models.length} entries`);
+
+  const rescan = await post("/api/models", { dir: path.join(root, "model") });
+  check("rescan folder", rescan.data?.models?.length === models.models.length,
+    `${rescan.data?.models?.length} entries`);
+
+  const badDir = await post("/api/models", { dir: path.join(root, "missing-models") });
+  check("missing folder rejected", badDir.status === 400, `status=${badDir.status}`);
+
+  const openFolder = await post("/api/open", { path: path.join(root, "model") });
+  check("open folder", openFolder.data?.kind === "folder" && openFolder.data?.models?.length > 0,
+    `kind=${openFolder.data?.kind} models=${openFolder.data?.models?.length}`);
+
+  const openModel = await post("/api/open", { path: path.join(root, "model", "Qwen3.5-2B-1.6gb.hqm") });
+  check("open model path", openModel.data?.kind === "model" && openModel.data?.info?.ok === true,
+    `kind=${openModel.data?.kind}`);
+
+  const openMissing = await post("/api/open", { path: path.join(root, "missing-model") });
+  check("open missing path rejected", openMissing.status === 400, `status=${openMissing.status}`);
 
   for (const [name, target, kind] of [
     ["probe hqm", "model/Qwen3.5-2B-1.6gb.hqm", "hqm"],
@@ -140,6 +159,22 @@ async function main() {
 
   const stProbe = await post("/api/probe", { path: "model/Qwen3.5-2B" });
   check("probe 2B safetensors", stProbe.data?.ok === true, `layers=${stProbe.data?.layers}`);
+
+  const oom = await post("/api/load", {
+    path: "model/Qwen3.5-2B",
+    maxCtx: 32768,
+    prefillChunk: 262144,
+    prune: true,
+    exportModel: false,
+    embed: stProbe.data.embed,
+    lmHead: stProbe.data.lmHead,
+    layers: stProbe.data.attnQuants.map((attn, i) => ({ attn, ffn: stProbe.data.ffnQuants[i] })),
+  });
+  check("oom load rejected", oom.status === 500 && /out of (host|GPU) memory/i.test(oom.data?.error ?? ""),
+    `status=${oom.status} error=${oom.data?.error}`);
+
+  const aliveAfterOom = await fetch(`${base}/api/status`).then((r) => r.ok).catch(() => false);
+  check("server alive after oom", aliveAfterOom === true);
 
   const stLoad = await post("/api/load", {
     path: "model/Qwen3.5-2B",

@@ -6,6 +6,18 @@ export interface ModelEntry {
   kind: string;
 }
 
+export interface ModelScan {
+  models: ModelEntry[];
+  dir: string | null;
+}
+
+export interface OpenResult {
+  kind: "folder" | "model";
+  models?: ModelEntry[];
+  dir?: string | null;
+  info?: ProbeInfo;
+}
+
 export interface LoadPayload {
   path: string;
   maxCtx: number;
@@ -28,10 +40,27 @@ async function json<T>(res: Response): Promise<T> {
   return data as T;
 }
 
-export async function listModels(): Promise<ModelEntry[]> {
+export async function listModels(): Promise<ModelScan> {
   const res = await fetch("/api/models");
-  const data = await json<{ models: ModelEntry[] }>(res);
-  return data.models;
+  return json<ModelScan>(res);
+}
+
+export async function scanModels(dir: string): Promise<ModelScan> {
+  const res = await fetch("/api/models", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dir }),
+  });
+  return json<ModelScan>(res);
+}
+
+export async function openPath(path: string): Promise<OpenResult> {
+  const res = await fetch("/api/open", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  return json<OpenResult>(res);
 }
 
 export async function probeModel(path: string): Promise<ProbeInfo> {

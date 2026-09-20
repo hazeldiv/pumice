@@ -556,6 +556,12 @@ int kvOpen(kvcache* kv, session s, const model_config* spec, const char* root, i
     kv->pool = createBufferNamed(s.dev.device, s.dev.physicalDevice, zeros, kv->ramBudget, MEMORY_RAM, "kvPool");
     kv->device = s.dev.device;
     free(zeros);
+    if (kv->pool.buffer == VK_NULL_HANDLE) {
+        free(kv->slotState);
+        free(kv->slotDirty);
+        free(kv->freeSlots);
+        return 0;
+    }
 
     kv->stageSlots = KV_STAGE_SLOTS;
     uint8_t* stageZeros = (uint8_t*)calloc(1, (size_t)kv->slotBytes * (size_t)kv->stageSlots);
@@ -563,6 +569,13 @@ int kvOpen(kvcache* kv, session s, const model_config* spec, const char* root, i
     kv->stage = createBufferNamed(s.dev.device, s.dev.physicalDevice, stageZeros,
                                   kv->slotBytes * kv->stageSlots, MEMORY_RAM, "kvStage");
     free(stageZeros);
+    if (kv->stage.buffer == VK_NULL_HANDLE) {
+        destroyBuffer(s.dev.device, kv->pool);
+        free(kv->slotState);
+        free(kv->slotDirty);
+        free(kv->freeSlots);
+        return 0;
+    }
 
     kv->cold = fopen(kv->coldPath, "r+b");
     if (kv->cold == NULL) kv->cold = fopen(kv->coldPath, "w+b");

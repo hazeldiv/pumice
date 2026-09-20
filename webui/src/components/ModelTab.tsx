@@ -27,9 +27,8 @@ interface Props {
   status: string;
   loading: boolean;
   loaded: boolean;
-  onRefresh: () => void;
+  onOpen: (target: string) => void;
   onSelect: (path: string) => void;
-  onProbe: (path: string) => void;
   onForm: (patch: Partial<ModelForm>) => void;
   onLayers: (layers: LayerRow[]) => void;
   onLoad: () => void;
@@ -46,20 +45,21 @@ export function ModelTab(props: Props) {
   return (
     <div className="model">
       <div className="row">
-        <select value={form.path} onChange={(e) => props.onSelect(e.target.value)}>
-          <option value="">select model...</option>
-          {models.map((m) => (
-            <option key={m.path} value={m.path}>{m.label}</option>
-          ))}
-        </select>
-        <button className="secondary" onClick={props.onRefresh}>Refresh</button>
-      </div>
-      <div className="row">
-        <input className="grow" type="text" placeholder="model path" value={form.path}
+        <input className="grow" type="text" placeholder="models folder or model path" value={form.path}
           onChange={(e) => props.onForm({ path: e.target.value })}
-          onBlur={(e) => props.onProbe(e.target.value)} />
-        <button className="secondary" onClick={() => props.onProbe(form.path)}>Validate</button>
+          onKeyDown={(e) => { if (e.key === "Enter") props.onOpen(form.path); }} />
+        <button className="secondary" onClick={() => props.onOpen(form.path)}>Scan</button>
       </div>
+      {models.length > 0 && (
+        <div className="row">
+          <select value={form.path} onChange={(e) => props.onSelect(e.target.value)}>
+            <option value="">select model...</option>
+            {models.map((m) => (
+              <option key={m.path} value={m.path}>{m.label}</option>
+            ))}
+          </select>
+        </div>
+      )}
 
       {info && (
         <div className={info.ok ? "note ok" : "note error"}>
@@ -155,8 +155,8 @@ export function ModelTab(props: Props) {
         <button onClick={props.onLoad} disabled={loading || !form.path}>
           {loading ? "Loading..." : "Load / Export HQM"}
         </button>
-        <button className="secondary" onClick={props.onUnload} disabled={!loaded}>Unload</button>
-        <span className={loaded ? "note ok" : "muted"}>{loaded ? "loaded" : "not loaded"}</span>
+        {loaded && <button className="secondary" onClick={props.onUnload}>Unload</button>}
+        {loaded && <span className="note ok">loaded</span>}
       </div>
       <div className="status">{status}</div>
     </div>

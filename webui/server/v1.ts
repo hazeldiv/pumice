@@ -2,9 +2,9 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { EngineManager, CancelledError, createRunHandle } from "./engine";
-import { buildLoadOptions } from "./load";
-import { modelRoot } from "./paths";
-import { probeModel, scanModels } from "./probe";
+import { buildLoadOptions, resolveInput } from "./load";
+import { scannedModels } from "./models";
+import { modelKind, probeModel } from "./probe";
 import {
   buildQwenPrompt,
   ReasoningSplitter,
@@ -112,6 +112,7 @@ class StopFilter {
 }
 
 function matchesLoaded(info: ProbeInfo, requested: string): boolean {
+  if (path.resolve(info.path) === path.resolve(requested)) return true;
   const req = requested.toLowerCase();
   const short = req.includes("/") ? req.slice(req.lastIndexOf("/") + 1) : req;
   const candidates = [
@@ -124,6 +125,22 @@ function matchesLoaded(info: ProbeInfo, requested: string): boolean {
 
 let loadInFlight: Promise<void> | null = null;
 
+async function loadTarget(engine: EngineManager, target: string, info: ProbeInfo): Promise<ResolvedModel> {
+  const status = engine.status();
+  if (status.loaded && status.info && path.resolve(status.info.path) === path.resolve(target)) {
+    return { id: status.info.name, info: status.info };
+  }
+  if (loadInFlight) {
+    await loadInFlight;
+    return loadTarget(engine, target, info);
+  }
+  loadInFlight = engine.load(buildLoadOptions(target, info, {}), info).finally(() => {
+    loadInFlight = null;
+  });
+  await loadInFlight;
+  return { id: info.name, info };
+}
+
 async function ensureModel(engine: EngineManager, requested?: string): Promise<ResolvedModel | null> {
   const status = engine.status();
   if (status.loaded && status.info) {
@@ -132,7 +149,7 @@ async function ensureModel(engine: EngineManager, requested?: string): Promise<R
     }
   }
 
-  const models = scanModels(modelRoot);
+  const models = scannedModels();
   const req = requested?.toLowerCase();
   const short = req?.includes("/") ? req.slice(req.lastIndexOf("/") + 1) : req;
   const target = requested
@@ -143,26 +160,23 @@ async function ensureModel(engine: EngineManager, requested?: string): Promise<R
         path.basename(m.path).toLowerCase() === req ||
         path.basename(m.path).toLowerCase() === short)
     : models[0];
-  if (!target) return null;
 
-  if (status.loaded && status.info && path.resolve(status.info.path) === path.resolve(target.path)) {
-    return { id: status.info.name, info: status.info };
-  }
-
-  if (loadInFlight) {
-    await loadInFlight;
-    return ensureModel(engine, requested);
+  if (!target) {
+    if (!requested) return null;
+    const resolved = resolveInput(requested);
+    if (modelKind(resolved) === "unknown") return null;
+    const info = probeModel(resolved);
+    if (!info.ok) {
+      throw new Error(`model '${requested}' failed validation: ${info.errors.join("; ")}`);
+    }
+    return loadTarget(engine, resolved, info);
   }
 
   const info = probeModel(target.path);
   if (!info.ok) {
     throw new Error(`model '${target.label}' failed validation: ${info.errors.join("; ")}`);
   }
-  loadInFlight = engine.load(buildLoadOptions(target.path, info, {}), info).finally(() => {
-    loadInFlight = null;
-  });
-  await loadInFlight;
-  return { id: info.name, info };
+  return loadTarget(engine, target.path, info);
 }
 
 function buildSampling(body: any): Sampling {
@@ -210,7 +224,7 @@ export function createV1Router(engine: EngineManager): Router {
   router.use(auth);
 
   router.get("/models", (_req, res) => {
-    const models = scanModels(modelRoot);
+    const models = scannedModels();
     const data = models.map((m) => ({ id: m.label, object: "model", created: 0, owned_by: "pumice" }));
     const loaded = engine.status();
     if (loaded.loaded && loaded.info) {

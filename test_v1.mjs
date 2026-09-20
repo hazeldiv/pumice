@@ -106,7 +106,7 @@ const chatBody = (content, extra = {}) => ({
 
 async function main() {
   if (!(await waitForServer(base, 1000).catch(() => false))) {
-    server = startServer({ PORT: String(port) });
+    server = startServer({ PORT: String(port), PUMICE_MODELS: path.join(root, "model") });
     if (!(await waitForServer(base))) {
       check("server startup", false);
       process.exit(1);
@@ -336,9 +336,18 @@ async function main() {
     okCount >= 8 && busyCount >= 1 && other === 0,
     `ok=${okCount} busy=${busyCount} other=${other}`);
 
+  const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "pumice-empty-"));
+  await postJson("/api/models", { dir: emptyDir });
+  await postJson("/api/unload", {});
+  const byPath = await postJson("/v1/chat/completions",
+    chatBody("Say hello in exactly three words.", { model: path.join(root, "model", MODEL) }));
+  const byPathText = byPath.data?.choices?.[0]?.message?.content ?? "";
+  check("path model id auto-loads", byPath.status === 200 && byPathText.length > 0,
+    `status=${byPath.status} content=${JSON.stringify(byPathText)}`);
+
   const authPort = port + 1;
   const authBase = `http://127.0.0.1:${authPort}`;
-  const authServer = startServer({ PORT: String(authPort), PUMICE_API_KEY: "secret" });
+  const authServer = startServer({ PORT: String(authPort), PUMICE_API_KEY: "secret", PUMICE_MODELS: path.join(root, "model") });
   try {
     if (await waitForServer(authBase)) {
       const noKey = await fetch(`${authBase}/v1/models`);

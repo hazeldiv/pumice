@@ -19,31 +19,58 @@ static uint32_t findMemoryType(VkPhysicalDevice physicalDevice, VkMemoryRequirem
 static int64_t g_deviceLocalBytes = 0;
 static int64_t g_hostVisibleBytes = 0;
 
+static int g_allocFailed = 0;
+static char g_allocError[256] = {0};
+
+void bufferAllocClear(void) {
+    g_allocFailed = 0;
+    g_allocError[0] = '\0';
+}
+
+int bufferAllocFailed(void) {
+    return g_allocFailed;
+}
+
+const char* bufferAllocError(void) {
+    return g_allocError;
+}
+
+void bufferAllocFail(const char* message) {
+    if (g_allocFailed) return;
+    g_allocFailed = 1;
+    snprintf(g_allocError, sizeof(g_allocError), "%s", message);
+}
+
 void bufferMemoryTotals(int64_t* deviceLocal, int64_t* hostVisible) {
     if (deviceLocal != NULL) *deviceLocal = g_deviceLocalBytes;
     if (hostVisible != NULL) *hostVisible = g_hostVisibleBytes;
 }
 
-static void allocateBufferMemory(VkDevice device, VkPhysicalDevice physicalDevice, VkBuffer buffer, VkMemoryRequirements memReqs, VkMemoryPropertyFlags properties, VkDeviceMemory* memory, const char* name) {
+static int allocateBufferMemory(VkDevice device, VkPhysicalDevice physicalDevice, VkBuffer buffer, VkMemoryRequirements memReqs, VkMemoryPropertyFlags properties, VkDeviceMemory* memory, const char* name) {
+    int isDev = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
     uint32_t memoryTypeIndex = findMemoryType(physicalDevice, memReqs, properties);
     if (memoryTypeIndex == UINT32_MAX) {
-        fprintf(stderr, "Error: Failed to find suitable memory type!\n");
-        exit(EXIT_FAILURE);
+        char msg[256];
+        snprintf(msg, sizeof(msg), "out of %s memory: no suitable memory type for '%s' (%.2f MB)",
+                 isDev ? "GPU" : "host", name ? name : "(unnamed)",
+                 (double)memReqs.size / (1024.0 * 1024.0));
+        bufferAllocFail(msg);
+        return -1;
     }
     VkMemoryAllocateInfo allocInfo = {0};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocInfo.allocationSize = memReqs.size;
     allocInfo.memoryTypeIndex = memoryTypeIndex;
     if (vkAllocateMemory(device, &allocInfo, NULL, memory) != VK_SUCCESS) {
-        int isDev = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
-        fprintf(stderr,
-                "OOM: vkAllocateMemory failed for '%s' (%s, %.2f MB) | device_local=%.2f MB host_visible=%.2f MB\n",
-                name ? name : "(unnamed)",
-                isDev ? "DEVICE_LOCAL" : "HOST_VISIBLE",
-                (double)memReqs.size / (1024.0 * 1024.0),
-                (double)g_deviceLocalBytes / (1024.0 * 1024.0),
-                (double)g_hostVisibleBytes / (1024.0 * 1024.0));
-        exit(EXIT_FAILURE);
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "out of %s memory: failed to allocate '%s' (%.2f MB) | device_local=%.2f MB host_visible=%.2f MB",
+                 isDev ? "GPU" : "host", name ? name : "(unnamed)",
+                 (double)memReqs.size / (1024.0 * 1024.0),
+                 (double)g_deviceLocalBytes / (1024.0 * 1024.0),
+                 (double)g_hostVisibleBytes / (1024.0 * 1024.0));
+        bufferAllocFail(msg);
+        return -1;
     }
     vkBindBufferMemory(device, buffer, *memory, 0);
     if (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
@@ -51,6 +78,7 @@ static void allocateBufferMemory(VkDevice device, VkPhysicalDevice physicalDevic
     } else if (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
         g_hostVisibleBytes += memReqs.size;
     }
+    return 0;
 }
 
 buffer createBuffer(VkDevice device, VkPhysicalDevice physicalDevice, void* data, int64_t size, int memoryType) {
@@ -64,18 +92,33 @@ buffer createBufferNamed(VkDevice device, VkPhysicalDevice physicalDevice, void*
     if (name) {
         snprintf(buf.name, sizeof(buf.name), "%s", name);
     }
+    if (g_allocFailed) return buf;
+    if (data == NULL && size > 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "out of host memory: could not stage '%s' (%.2f MB)",
+                 name ? name : "(unnamed)", (double)size / (1024.0 * 1024.0));
+        bufferAllocFail(msg);
+        return buf;
+    }
 
     VkBufferCreateInfo bufferInfo = {0};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = size;
     bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    vkCreateBuffer(device, &bufferInfo, NULL, &buf.buffer);
+    if (vkCreateBuffer(device, &bufferInfo, NULL, &buf.buffer) != VK_SUCCESS) {
+        bufferAllocFail("out of GPU memory: vkCreateBuffer failed");
+        return buf;
+    }
     vkGetBufferMemoryRequirements(device, buf.buffer, &buf.memReqs);
 
     if (memoryType == MEMORY_RAM) {
-        allocateBufferMemory(device, physicalDevice, buf.buffer, buf.memReqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &buf.memory, name);
-        void* mappedMemory;
+        if (allocateBufferMemory(device, physicalDevice, buf.buffer, buf.memReqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &buf.memory, name) != 0) {
+            vkDestroyBuffer(device, buf.buffer, NULL);
+            buf.buffer = VK_NULL_HANDLE;
+            return buf;
+        }
+        void* mappedMemory = NULL;
         vkMapMemory(device, buf.memory, 0, size, 0, &mappedMemory);
         memcpy(mappedMemory, data, size);
         buf.mappedMemory = mappedMemory;
@@ -85,16 +128,35 @@ buffer createBufferNamed(VkDevice device, VkPhysicalDevice physicalDevice, void*
         stagingInfo.size = size;
         stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         stagingInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        vkCreateBuffer(device, &stagingInfo, NULL, &buf.stagingBuffer);
+        if (vkCreateBuffer(device, &stagingInfo, NULL, &buf.stagingBuffer) != VK_SUCCESS) {
+            vkDestroyBuffer(device, buf.buffer, NULL);
+            buf.buffer = VK_NULL_HANDLE;
+            bufferAllocFail("out of GPU memory: vkCreateBuffer failed");
+            return buf;
+        }
         VkMemoryRequirements stagingMemReqs;
         vkGetBufferMemoryRequirements(device, buf.stagingBuffer, &stagingMemReqs);
-        allocateBufferMemory(device, physicalDevice, buf.stagingBuffer, stagingMemReqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &buf.stagingMemory, name);
-        void* mappedMemory;
+        if (allocateBufferMemory(device, physicalDevice, buf.stagingBuffer, stagingMemReqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &buf.stagingMemory, name) != 0) {
+            vkDestroyBuffer(device, buf.stagingBuffer, NULL);
+            vkDestroyBuffer(device, buf.buffer, NULL);
+            buf.stagingBuffer = VK_NULL_HANDLE;
+            buf.buffer = VK_NULL_HANDLE;
+            return buf;
+        }
+        void* mappedMemory = NULL;
         vkMapMemory(device, buf.stagingMemory, 0, size, 0, &mappedMemory);
         memcpy(mappedMemory, data, size);
         vkUnmapMemory(device, buf.stagingMemory);
 
-        allocateBufferMemory(device, physicalDevice, buf.buffer, buf.memReqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &buf.memory, name);
+        if (allocateBufferMemory(device, physicalDevice, buf.buffer, buf.memReqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &buf.memory, name) != 0) {
+            vkDestroyBuffer(device, buf.stagingBuffer, NULL);
+            vkFreeMemory(device, buf.stagingMemory, NULL);
+            vkDestroyBuffer(device, buf.buffer, NULL);
+            buf.stagingBuffer = VK_NULL_HANDLE;
+            buf.stagingMemory = VK_NULL_HANDLE;
+            buf.buffer = VK_NULL_HANDLE;
+            return buf;
+        }
     }
 
     return buf;

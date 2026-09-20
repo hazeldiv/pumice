@@ -14,18 +14,16 @@ Requires **Windows x64**, **Node.js 18+**, and a Vulkan-capable GPU with a curre
 npm install -g @h4zel/pumice
 ```
 
-Models live in a folder you own — the command scans `./model` and `./pruned-vocab` relative to where you run it:
+Models are not scanned automatically. In the **Model** tab, type either a folder or a model path into the single field and press **Scan**:
 
-```
-my-models/
-   model/          # safetensors dirs, .gguf, or .hqm files
-   pruned-vocab/   # mapping.npy + pruned tokenizer
-```
+- a folder is scanned one level deep for safetensors directories and `.gguf`/`.hqm` files, which then appear in a dropdown;
+- a model path (a safetensors/GGUF/HQM directory or file) is opened directly.
+
+The last path is remembered in the browser. `pruned-vocab/` is read from `./pruned-vocab` relative to where you run `pumice` (override with `PUMICE_PRUNED_VOCAB_DIR`).
 
 ## Usage
 
 ```bash
-cd my-models
 pumice
 ```
 
@@ -34,7 +32,7 @@ The UI opens automatically at `http://127.0.0.1:8787`.
 | Option               | Description                                 |
 | -------------------- | ------------------------------------------- |
 | `-p, --port <port>`  | port to listen on (default 8787)            |
-| `-m, --models <dir>` | model directory to scan (default `./model`) |
+| `-m, --models <dir>` | scan this models folder at startup (or set `PUMICE_MODELS`) |
 | `--host <addr>`      | bind address (default `127.0.0.1`)          |
 | `--api-key <key>`    | require `Authorization: Bearer <key>` on `/v1` (or set `PUMICE_API_KEY`) |
 | `--no-open`          | do not open the browser                     |
@@ -82,10 +80,11 @@ Set `limit.context` to the `maxCtx` you load with. If the server was started wit
 
 ### Model tab
 
-- Pick a model from the dropdown (scanned from your models folder) or type a path, then probe it — the engine validates safetensors shard/config consistency, and reads GGUF/HQM metadata.
+- Type a models folder or a model path into the single field and press **Scan**; a folder lists its models in a dropdown, a model path is opened directly — the engine validates safetensors shard/config consistency, and reads GGUF/HQM metadata.
 - The **Quantization** accordion sets a per-layer `attn`/`ffn` FP16/INT8/INT4 mix (with "set all" presets), plus embed/LM-head quant and, for MoE models, how many experts stay in VRAM. Quantization is baked in for `.hqm` files, so the editor locks.
 - **Max context** (bounded by the model's `max_position_embeddings`) and **prefill chunk** size.
 - **Prune vocab** bootstraps a fresh model dir (gathers the pruned vocab from the shards); **Export HQM** writes a single-file quantized copy for fast reloads.
+- If a load does not fit, the engine reports `out of GPU memory` / `out of host memory` in the status line instead of crashing; lower **Max context**, **Prefill chunk**, or the experts-in-VRAM count and try again.
 
 ### Sampling tab
 

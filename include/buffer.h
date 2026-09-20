@@ -19,6 +19,10 @@ typedef struct buffer {
 
 buffer createBuffer(VkDevice device, VkPhysicalDevice physicalDevice, void* data, int64_t size, int memoryType);
 buffer createBufferNamed(VkDevice device, VkPhysicalDevice physicalDevice, void* data, int64_t size, int memoryType, const char* name);
+int bufferAllocFailed(void);
+const char* bufferAllocError(void);
+void bufferAllocClear(void);
+void bufferAllocFail(const char* message);
 void createTransferAndCopy(VkDevice device, VkQueue queue, buffer* buffers, int bufferCount);
 void readBuffer(VkDevice device, VkPhysicalDevice physicalDevice, VkQueue queue, buffer buf, void* output);
 void writeStaging(VkDevice device, buffer* buf, const void* data, int64_t size);

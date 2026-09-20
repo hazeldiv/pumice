@@ -15,7 +15,7 @@ function usage() {
 
 Options:
   -p, --port <port>    port to listen on (default 8787)
-  -m, --models <dir>   model directory to scan (default ./model)
+  -m, --models <dir>   models directory to scan (env PUMICE_MODELS)
       --host <addr>    bind address (default 127.0.0.1, env PUMICE_HOST)
       --api-key <key>  require Authorization: Bearer <key> on /v1 (env PUMICE_API_KEY)
       --no-open        do not open the browser
@@ -60,11 +60,11 @@ function resolveRuntime() {
 
 const opts = parseArgs(process.argv.slice(2));
 const runtimeDir = resolveRuntime();
-const modelsDir = opts.models ? path.resolve(launchCwd, opts.models) : path.join(launchCwd, "model");
+const modelsDir = opts.models ? path.resolve(launchCwd, opts.models) : null;
 
 process.env.PUMICE_RUNTIME = runtimeDir;
 process.env.PUMICE_CWD = launchCwd;
-process.env.PUMICE_MODELS = modelsDir;
+process.env.PUMICE_MODELS = modelsDir ?? "";
 process.env.PUMICE_PRUNED_VOCAB_DIR = path.join(launchCwd, "pruned-vocab");
 process.env.PUMICE_EXPORT_DIR = path.join(launchCwd, "exported");
 process.env.PUMICE_QUANT_TMP = path.join(os.tmpdir(), `pumice-quant-${process.pid}.json`);
@@ -83,7 +83,7 @@ if (!fs.existsSync(path.join(runtimeDir, "pumice.node"))) {
   process.exit(1);
 }
 
-console.log(`pumice: models  ${modelsDir}`);
+if (modelsDir) console.log(`pumice: models  ${modelsDir}`);
 console.log(`pumice: runtime ${runtimeDir}`);
 console.log(`pumice: api     http://${opts.host ?? "127.0.0.1"}:${opts.port}/v1`);
 

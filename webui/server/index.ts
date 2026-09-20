@@ -4,8 +4,9 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { EngineManager, createRunHandle } from "./engine";
 import { buildLoadOptions, resolveInput } from "./load";
-import { addonPath, distDir, modelRoot, quantTmp } from "./paths";
-import { probeModel, scanModels } from "./probe";
+import { lastScanDir, scanDirectory, scannedModels } from "./models";
+import { addonPath, distDir, quantTmp } from "./paths";
+import { probeModel } from "./probe";
 import { createV1Router } from "./v1";
 import type { ChatMessage, Sampling } from "./types";
 
@@ -19,7 +20,46 @@ app.get("/api/status", (_req, res) => {
 });
 
 app.get("/api/models", (_req, res) => {
-  res.json({ models: scanModels(modelRoot) });
+  res.json({ models: scannedModels(), dir: lastScanDir() });
+});
+
+app.post("/api/models", (req, res) => {
+  const dir = String(req.body?.dir ?? "").trim();
+  if (!dir) {
+    res.status(400).json({ error: "directory is required" });
+    return;
+  }
+  try {
+    res.json({ models: scanDirectory(dir), dir: lastScanDir() });
+  } catch (e) {
+    res.status(400).json({ error: String((e as Error)?.message ?? e) });
+  }
+});
+
+app.post("/api/open", (req, res) => {
+  const raw = String(req.body?.path ?? "").trim();
+  if (!raw) {
+    res.status(400).json({ error: "path is required" });
+    return;
+  }
+  const target = resolveInput(raw);
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(target);
+  } catch {
+    res.status(400).json({ error: `path not found: ${target}` });
+    return;
+  }
+  const isModelDir = stat.isDirectory() && fs.existsSync(path.join(target, "config.json"));
+  if (stat.isDirectory() && !isModelDir) {
+    try {
+      res.json({ kind: "folder", models: scanDirectory(target), dir: lastScanDir() });
+    } catch (e) {
+      res.status(400).json({ error: String((e as Error)?.message ?? e) });
+    }
+    return;
+  }
+  res.json({ kind: "model", info: probeModel(target) });
 });
 
 app.post("/api/probe", (req, res) => {

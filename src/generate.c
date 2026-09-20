@@ -656,8 +656,17 @@ generator* createGenerator(session s, const model_config* spec, const char* weig
     setShaderRootDir(spec->shaderDir);
     pipelineSetSpecInt(0, spec->dims.K);
     g.w = createWeights(s, spec, weightDir, verboseWeights);
+    if (bufferAllocFailed()) {
+        destroyWeights(s, &g.w);
+        return NULL;
+    }
     g.vocab = g.w.vocab;
     g.st = createState(s, spec, g.maxM, g.vocab, verboseWeights);
+    if (bufferAllocFailed()) {
+        destroyState(s, &g.st);
+        destroyWeights(s, &g.w);
+        return NULL;
+    }
     g.groupOpCount = compileDecodeGroup(&g, g.groupOps, 1);
     g.groupOpCountShort = compileDecodeGroup(&g, g.groupOpsShort, 0);
     g.prefillOpCount = compilePrefill(&g, g.maxM, 0, g.maxM);

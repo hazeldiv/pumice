@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { chatStream, listModels, loadModel, probeModel, unloadModel, type ModelEntry } from "./api";
+import { chatStream, loadModel, openPath, unloadModel, type ModelEntry } from "./api";
 import type { ChatMessage, LayerRow, ProbeInfo, Quant } from "../server/types";
 import { ModelTab, type ModelForm } from "./components/ModelTab";
 import { SamplingTab, type SamplingState } from "./components/SamplingTab";
@@ -7,6 +7,7 @@ import { ChatTab } from "./components/ChatTab";
 import { ScoreTab } from "./components/ScoreTab";
 
 type Tab = "model" | "sampling" | "chat" | "eval";
+const TARGET_KEY = "pumice-model-target";
 const DEFAULT_FORM: ModelForm = {
   path: "",
   maxCtx: 32768,
@@ -56,18 +57,6 @@ export default function App() {
   const [chatStatus, setChatStatus] = useState("");
   const abortRef = useRef<AbortController | null>(null);
 
-  const refreshModels = async () => {
-    try {
-      setModels(await listModels());
-    } catch (e) {
-      setStatus(String(e));
-    }
-  };
-
-  useEffect(() => {
-    refreshModels();
-  }, []);
-
   const applyInfo = (p: ProbeInfo) => {
     setInfo(p);
     setLayers(
@@ -90,22 +79,31 @@ export default function App() {
     setSampling((s) => ({ ...s, maxCtx: p.maxCtx, maxNew: Math.min(s.maxNew, p.maxCtx) }));
   };
 
-  const probe = async (path: string) => {
-    if (!path) return;
-    setStatus("validating...");
+  const open = async (target: string) => {
+    const value = target.trim();
+    if (!value) return;
+    setStatus("opening...");
     try {
-      const p = await probeModel(path);
-      applyInfo(p);
-      setStatus(p.ok ? "valid" : "validation failed");
+      const result = await openPath(value);
+      setForm((f) => ({ ...f, path: value }));
+      if (result.kind === "model" && result.info) {
+        applyInfo(result.info);
+        setStatus(result.info.ok ? "valid" : "validation failed");
+      } else {
+        const found = result.models ?? [];
+        setModels(found);
+        setStatus(`found ${found.length} model${found.length === 1 ? "" : "s"}`);
+      }
+      localStorage.setItem(TARGET_KEY, value);
     } catch (e) {
       setStatus(String(e));
     }
   };
 
-  const selectModel = async (path: string) => {
-    setForm((f) => ({ ...f, path }));
-    await probe(path);
-  };
+  useEffect(() => {
+    const saved = localStorage.getItem(TARGET_KEY);
+    if (saved) open(saved);
+  }, []);
 
   const updateForm = (patch: Partial<ModelForm>) => setForm((f) => ({ ...f, ...patch }));
 
@@ -220,9 +218,8 @@ export default function App() {
             status={status}
             loading={loading}
             loaded={loaded}
-            onRefresh={refreshModels}
-            onSelect={selectModel}
-            onProbe={probe}
+            onOpen={open}
+            onSelect={open}
             onForm={updateForm}
             onLayers={setLayers}
             onLoad={load}

@@ -19,6 +19,10 @@ model_state createState(session s, const model_config* spec, int maxM, int vocab
     int mn = maxM * d->K;
 
     st.layerBufs = (buffer*)calloc((size_t)d->layerCount * 8, sizeof(buffer));
+    if (st.layerBufs == NULL) {
+        bufferAllocFail("out of host memory: state buffer table");
+        return st;
+    }
     st.kCache = st.layerBufs + 0 * d->layerCount;
     st.vCache = st.layerBufs + 1 * d->layerCount;
     st.kScale = st.layerBufs + 2 * d->layerCount;
@@ -180,7 +184,7 @@ void destroyState(session s, model_state* st) {
     destroyBuffer(s.dev.device, st->zProj);
     destroyBuffer(s.dev.device, st->aProj);
     destroyBuffer(s.dev.device, st->bProj);
-    for (int L = 0; L < st->layerCount; L++) {
+    for (int L = 0; L < st->layerCount && st->layerBufs != NULL; L++) {
         if (st->kCache[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, st->kCache[L]);
         if (st->vCache[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, st->vCache[L]);
         if (st->kScale[L].buffer != VK_NULL_HANDLE) destroyBuffer(s.dev.device, st->kScale[L]);

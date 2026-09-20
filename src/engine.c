@@ -310,8 +310,17 @@ engine* engineOpen(const engine_options* opts, char* err, size_t errCap) {
     weightsSetExport(opts->exportModel ? 1 : 0);
     if (opts->expertsVram > 0) e->spec.expertsVram = opts->expertsVram;
 
+    bufferAllocClear();
     e->s = createSession();
     e->g = createGenerator(e->s, &e->spec, opts->weights, 0);
+    if (e->g == NULL) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "%s", bufferAllocError());
+        destroySession(e->s);
+        free(e);
+        setError(err, errCap, msg[0] ? msg : "failed to allocate model memory");
+        return NULL;
+    }
     e->tok = loadTokenizer(opts->weights, opts->prune);
     if (e->tok == NULL) {
         destroyGenerator(e->g);
@@ -328,6 +337,7 @@ engine* engineOpen(const engine_options* opts, char* err, size_t errCap) {
         e->gdnScratchBytes = e->kv.gdnBytes;
         if (e->gdnScratchBytes > 0) e->gdnScratch = (uint8_t*)malloc((size_t)e->gdnScratchBytes);
     }
+    bufferAllocClear();
     return e;
 }
 

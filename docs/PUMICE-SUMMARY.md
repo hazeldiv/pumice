@@ -93,6 +93,7 @@ pumice/
             server/chatTemplate.ts   # Qwen chat template (roles, tools, thinking) + ReasoningSplitter
             server/toolParser.ts     # <tool_call> / JSON tool-call parser + ToolTagHoldBack
             server/load.ts           # shared resolveInput/buildLoadOptions for /api/load + /v1
+            server/models.ts         # scan-folder registry shared by /api/models and /v1
             server/paths.ts          # runtime/dist/models/export/pruned-vocab path resolution + chdir
             server/engine.ts         # EngineManager: addon wrapper, request queue, streaming, scoring
             server/probe.ts          # model probe: safetensors shard/config checks, gguf+hqm meta
@@ -213,7 +214,7 @@ buffer createBufferNamed(VkDevice, VkPhysicalDevice, const void* data, size_t si
 ```
 
 - `MEMORY_RAM` = host-visible staging; `MEMORY_VRAM` = device-local (plus a persistent host-visible staging buffer of equal size for the initial copy).
-- `createBufferNamed` stores the 64-byte `buffer.name` label and, via `allocateBufferMemory`, meters per-pool bytes onto two file-scope counters (`device_local` / `host_visible`) — on `vkAllocateMemory` failure it prints `OOM:    for '<name>' (DEVICE_LOCAL|HOST_VISIBLE, N MB) | device_local=   host_visible=  ` (see Â§12).
+- `createBufferNamed` stores the 64-byte `buffer.name` label and, via `allocateBufferMemory`, meters per-pool bytes onto two file-scope counters (`device_local` / `host_visible`). On allocation failure it no longer calls `exit()`: it records an error (`bufferAllocFail`) naming the buffer and the pool (`out of GPU memory` for DEVICE_LOCAL, `out of host memory` for HOST_VISIBLE/staging, or `out of host memory: could not stage` when the caller's staging array is NULL), returns a null buffer, and fast-fails all further allocations. `createState`/`createWeights`/`createGenerator` detect the flag, tear down what they built, and `engineOpen` returns NULL with the message — so a too-large load surfaces as a `500` from `/api/load` (and a rejected promise from the addon) instead of killing the process (see §12).
 - `createTransferAndCopy(device, queue, bufs, n)` stages host data into all buffers and copies RAM—VRAM where needed.
 - `readBuffer(...)` copies results back to host.
 
@@ -1435,7 +1436,7 @@ A separate `--debug-sampling` flag (`generatorDumpSamplingDebug`) reads back the
 15. **Quantized KV-cache scale/zero need a context-independent stride.** Writers originally used `kvh*(pos+1)+pos` / `kvh*(tokenIdx+M)+absTok` — a stride that grows with the current context — while readers assumed whatever the *current* chunk's stride was, so every token written by an earlier chunk had its scale read from the wrong slot once the cache grew (silently, and masked by the zero-token demo signature). Fix: fixed stride `kvh * MODEL_MAX_CTX + token` in all writers (`Rope-GEMM`, `Reduce-Rope`) and readers (`Att-QK2/PV2/SplitK2/full` INT8+INT4), with validator fixtures updated to match.
 16. **GCN4 tile geometry for the GEMM2 family: smaller workgroups win.** TN=64 or TS=32 (1024-thread) variants regress +50  70% despite halving barrier count — occupancy/latency-hiding dominates. Ping-pong k-tile prefetch (one barrier per tile, prefetch into the alternate LDS set) gives a reliable but small '1..2% **only when grid.x is wide** (FFN/ADD2 shapes); on narrow-N kernels (LinearProj N=12352, QKV) it regressed or washed out.
 17. **Appended shader bindings must match validator buffer order exactly.** When the gated-attention change added `q_norm`/`k_norm`/`gAttn` bindings, the three *legacy prefill-fused* `RmsNorm-QKV-GEMM-*` shaders declared them as `gAttn, qGamma, kGamma` while the validators supplied `qGamma, kGamma, gOut` — q got the wrong gamma and g/k wrote nowhere (q err 6.4, g/k zero). The decode-fused and `Rope-GEMM`/`Reduce-Rope` shaders matched, which is why only `validateQkvRopeGEMM*` failed. Also: the learned per-head norm gamma must be applied to each column **before** the RoPE rotation mixes the two halves (`acc*inv_rms*gamma` then rope), not to the rotated result — applying it after yields a real numeric mismatch against the reference, not just noise.
-18. **VRAM is ~7936 MB on the 8 GB RX 580, not 8192, and it's fragmented.** `main.exe meminfo` dumps this: `heap[0]` device-local is 7936 MB (WDDM reserves ~256 MB) and host-visible/staging memory lives in a separate 16/32 GB system heap — staging is *not* the VRAM problem. The 9 B model + state needs ~7480 MB of device-local memory, and because ~450 discrete `vkAllocateMemory` calls fragment the heap, the allocation that tips it over is reproducible: `OOM: vkAllocateMemory failed for 'attScores' (DEVICE_LOCAL, 128.00 MB) | device_local=7352.66 MB`. `createBufferNamed(..., name)` + per-pool byte counters (reset) in `buffer.c` emit this line and name the buffer. Freeing device memory = lower `MODEL_MAX_CTX` / smaller `MODEL_PREFILL_CHUNK`, INT8 embed/lm-head, or consolidating the ~450 tiny allocations into arenas.
+18. **VRAM is ~7936 MB on the 8 GB RX 580, not 8192, and it's fragmented.** `main.exe meminfo` dumps this: `heap[0]` device-local is 7936 MB (WDDM reserves ~256 MB) and host-visible/staging memory lives in a separate 16/32 GB system heap — staging is *not* the VRAM problem. The 9 B model + state needs ~7480 MB of device-local memory, and because ~450 discrete `vkAllocateMemory` calls fragment the heap, the allocation that tips it over is reproducible: `out of GPU memory: failed to allocate 'attScores' (128.00 MB) | device_local=7352.66 MB ...`. `createBufferNamed(..., name)` + per-pool byte counters in `buffer.c` name the buffer; the failure is now reported as an error instead of aborting (see §12). Freeing device memory = lower `MODEL_MAX_CTX` / smaller `MODEL_PREFILL_CHUNK`, INT8 embed/lm-head, or consolidating the ~450 tiny allocations into arenas.
 19. **safetensors `data_offsets` are relative to the data section, not the file start.** `safetensors_load_f32` (and `loadEmbedLike`) sought to `t->offset` directly from file start, missing the `8 + header_length` prefix — so every tensor read from the multi-tensor HF shards returned garbage (e.g. `input_layernorm.weight` looked like `4e30`), while the single-tensor pruned embed lured by "looking plausible" at offset 0. Fix: `safetensors_open` adds `8 + hlen` to each tensor offset.
 20. **`createBufferNamed(MEMORY_VRAM)` only *stages*; it never copies to VRAM.** The actual staging—device copy lives in a separate `createTransferAndCopy(device, queue, bufs, n)`. `createWeights` never called it, so every weight stayed zero on the device — the whole residual stream was zero and the lm-head argmax collapsed to token 0 (the "all token 0" signature). Fix: register all weight buffers into `g_wbufs` and call `createTransferAndCopy` once at the end of `createWeights`.
 21. **`RmsNorm-Prologue` must RMS-normalize the exact buffer its GEMM2 consumes.** For prefill layer 0 the GEMM2 input is `st->embStaged`, but the prologue was hardcoded to `st->h` (still zero at that point), so `invRms` blew the embedding up by ~1/šeps. Fix: `proBufs[0] = input` (not `st->h`).
@@ -1632,6 +1633,19 @@ A separate `--debug-sampling` flag (`generatorDumpSamplingDebug`) reads back the
     splitter now takes the `enable_thinking` expectation into account: if reasoning was expected and no
     `</think>` appears, the whole output is reasoning (and `content` is empty).
 
+66. **The web UI wrote its quant config in camelCase.** `/api/load` serialized `opts.quant` verbatim
+    (`prefillChunk`, `lmHead`, `maxCtx`), but the engine's JSON reader is exact-match and expects
+    `prefill_chunk` / `lm_head` / `max_ctx` — so the **prefill chunk and LM-head quant controls were
+    silently ignored** (they fell back to 512 / fp16; `maxCtx` and `expertsVram` still worked because
+    they also travel as separate `engine_options`). `EngineManager.doLoad` now writes the snake_case
+    shape the engine (and `probe.ts`'s `applyExistingQuant`) reads.
+
+67. **A load-time OOM killed the whole process.** `allocateBufferMemory` called `exit(EXIT_FAILURE)` on
+    `vkAllocateMemory` failure, so a model that did not fit took down the web UI server (and the CLI)
+    with no error to the client. It now records the failure, returns a null buffer, and the load is torn
+    down and returned as an error (`out of GPU memory` / `out of host memory`) through `engineOpen` →
+    the addon promise → `/api/load`'s `500`. See §12.
+
 
 ---
 
@@ -1706,7 +1720,7 @@ Generation streams: `generate_stream(llm, ids)` yields **incremental decoded tex
 **Layer-differential harness** (`--dump <dir> --dump-layers <N>`): the server dumps per-layer fp32 tensors (`layer_00_embed`, `layer_XX_h`, `layer_XX_hattn`, plus attention internals `qkvRaw`/`qOut`/`kCache`/`vCache`/`scores`/`smSum` and FFN `act`/`gAct`/`uAct`) after each prefill layer. `tools/run_dump.py` drives it; a layer-comparison script (run under `tools/pruner/.venv`, which can load the model in transformers) compares each dump against the HF `output_hidden_states` and prints per-layer cosine correlation / max|diff| / rms — `tools/cmp_layers.py` for the 9B; for the 2B, map pruned ids through `vocab/mapping.npy` before the HF forward. This is the tool that isolated gotchas 27–30, 33, 38. **Note:** `tools/` scripts must not be named after stdlib modules (`tools/tokenize.py` shadowed stdlib `tokenize` and crashed torch imports — renamed `tokenize_cli.py`).
 ## 12. VRAM budget (8 GB RX 580)
 
-Device-local memory (`heap[0]`) is **7936 MB**, not 8192. With the 9B hybrid spec the totals are (metered by `createBufferNamed` + the `OOM:` line in `buffer.c`):
+Device-local memory (`heap[0]`) is **7936 MB**, not 8192. With the 9B hybrid spec the totals are (metered by `createBufferNamed` in `buffer.c`):
 
 | Component (9B) | MB |
 |---|---|
@@ -1719,7 +1733,9 @@ Device-local memory (`heap[0]`) is **7936 MB**, not 8192. With the 9B hybrid spe
 | h/emb/attn/q-proj group, `qkvRaw`, partials | ~155 |
 | **total device-local** | **~7550** |
 
-This fits arithmetically but overflows at runtime — fragmentation from ~450 discrete allocations means a single further 128 MB `attScores` block can't be satisfied. The failure is deterministic and reported as `OOM: vkAllocateMemory failed for 'attScores' (DEVICE_LOCAL, 128.00 MB) | device_local=7352.66 MB`. Levers: lower `max_ctx` in `quant_config.json` (KV + attScores scale with it → −576 MB at 8192; the `--max-ctx` flag also *resizes the allocations* (grow or shrink), not just the generation limit), lower `prefill_chunk` (−160 MB at 256), INT8 embed/lm-head (−640 MB), or consolidating the ~450 tiny allocations into arenas. Staging/host buffers are **not** the issue — they live in the 16/32 GB system heap.
+This fits arithmetically but overflows at runtime — fragmentation from ~450 discrete allocations means a single further 128 MB `attScores` block can't be satisfied. The failure is deterministic and reported as `out of GPU memory: failed to allocate 'attScores' (128.00 MB) | device_local=7352.66 MB ...`. Levers: lower `max_ctx` in `quant_config.json` (KV + attScores scale with it → −576 MB at 8192; the `--max-ctx` flag also *resizes the allocations* (grow or shrink), not just the generation limit), lower `prefill_chunk` (−160 MB at 256), INT8 embed/lm-head (−640 MB), or consolidating the ~450 tiny allocations into arenas. Staging/host buffers are **not** the issue — they live in the 16/32 GB system heap.
+
+**A failed allocation no longer kills the process.** `allocateBufferMemory` records the error (`bufferAllocFail`) and returns a null buffer; `createBufferNamed` fast-fails afterwards; `createState`/`createWeights`/`createGenerator` check the flag, destroy whatever they allocated, and `engineOpen` returns NULL. The CLI prints the message; the addon rejects the `createEngine` promise, so the web UI shows it in the status line and the server keeps running (verified by `test_webui`'s `oom load rejected` check, which then loads a smaller config successfully). This makes the failure recoverable in-process instead of an `exit()`.
 
 The 2B (all-FP16, 102400 vocab, tied embeddings) totals ~1.7 GB of weights + ~0.4 GB state at
 `max_ctx = 32768` — comfortable. Context is now runtime-resizable (gotcha 49): at
@@ -1914,14 +1930,17 @@ A small Express + TypeScript server (default `127.0.0.1:8787`) that loads the ad
 built React app. `paths.ts` centralizes path resolution so the server works both from the repo and
 from an npm install: the runtime dir (addon + `shader/`, `PUMICE_RUNTIME`), the served `dist`,
 and the model root are environment-driven, and `process.chdir(runtimeDir)` is done before any engine
-use (the engine's shader lookup is cwd-relative). The model root defaults to the launch cwd's
-`model/`, `pruned-vocab/` to the launch cwd's (passed to C through `PUMICE_PRUNED_VOCAB_DIR`, §4.7), the
-quant temp file to the OS temp dir, and exports to the launch cwd's `exported/`.
+use (the engine's shader lookup is cwd-relative). The models root is not defaulted — it is whatever
+`PUMICE_MODELS` points at or the folder the user scans from the UI; `pruned-vocab/` is read from the
+launch cwd (passed to C through `PUMICE_PRUNED_VOCAB_DIR`, §4.7), the quant temp file from the OS temp
+dir, and exports from the launch cwd's `exported/`.
 
 | Route | Method | Purpose |
 |---|---|---|
 | `/api/status` | GET | `{ loaded, info, engine }` |
-| `/api/models` | GET | scan the model root for safetensors dirs + `.gguf`/`.hqm` files (dropdown source) |
+| `/api/models` | GET | `{ models, dir }` — the last scan (empty until a folder is scanned) |
+| `/api/models` | POST | `{ dir }` → scan that folder one level for safetensors dirs + `.gguf`/`.hqm` files |
+| `/api/open` | POST | `{ path }` → `{kind:"folder", models, dir}` if it is a plain folder, else `{kind:"model", info}` (probe); 400 if the path does not exist |
 | `/api/probe` | POST | validate + summarize a model (see below) |
 | `/api/load` | POST | write the UI quant config to a temp file, `createEngine`, load |
 | `/api/unload` | POST | `destroyEngine` |
@@ -2033,9 +2052,10 @@ a **pure-JS main package** plus a **platform companion package** pulled in throu
   `require.resolve("@h4zel/pumice-win32-x64/package.json")` (clear error if the platform is
   unsupported or the optional dep failed to install), exports `PUMICE_RUNTIME`,
   `PUMICE_CWD`, `PUMICE_MODELS`, `PUMICE_PRUNED_VOCAB_DIR`, `PUMICE_EXPORT_DIR`,
-  `PUMICE_QUANT_TMP`, `PUMICE_OPEN` and `PORT`, then imports the bundled server. Models
-  default to `./model` and pruned-vocab to `./pruned-vocab` **relative to the directory where the
-  command was run** (not the install dir); the browser is opened on listen unless `--no-open`.
+  `PUMICE_QUANT_TMP`, `PUMICE_OPEN` and `PORT`, then imports the bundled server. `PUMICE_MODELS`
+  is only set when `--models` is passed (there is no default models folder); pruned-vocab is read from
+  `./pruned-vocab` **relative to the directory where the command was run** (not the install dir); the
+  browser is opened on listen unless `--no-open`.
 - **Server bundling.** `webui/package.json`'s `build:server` runs esbuild
   (`--bundle --platform=node --format=esm --packages=external`) to produce
   `webui/dist-server/index.mjs`; the only runtime dependency is `express`, so the installed CLI needs
@@ -2425,7 +2445,7 @@ growing conversation resume instead of re-prefilling. The base URL is printed at
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/v1/models` | `{object:"list", data:[{id, object:"model", ...}]}` — scanned models + the loaded one |
+| GET | `/v1/models` | `{object:"list", data:[{id, object:"model", ...}]}` — models from the last scanned folder + the loaded one |
 | POST | `/v1/chat/completions` | streaming and non-streaming; tools; usage |
 | POST | `/v1/completions` | legacy text completion (streaming and non-streaming) |
 
@@ -2494,7 +2514,8 @@ rest into `content`, in both streaming (`delta.reasoning_content`) and non-strea
 
 `webui/server/v1.ts` (router, stop filter, [OI] serialization), `chatTemplate.ts` (template +
 `ReasoningSplitter`), `toolParser.ts` (parser + `ToolTagHoldBack`), `engine.ts` (request queue +
-`RunHandle`), `load.ts` (shared `resolveInput` / `buildLoadOptions`, also used by `/api/load`), mounted in
+`RunHandle`), `load.ts` (shared `resolveInput` / `buildLoadOptions`, also used by `/api/load`),
+`models.ts` (last-scanned folder + entries, used by `/v1/models` and `ensureModel`), mounted in
 `server/index.ts` as `app.use("/v1", createV1Router(engine))`. `test_v1.mjs` drives it end-to-end.
 
 ### 17.6 Verification
@@ -2503,7 +2524,7 @@ rest into `content`, in both streaming (`delta.reasoning_content`) and non-strea
 
 | Check | Result |
 |---|---|
-| `/v1/models` | lists the scanned models |
+| `/v1/models` | lists the scanned models (or `PUMICE_MODELS`); a `model` id that is a filesystem path is also accepted and auto-loaded |
 | chat non-stream + usage | `"Hello there!"`, prompt 19 / completion 3 |
 | chat stream == non-stream | byte-identical |
 | `max_tokens:1` | `finish_reason:"length"`, completion_tokens 1 |

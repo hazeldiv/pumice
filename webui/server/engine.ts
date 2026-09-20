@@ -108,7 +108,15 @@ export class EngineManager {
     if (this.engine) this.unload();
     let quantConfig: string | null = null;
     if (opts.quant) {
-      fs.writeFileSync(this.quantTmp, JSON.stringify(opts.quant, null, 2));
+      fs.writeFileSync(this.quantTmp, JSON.stringify({
+        name: opts.quant.name,
+        max_ctx: opts.quant.maxCtx,
+        prefill_chunk: opts.quant.prefillChunk,
+        embed: opts.quant.embed,
+        lm_head: opts.quant.lmHead,
+        experts_vram: opts.quant.expertsVram,
+        layers: opts.quant.layers,
+      }, null, 2));
       quantConfig = this.quantTmp;
     }
     const engine = await this.addon.createEngine({
