@@ -6,6 +6,7 @@ import {
   type ScoreProgress,
   type ScoreStart,
 } from "../api";
+import { NumberInput } from "./NumberInput";
 
 interface Props {
   loaded: boolean;
@@ -178,18 +179,15 @@ export function ScoreTab({ loaded }: Props) {
       <div className="grid">
         <label className="field">
           Prefill tokens
-          <input type="number" min={1} value={prefill}
-            onChange={(e) => setPrefill(Math.max(1, Number(e.target.value)))} />
+          <NumberInput value={prefill} min={1} integer onChange={setPrefill} />
         </label>
         <label className="field">
           Decode tokens
-          <input type="number" min={1} value={decode}
-            onChange={(e) => setDecode(Math.max(1, Number(e.target.value)))} />
+          <NumberInput value={decode} min={1} integer onChange={setDecode} />
         </label>
         <label className="field">
           Test size (% of file)
-          <input type="number" min={0.1} max={100} step={0.1} value={sizePct}
-            onChange={(e) => setSizePct(Number(e.target.value))} />
+          <NumberInput value={sizePct} min={0.1} max={100} onChange={setSizePct} />
         </label>
       </div>
 

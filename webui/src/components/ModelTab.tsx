@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { LayerRow, ProbeInfo, Quant } from "../../server/types";
 import type { ModelEntry } from "../api";
+import { NumberInput } from "./NumberInput";
 import { QuantEditor } from "./QuantEditor";
 
 export interface ModelForm {
@@ -27,6 +28,8 @@ interface Props {
   status: string;
   loading: boolean;
   loaded: boolean;
+  scanPath: string;
+  onScanPath: (value: string) => void;
   onOpen: (target: string) => void;
   onSelect: (path: string) => void;
   onForm: (patch: Partial<ModelForm>) => void;
@@ -45,10 +48,10 @@ export function ModelTab(props: Props) {
   return (
     <div className="model">
       <div className="row">
-        <input className="grow" type="text" placeholder="models folder or model path" value={form.path}
-          onChange={(e) => props.onForm({ path: e.target.value })}
-          onKeyDown={(e) => { if (e.key === "Enter") props.onOpen(form.path); }} />
-        <button className="secondary" onClick={() => props.onOpen(form.path)}>Scan</button>
+        <input className="grow" type="text" placeholder="models folder or model path" value={props.scanPath}
+          onChange={(e) => props.onScanPath(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") props.onOpen(props.scanPath); }} />
+        <button className="secondary" onClick={() => props.onOpen(props.scanPath)}>Scan</button>
       </div>
       {models.length > 0 && (
         <div className="row">
@@ -78,13 +81,13 @@ export function ModelTab(props: Props) {
       <div className="grid">
         <label className="field">
           Max context
-          <input type="number" value={form.maxCtx} min={1024} max={info?.maxPos ?? 32768}
-            onChange={(e) => props.onForm({ maxCtx: Number(e.target.value) })} />
+          <NumberInput value={form.maxCtx} min={1024} max={info?.maxPos ?? 32768} integer
+            onChange={(v) => props.onForm({ maxCtx: v })} />
         </label>
         <label className="field">
           Prefill chunk
-          <input type="number" value={form.prefillChunk} min={16}
-            onChange={(e) => props.onForm({ prefillChunk: Number(e.target.value) })} />
+          <NumberInput value={form.prefillChunk} min={16} integer
+            onChange={(v) => props.onForm({ prefillChunk: v })} />
         </label>
         {tied ? (
           <label className="field">
@@ -115,19 +118,19 @@ export function ModelTab(props: Props) {
         {isMoe && (
           <label className="field">
             Experts in VRAM
-            <input type="number" value={form.expertsVram} min={1} max={info?.experts ?? 0}
-              onChange={(e) => props.onForm({ expertsVram: Number(e.target.value) })} />
+            <NumberInput value={form.expertsVram} min={1} max={info?.experts ?? 0} integer
+              onChange={(v) => props.onForm({ expertsVram: v })} />
           </label>
         )}
         <label className="field">
           KV cache RAM (MB)
-          <input type="number" value={form.kvRamBudgetMB} min={8}
-            onChange={(e) => props.onForm({ kvRamBudgetMB: Number(e.target.value) })} />
+          <NumberInput value={form.kvRamBudgetMB} min={8} integer
+            onChange={(v) => props.onForm({ kvRamBudgetMB: v })} />
         </label>
         <label className="field">
           KV cache disk (MB)
-          <input type="number" value={form.kvDiskBudgetMB} min={0}
-            onChange={(e) => props.onForm({ kvDiskBudgetMB: Number(e.target.value) })} />
+          <NumberInput value={form.kvDiskBudgetMB} min={0} integer
+            onChange={(v) => props.onForm({ kvDiskBudgetMB: v })} />
         </label>
         <label className="field">
           KV store dir

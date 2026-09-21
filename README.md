@@ -19,7 +19,7 @@ Models are not scanned automatically. In the **Model** tab, type either a folder
 - a folder is scanned one level deep for safetensors directories and `.gguf`/`.hqm` files, which then appear in a dropdown;
 - a model path (a safetensors/GGUF/HQM directory or file) is opened directly.
 
-The last path is remembered in the browser. `pruned-vocab/` is read from `./pruned-vocab` relative to where you run `pumice` (override with `PUMICE_PRUNED_VOCAB_DIR`).
+The path you typed and the model you picked are both remembered in the browser; picking a model from the dropdown leaves the folder in the input. `pruned-vocab/` is read from `./pruned-vocab` relative to where you run `pumice` (override with `PUMICE_PRUNED_VOCAB_DIR`).
 
 ## Usage
 

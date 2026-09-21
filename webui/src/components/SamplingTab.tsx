@@ -1,3 +1,5 @@
+import { NumberInput } from "./NumberInput";
+
 export interface SamplingState {
   enabled: boolean;
   temperature: number;
@@ -22,15 +24,14 @@ interface Props {
   onReset: () => void;
 }
 
-function Num({ label, value, min, max, step, onChange, disabled }: {
-  label: string; value: number; min?: number; max?: number; step?: number;
+function Num({ label, value, min, max, onChange, disabled }: {
+  label: string; value: number; min?: number; max?: number;
   onChange: (v: number) => void; disabled?: boolean;
 }) {
   return (
     <label className="field">
       {label}
-      <input type="number" value={value} min={min} max={max} step={step} disabled={disabled}
-        onChange={(e) => onChange(Number(e.target.value))} />
+      <NumberInput value={value} min={min} max={max} integer disabled={disabled} onChange={onChange} />
     </label>
   );
 }
@@ -45,11 +46,7 @@ function Slider({ label, value, min, max, step, onChange, editable }: {
       <input type="range" min={min} max={max} step={step} value={value}
         onChange={(e) => onChange(Number(e.target.value))} />
       {editable && (
-        <input type="number" className="slider-num" min={min} max={max} step={step} value={value}
-          onChange={(e) => {
-            const v = Number(e.target.value);
-            if (Number.isFinite(v)) onChange(Math.min(max, Math.max(min, Math.round(v))));
-          }} />
+        <NumberInput className="slider-num" min={min} max={max} integer value={value} onChange={onChange} />
       )}
     </label>
   );

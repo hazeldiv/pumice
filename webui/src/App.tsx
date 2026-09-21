@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { chatStream, loadModel, openPath, unloadModel, type ModelEntry } from "./api";
+import { chatStream, loadModel, openPath, unloadModel, type ModelEntry, type OpenResult } from "./api";
 import type { ChatMessage, LayerRow, ProbeInfo, Quant } from "../server/types";
 import { ModelTab, type ModelForm } from "./components/ModelTab";
 import { SamplingTab, type SamplingState } from "./components/SamplingTab";
@@ -7,7 +7,8 @@ import { ChatTab } from "./components/ChatTab";
 import { ScoreTab } from "./components/ScoreTab";
 
 type Tab = "model" | "sampling" | "chat" | "eval";
-const TARGET_KEY = "pumice-model-target";
+const SCAN_KEY = "pumice-scan-path";
+const MODEL_KEY = "pumice-model-path";
 const DEFAULT_FORM: ModelForm = {
   path: "",
   maxCtx: 32768,
@@ -45,6 +46,7 @@ const DEFAULT_SAMPLING: SamplingState = {
 export default function App() {
   const [tab, setTab] = useState<Tab>("model");
   const [models, setModels] = useState<ModelEntry[]>([]);
+  const [scanPath, setScanPath] = useState("");
   const [info, setInfo] = useState<ProbeInfo | null>(null);
   const [layers, setLayers] = useState<LayerRow[]>([]);
   const [form, setForm] = useState<ModelForm>(DEFAULT_FORM);
@@ -79,30 +81,54 @@ export default function App() {
     setSampling((s) => ({ ...s, maxCtx: p.maxCtx, maxNew: Math.min(s.maxNew, p.maxCtx) }));
   };
 
-  const open = async (target: string) => {
+  const open = async (target: string): Promise<OpenResult | null> => {
     const value = target.trim();
-    if (!value) return;
+    if (!value) return null;
+    setScanPath(value);
+    localStorage.setItem(SCAN_KEY, value);
     setStatus("opening...");
     try {
       const result = await openPath(value);
-      setForm((f) => ({ ...f, path: value }));
       if (result.kind === "model" && result.info) {
         applyInfo(result.info);
         setStatus(result.info.ok ? "valid" : "validation failed");
+        localStorage.setItem(MODEL_KEY, value);
       } else {
         const found = result.models ?? [];
         setModels(found);
         setStatus(`found ${found.length} model${found.length === 1 ? "" : "s"}`);
       }
-      localStorage.setItem(TARGET_KEY, value);
+      return result;
+    } catch (e) {
+      setStatus(String(e));
+      return null;
+    }
+  };
+
+  const selectModel = async (path: string) => {
+    if (!path) return;
+    setStatus("opening...");
+    try {
+      const result = await openPath(path);
+      if (result.kind === "model" && result.info) {
+        applyInfo(result.info);
+        setStatus(result.info.ok ? "valid" : "validation failed");
+        localStorage.setItem(MODEL_KEY, path);
+      }
     } catch (e) {
       setStatus(String(e));
     }
   };
 
   useEffect(() => {
-    const saved = localStorage.getItem(TARGET_KEY);
-    if (saved) open(saved);
+    const savedScan = localStorage.getItem(SCAN_KEY) ?? "";
+    const savedModel = localStorage.getItem(MODEL_KEY) ?? "";
+    setScanPath(savedScan);
+    if (!savedScan) return;
+    open(savedScan).then((result) => {
+      if (!result || result.kind !== "folder" || !savedModel) return;
+      if ((result.models ?? []).some((m) => m.path === savedModel)) selectModel(savedModel);
+    });
   }, []);
 
   const updateForm = (patch: Partial<ModelForm>) => setForm((f) => ({ ...f, ...patch }));
@@ -218,8 +244,10 @@ export default function App() {
             status={status}
             loading={loading}
             loaded={loaded}
+            scanPath={scanPath}
+            onScanPath={setScanPath}
             onOpen={open}
-            onSelect={open}
+            onSelect={selectModel}
             onForm={updateForm}
             onLayers={setLayers}
             onLoad={load}
