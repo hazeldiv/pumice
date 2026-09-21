@@ -68,6 +68,7 @@ async function chatStream(body) {
   let text = "";
   let reasoning = "";
   let finish = null;
+  let doneSent = false;
   const chunks = [];
   for (;;) {
     const { value, done } = await reader.read();
@@ -78,7 +79,10 @@ async function chatStream(body) {
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
       const payload = line.slice(6);
-      if (payload === "[DONE]") continue;
+      if (payload === "[DONE]") {
+        doneSent = true;
+        continue;
+      }
       let ev;
       try {
         ev = JSON.parse(payload);
@@ -92,7 +96,7 @@ async function chatStream(body) {
       if (choice?.finish_reason) finish = choice.finish_reason;
     }
   }
-  return { status: res.status, text, reasoning, finish, chunks };
+  return { status: res.status, text, reasoning, finish, chunks, doneSent };
 }
 
 const chatBody = (content, extra = {}) => ({
@@ -126,7 +130,7 @@ async function main() {
     `usage=${JSON.stringify(baseline.data?.usage)}`);
 
   const streamed = await chatStream(chatBody("Say hello in exactly three words."));
-  check("chat stream", streamed.status === 200 && streamed.finish !== null && streamed.text.length > 0,
+  check("chat stream", streamed.status === 200 && streamed.finish !== null && streamed.text.length > 0 && streamed.doneSent,
     `finish=${streamed.finish} content=${JSON.stringify(streamed.text)}`);
   check("stream == non-stream", streamed.text === baseText,
     `stream=${JSON.stringify(streamed.text)} baseline=${JSON.stringify(baseText)}`);

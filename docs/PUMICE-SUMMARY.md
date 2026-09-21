@@ -1646,6 +1646,21 @@ A separate `--debug-sampling` flag (`generatorDumpSamplingDebug`) reads back the
     down and returned as an error (`out of GPU memory` / `out of host memory`) through `engineOpen` →
     the addon promise → `/api/load`'s `500`. See §12.
 
+68. **The SSE terminator was JSON-quoted.** The `/v1` streaming helpers wrapped everything through
+    `send()`, so the stream ended with `data: "[DONE]"` — a JSON *string*. OpenAI-compatible clients
+    (the AI SDK that opencode uses) only skip the bare `data: [DONE]` sentinel, and their chunk schema
+    rejected the quoted form with `invalid_type: expected object, received string` on every streamed
+    response. Non-streaming requests were unaffected, and the in-repo test reader silently skipped
+    unparseable chunks, so `test_v1` never caught it. The terminators now go out raw via a dedicated
+    `sendDone()` (`res.write("data: [DONE]\n\n")`), and `chatStream` in `test_v1.mjs` asserts the
+    sentinel arrived (`doneSent`).
+
+69. **A stale server squats on the port and corrupts test results.** `test_webui.mjs` reuses a server
+    that is already listening on 8787 (`waitForServer(1000)`); if a previous run (or a `pumice` CLI
+    instance) is still alive, the suite silently runs against old code/cwd and probes start returning
+    `layers=0`. Kill the process on the port (`Get-NetTCPConnection -LocalPort 8787` →
+    `Stop-Process -Id <pid>`) before trusting a run.
+
 
 ---
 
@@ -2446,7 +2461,7 @@ growing conversation resume instead of re-prefilling. The base URL is printed at
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/v1/models` | `{object:"list", data:[{id, object:"model", ...}]}` — models from the last scanned folder + the loaded one |
-| POST | `/v1/chat/completions` | streaming and non-streaming; tools; usage |
+| POST | `/v1/chat/completions` | streaming and non-streaming (SSE chunks end with a bare `data: [DONE]` sentinel); tools; usage |
 | POST | `/v1/completions` | legacy text completion (streaming and non-streaming) |
 
 Auth: if `PUMICE_API_KEY` is set (or `--api-key` is passed to the CLI), every `/v1` request must send

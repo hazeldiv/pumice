@@ -293,6 +293,7 @@ export function createV1Router(engine: EngineManager): Router {
     const handle = createRunHandle();
 
     let send: (chunk: unknown) => void = () => {};
+    let sendDone: () => void = () => {};
     let sentRole = false;
     let clientClosed = false;
 
@@ -308,6 +309,10 @@ export function createV1Router(engine: EngineManager): Router {
       send = (chunk: unknown) => {
         if (clientClosed || res.writableEnded) return;
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      };
+      sendDone = () => {
+        if (clientClosed || res.writableEnded) return;
+        res.write("data: [DONE]\n\n");
       };
     }
 
@@ -421,7 +426,7 @@ export function createV1Router(engine: EngineManager): Router {
       }
       send({ ...base(), choices: [{ index: 0, delta: {}, finish_reason: finishReason }] });
       if (includeUsage) send({ ...base(), choices: [], usage });
-      send("[DONE]");
+      sendDone();
       res.end();
     } catch (e) {
       if (e instanceof CancelledError) {
@@ -431,7 +436,7 @@ export function createV1Router(engine: EngineManager): Router {
       const message = String((e as Error)?.message ?? e);
       if (streaming) {
         send({ error: { message, type: "server_error", code: null } });
-        send("[DONE]");
+        sendDone();
         if (!res.writableEnded) res.end();
       } else {
         const busy = message.includes("engine busy");
@@ -487,6 +492,7 @@ export function createV1Router(engine: EngineManager): Router {
     const handle = createRunHandle();
 
     let send: (chunk: unknown) => void = () => {};
+    let sendDone: () => void = () => {};
     let clientClosed = false;
     if (streaming) {
       res.setHeader("Content-Type", "text/event-stream");
@@ -500,6 +506,10 @@ export function createV1Router(engine: EngineManager): Router {
       send = (chunk: unknown) => {
         if (clientClosed || res.writableEnded) return;
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      };
+      sendDone = () => {
+        if (clientClosed || res.writableEnded) return;
+        res.write("data: [DONE]\n\n");
       };
     }
 
@@ -546,7 +556,7 @@ export function createV1Router(engine: EngineManager): Router {
       }
       send({ id, object: "text_completion", created, model: modelId, choices: [{ text: "", index: 0, logprobs: null, finish_reason: result.finishReason }] });
       if (includeUsage) send({ id, object: "text_completion", created, model: modelId, choices: [], usage });
-      send("[DONE]");
+      sendDone();
       res.end();
     } catch (e) {
       if (e instanceof CancelledError) {
@@ -556,7 +566,7 @@ export function createV1Router(engine: EngineManager): Router {
       const message = String((e as Error)?.message ?? e);
       if (streaming) {
         send({ error: { message, type: "server_error", code: null } });
-        send("[DONE]");
+        sendDone();
         if (!res.writableEnded) res.end();
       } else {
         const busy = message.includes("engine busy");
