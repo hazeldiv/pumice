@@ -149,6 +149,115 @@ function emptyInfo(kind: ProbeInfo["kind"], target: string, name: string): Probe
   };
 }
 
+export interface GgufGroup {
+  canonical: string;
+  shards: string[];
+  missing: string[];
+}
+
+export type GgufResolve =
+  | { status: "ok"; canonical: string; group: GgufGroup }
+  | { status: "none" }
+  | { status: "error"; error: string };
+
+function shardMatch(name: string): { prefix: string; total: number; width: number } | null {
+  const m = /^(.*?)-(\d+)-of-(\d+)\.gguf$/i.exec(name);
+  if (!m) return null;
+  const index = Number(m[2]);
+  const total = Number(m[3]);
+  if (!(index > 0) || !(total > 0) || index > total) return null;
+  return { prefix: m[1], total, width: m[3].length };
+}
+
+function resolveGroup(file: string): GgufGroup {
+  const dir = path.dirname(file);
+  const m = shardMatch(path.basename(file));
+  if (!m) return { canonical: file, shards: [file], missing: [] };
+  const shards: string[] = [];
+  const missing: string[] = [];
+  for (let i = 1; i <= m.total; i++) {
+    const name = `${m.prefix}-${String(i).padStart(m.width, "0")}-of-${String(m.total).padStart(m.width, "0")}.gguf`;
+    const full = path.join(dir, name);
+    shards.push(full);
+    if (!fs.existsSync(full)) missing.push(name);
+  }
+  return { canonical: shards[0], shards, missing };
+}
+
+function collectGgufGroups(dir: string): { first: string; key: string }[] {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir).filter((n) => n.toLowerCase().endsWith(".gguf")).sort();
+  } catch {
+    return [];
+  }
+  const groups: { first: string; key: string }[] = [];
+  for (const name of names) {
+    const m = shardMatch(name);
+    const key = m ? m.prefix : name;
+    if (!groups.some((g) => g.key === key)) groups.push({ first: path.join(dir, name), key });
+  }
+  return groups;
+}
+
+function hasGguf(dir: string): boolean {
+  if (collectGgufGroups(dir).length > 0) return true;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const sub = path.join(dir, entry.name);
+    if (fs.existsSync(path.join(sub, "config.json"))) continue;
+    if (collectGgufGroups(sub).length > 0) return true;
+  }
+  return false;
+}
+
+export function resolveGgufTarget(target: string): GgufResolve {
+  let stat: fs.Stats | null = null;
+  try {
+    stat = fs.statSync(target);
+  } catch {
+    stat = null;
+  }
+
+  if (stat === null) {
+    if (!shardMatch(path.basename(target))) return { status: "none" };
+    const group = resolveGroup(target);
+    if (group.missing.length) return { status: "error", error: `missing shards: ${group.missing.join(", ")}` };
+    return { status: "ok", canonical: group.canonical, group };
+  }
+
+  if (stat.isFile()) {
+    const group = resolveGroup(target);
+    if (group.missing.length) return { status: "error", error: `missing shards: ${group.missing.join(", ")}` };
+    return { status: "ok", canonical: group.canonical, group };
+  }
+
+  if (!stat.isDirectory()) return { status: "none" };
+  if (fs.existsSync(path.join(target, "config.json"))) return { status: "none" };
+
+  const groups = collectGgufGroups(target);
+  for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const sub = path.join(target, entry.name);
+    if (fs.existsSync(path.join(sub, "config.json"))) continue;
+    for (const g of collectGgufGroups(sub)) groups.push({ first: g.first, key: `${entry.name}/${g.key}` });
+  }
+
+  if (groups.length === 0) return { status: "none" };
+  if (groups.length > 1) {
+    return { status: "error", error: `multiple gguf models in ${target}: ${groups.map((g) => g.key).join(", ")}` };
+  }
+  const group = resolveGroup(groups[0].first);
+  if (group.missing.length) return { status: "error", error: `missing shards: ${group.missing.join(", ")}` };
+  return { status: "ok", canonical: group.canonical, group };
+}
+
 export function modelKind(target: string): "safetensors" | "gguf" | "hqm" | "unknown" {
   let stat: fs.Stats;
   try {
@@ -156,7 +265,10 @@ export function modelKind(target: string): "safetensors" | "gguf" | "hqm" | "unk
   } catch {
     return "unknown";
   }
-  if (stat.isDirectory()) return "safetensors";
+  if (stat.isDirectory()) {
+    if (fs.existsSync(path.join(target, "config.json"))) return "safetensors";
+    return hasGguf(target) ? "gguf" : "safetensors";
+  }
   const ext = path.extname(target).toLowerCase();
   if (ext === ".gguf") return "gguf";
   if (ext === ".hqm") return "hqm";
@@ -319,9 +431,30 @@ function archGet(meta: Map<string, unknown>, suffix: string): unknown {
 }
 
 export function readGgufInfo(target: string): ProbeInfo {
-  const { meta, tensors } = readGgufMeta(target);
-  const info = emptyInfo("gguf", target, path.basename(target, path.extname(target)));
-  const layers = Number(archGet(meta, "block_count") ?? 0) || 0;
+  const resolved = resolveGgufTarget(target);
+  if (resolved.status === "error") {
+    const info = emptyInfo("gguf", target, path.basename(target, path.extname(target)));
+    info.errors.push(resolved.error);
+    return info;
+  }
+
+  const canonical = resolved.status === "ok" ? resolved.canonical : target;
+  const shards = resolved.status === "ok" ? resolved.group.shards.filter((s) => fs.existsSync(s)) : [target];
+
+  let meta = new Map<string, unknown>();
+  const tensors = new Set<string>();
+  for (let i = 0; i < shards.length; i++) {
+    const parsed = readGgufMeta(shards[i]);
+    if (i === 0) meta = parsed.meta;
+    for (const name of parsed.tensors) tensors.add(name);
+  }
+
+  const base = path.basename(canonical, path.extname(canonical));
+  const shard = shardMatch(path.basename(canonical));
+  const name = String(meta.get("general.name") ?? (shard ? shard.prefix : base));
+  const info = emptyInfo("gguf", canonical, name);
+  const nextn = Number(archGet(meta, "nextn_predict_layers") ?? 0) || 0;
+  const layers = Math.max(0, (Number(archGet(meta, "block_count") ?? 0) || 0) - nextn);
   const interval = Number(archGet(meta, "full_attention_interval") ?? 0) || 0;
   info.layers = layers;
   info.layerTypes = Array.from({ length: layers }, (_, i) =>
@@ -332,7 +465,7 @@ export function readGgufInfo(target: string): ProbeInfo {
   info.experts = Number(archGet(meta, "expert_count") ?? 0) || 0;
   info.tied = !tensors.has("output.weight");
   info.ok = true;
-  applyExistingQuant(info, path.dirname(target));
+  applyExistingQuant(info, path.dirname(canonical));
   return info;
 }
 
@@ -423,6 +556,12 @@ export function readHqmInfo(target: string): ProbeInfo {
 export function probeModel(target: string): ProbeInfo {
   const kind = modelKind(target);
   if (kind === "unknown") {
+    const gguf = resolveGgufTarget(target);
+    if (gguf.status === "error") {
+      const info = emptyInfo("gguf", target, path.basename(target));
+      info.errors.push(gguf.error);
+      return info;
+    }
     return { ...emptyInfo("safetensors", target, path.basename(target)), errors: ["unsupported model path"] };
   }
   try {
@@ -439,18 +578,38 @@ export function probeModel(target: string): ProbeInfo {
 export function scanModels(modelRoot: string): { path: string; label: string; kind: string }[] {
   const results: { path: string; label: string; kind: string }[] = [];
   if (!fs.existsSync(modelRoot)) return results;
+
+  const loose = new Map<string, string[]>();
   for (const entry of fs.readdirSync(modelRoot, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
     const full = path.join(modelRoot, entry.name);
     if (entry.isDirectory()) {
       if (fs.existsSync(path.join(full, "config.json"))) {
         results.push({ path: full, label: entry.name, kind: "safetensors" });
+        continue;
+      }
+      const groups = collectGgufGroups(full);
+      for (const g of groups) {
+        const resolved = resolveGroup(g.first);
+        const label = groups.length === 1 ? entry.name : `${entry.name}/${g.key}`;
+        results.push({ path: resolved.canonical, label, kind: "gguf" });
       }
     } else {
       const ext = path.extname(entry.name).toLowerCase();
-      if (ext === ".gguf" || ext === ".hqm") {
-        results.push({ path: full, label: entry.name, kind: ext.slice(1) });
+      if (ext === ".hqm") {
+        results.push({ path: full, label: entry.name, kind: "hqm" });
+      } else if (ext === ".gguf") {
+        const key = shardMatch(entry.name)?.prefix ?? entry.name;
+        if (!loose.has(key)) loose.set(key, []);
+        loose.get(key)!.push(full);
       }
     }
   }
+
+  for (const [key, files] of loose) {
+    files.sort();
+    results.push({ path: resolveGroup(files[0]).canonical, label: key, kind: "gguf" });
+  }
+
+  results.sort((a, b) => a.label.localeCompare(b.label));
   return results;
 }

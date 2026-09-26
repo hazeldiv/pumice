@@ -74,7 +74,7 @@ int parseEos(model_dims* d, const char* modelDir, int pruned) {
     }
     if (!pruned && gguf_path_is_file(modelDir)) {
         gguf g;
-        if (gguf_open(&g, modelDir) != 0) cfg_fatal("cannot open gguf");
+        if (gguf_open(&g, modelDir, NULL, 0) != 0) cfg_fatal("cannot open gguf");
         const gguf_kv* kv = gguf_kv_find(&g, "tokenizer.ggml.eos_token_id");
         if (kv == NULL) cfg_fatal("gguf missing eos token id");
         d->eos = (int)kv->ival;
@@ -215,12 +215,14 @@ static void loadGgufConfig(model_config* cfg, const char* ggufPath, const char* 
     memset(cfg, 0, sizeof(model_config));
 
     gguf g;
-    if (gguf_open(&g, ggufPath) != 0) cfg_fatal("cannot parse gguf");
+    if (gguf_open(&g, ggufPath, NULL, 0) != 0) cfg_fatal("cannot parse gguf");
     if (gguf_arch(&g)[0] == '\0') cfg_fatal("gguf missing general.architecture");
 
     model_dims* d = &cfg->dims;
     d->K = (int)gguf_meta_int_arch(&g, "embedding_length", 0);
     d->layerCount = (int)gguf_meta_int_arch(&g, "block_count", 0);
+    int64_t nextn = gguf_meta_int_arch(&g, "nextn_predict_layers", 0);
+    if (nextn > 0 && nextn < d->layerCount) d->layerCount -= (int)nextn;
     d->heads = (int)gguf_meta_int_arch(&g, "attention.head_count", 0);
     d->kvHeads = (int)gguf_meta_int_arch(&g, "attention.head_count_kv", 0);
     d->headDim = (int)gguf_meta_int_arch(&g, "attention.key_length", 0);
@@ -336,13 +338,22 @@ static void loadHqmConfig(model_config* cfg, const char* hqmPath, int maxCtxOver
     hqm_close(&h);
 }
 
-int loadModelConfig(model_config* cfg, const char* modelDir, const char* quantConfigPath, int maxCtxOverride, int pruned) {
+int loadModelConfig(model_config* cfg, const char* modelDir, const char* quantConfigPath, int maxCtxOverride, int pruned, char* err, size_t errCap) {
     if (hqm_path_is_file(modelDir)) {
         loadHqmConfig(cfg, modelDir, maxCtxOverride);
         return 0;
     }
-    if (gguf_path_is_file(modelDir)) {
-        loadGgufConfig(cfg, modelDir, quantConfigPath, maxCtxOverride, pruned);
+
+    char resolved[512] = {0};
+    char ggufErr[256] = {0};
+    int ggufRc = gguf_resolve(modelDir, resolved, sizeof(resolved), ggufErr, sizeof(ggufErr));
+    if (ggufRc < 0) {
+        if (err != NULL && errCap > 0) snprintf(err, errCap, "%s", ggufErr);
+        return -1;
+    }
+    if (ggufRc > 0) {
+        loadGgufConfig(cfg, resolved, quantConfigPath, maxCtxOverride, pruned);
+        snprintf(cfg->ggufPath, sizeof(cfg->ggufPath), "%s", resolved);
         return 0;
     }
 

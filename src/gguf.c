@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
+#include <windows.h>
 #include "gguf.h"
 
 enum {
@@ -187,10 +189,119 @@ void gguf_dir_of(const char* path, char* out, size_t cap) {
     if (sep != NULL) *sep = '\0';
 }
 
-int gguf_open(gguf* g, const char* path) {
-    memset(g, 0, sizeof(*g));
-    snprintf(g->path, sizeof(g->path), "%s", path);
+static void setErr(char* err, size_t cap, const char* msg) {
+    if (err != NULL && cap > 0) snprintf(err, cap, "%s", msg);
+}
 
+static int endsWithGguf(const char* name) {
+    size_t n = strlen(name);
+    if (n < 5) return 0;
+    const char* e = name + n - 5;
+    return tolower((unsigned char)e[0]) == '.' && tolower((unsigned char)e[1]) == 'g' &&
+           tolower((unsigned char)e[2]) == 'g' && tolower((unsigned char)e[3]) == 'u' &&
+           tolower((unsigned char)e[4]) == 'f';
+}
+
+static int allDigits(const char* s, size_t n) {
+    if (n == 0) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return 0;
+    }
+    return 1;
+}
+
+static int shardPattern(const char* name, char* prefix, size_t prefixCap, char* totalStr, size_t totalCap,
+                        int* index, int* total) {
+    if (!endsWithGguf(name)) return 0;
+    size_t stem = strlen(name) - 5;
+    const char* of = NULL;
+    for (size_t i = stem; i >= 4; i--) {
+        if (name[i - 4] == '-' && name[i - 3] == 'o' && name[i - 2] == 'f' && name[i - 1] == '-') {
+            of = name + i;
+            break;
+        }
+    }
+    if (of == NULL) return 0;
+    size_t sep = (size_t)(of - name);
+    if (sep < 5 || !allDigits(of, stem - sep)) return 0;
+    const char* idxStart = NULL;
+    for (size_t i = sep - 4; i >= 1; i--) {
+        if (name[i - 1] == '-') {
+            idxStart = name + i;
+            break;
+        }
+    }
+    if (idxStart == NULL || !allDigits(idxStart, (sep - 4) - (size_t)(idxStart - name))) return 0;
+    size_t totalLen = stem - sep;
+    size_t prefixLen = (size_t)(idxStart - name) - 1;
+    if (totalLen >= totalCap || prefixLen == 0 || prefixLen >= prefixCap) return 0;
+    memcpy(prefix, name, prefixLen);
+    prefix[prefixLen] = '\0';
+    memcpy(totalStr, of, totalLen);
+    totalStr[totalLen] = '\0';
+    *index = atoi(idxStart);
+    *total = atoi(of);
+    return *index > 0 && *total > 0 && *index <= *total;
+}
+
+static void baseName(const char* path, const char** out) {
+    const char* name = path;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') name = p + 1;
+    }
+    *out = name;
+}
+
+static int groupShards(const char* file, char shards[][512], int max, int* count, int* canonical, char* err,
+                       size_t errCap) {
+    char dir[512];
+    gguf_dir_of(file, dir, sizeof(dir));
+    const char* name = NULL;
+    baseName(file, &name);
+
+    char prefix[256];
+    char totalStr[32];
+    int index = 0;
+    int total = 0;
+    if (!shardPattern(name, prefix, sizeof(prefix), totalStr, sizeof(totalStr), &index, &total)) {
+        snprintf(shards[0], 512, "%s", file);
+        *count = 1;
+        *canonical = 0;
+        return 1;
+    }
+    if (total > max) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "too many gguf shards (%d, max %d)", total, max);
+        setErr(err, errCap, msg);
+        return -1;
+    }
+
+    int width = (int)strlen(totalStr);
+    char missing[512] = {0};
+    for (int i = 1; i <= total; i++) {
+        snprintf(shards[i - 1], 512, "%s/%s-%0*d-of-%s.gguf", dir, prefix, width, i, totalStr);
+        if (GetFileAttributesA(shards[i - 1]) == INVALID_FILE_ATTRIBUTES) {
+            char entry[320];
+            snprintf(entry, sizeof(entry), "%s-%0*d-of-%s.gguf", prefix, width, i, totalStr);
+            if (missing[0]) strncat(missing, ", ", sizeof(missing) - strlen(missing) - 1);
+            strncat(missing, entry, sizeof(missing) - strlen(missing) - 1);
+        }
+    }
+    if (missing[0]) {
+        char msg[768];
+        snprintf(msg, sizeof(msg), "missing shards: %s", missing);
+        setErr(err, errCap, msg);
+        return -1;
+    }
+    *count = total;
+    *canonical = 0;
+    return 1;
+}
+
+static int parseShard(const char* path, gguf_kv** kvsOut, int* kvCountOut, gguf_tensor** tensorsOut,
+                      int* tensorCountOut, int64_t* dataStartOut) {
+    *kvsOut = NULL;
+    *tensorsOut = NULL;
     FILE* f = fopen(path, "rb");
     if (f == NULL) return -1;
 
@@ -198,56 +309,49 @@ int gguf_open(gguf* g, const char* path) {
     uint32_t version;
     uint64_t tensorCount;
     uint64_t kvCount;
-    if (!rd(f, magic, 4) || memcmp(magic, "GGUF", 4) != 0 ||
-        !rd_u32(f, &version) || !rd_u64(f, &tensorCount) || !rd_u64(f, &kvCount) ||
-        version < 2 || version > 3 || tensorCount > (1u << 24)) {
+    if (!rd(f, magic, 4) || memcmp(magic, "GGUF", 4) != 0 || !rd_u32(f, &version) || !rd_u64(f, &tensorCount) ||
+        !rd_u64(f, &kvCount) || version < 2 || version > 3 || tensorCount > (1u << 24)) {
         fclose(f);
         return -1;
     }
 
-    g->kvs = (gguf_kv*)calloc((size_t)kvCount, sizeof(gguf_kv));
-    if (g->kvs == NULL) {
+    gguf_kv* kvs = (gguf_kv*)calloc((size_t)kvCount, sizeof(gguf_kv));
+    if (kvs == NULL) {
         fclose(f);
         return -1;
     }
-    g->kvCount = (int)kvCount;
-
     int64_t alignment = 32;
     for (uint64_t i = 0; i < kvCount; i++) {
-        gguf_kv* kv = &g->kvs[i];
+        gguf_kv* kv = &kvs[i];
         uint32_t type;
         if (!rd_string(f, kv->key, (int)sizeof(kv->key)) || !rd_u32(f, &type)) {
-            gguf_close(g);
+            free(kvs);
             fclose(f);
             return -1;
         }
         kv->type = (int)type;
         if (!read_value(f, (int)type, kv)) {
-            gguf_close(g);
+            free(kvs);
             fclose(f);
             return -1;
         }
-        if (strcmp(kv->key, "general.alignment") == 0 && kv->ival > 0) {
-            alignment = kv->ival;
-        }
+        if (strcmp(kv->key, "general.alignment") == 0 && kv->ival > 0) alignment = kv->ival;
     }
 
-    g->tensors = (gguf_tensor*)calloc((size_t)tensorCount, sizeof(gguf_tensor));
-    if (g->tensors == NULL) {
-        gguf_close(g);
+    gguf_tensor* tensors = (gguf_tensor*)calloc((size_t)tensorCount, sizeof(gguf_tensor));
+    if (tensors == NULL) {
+        free(kvs);
         fclose(f);
         return -1;
     }
-    g->tensorCount = (int)tensorCount;
-
     for (uint64_t i = 0; i < tensorCount; i++) {
-        gguf_tensor* t = &g->tensors[i];
+        gguf_tensor* t = &tensors[i];
         uint32_t nDims;
         uint32_t type;
         uint64_t offset;
-        if (!rd_string(f, t->name, (int)sizeof(t->name)) || !rd_u32(f, &nDims) ||
-            nDims > GGUF_MAX_DIMS) {
-            gguf_close(g);
+        if (!rd_string(f, t->name, (int)sizeof(t->name)) || !rd_u32(f, &nDims) || nDims > GGUF_MAX_DIMS) {
+            free(tensors);
+            free(kvs);
             fclose(f);
             return -1;
         }
@@ -255,14 +359,16 @@ int gguf_open(gguf* g, const char* path) {
         for (uint32_t j = 0; j < nDims; j++) {
             uint64_t d;
             if (!rd_u64(f, &d)) {
-                gguf_close(g);
+                free(tensors);
+                free(kvs);
                 fclose(f);
                 return -1;
             }
             t->dims[j] = (int64_t)d;
         }
         if (!rd_u32(f, &type) || !rd_u64(f, &offset)) {
-            gguf_close(g);
+            free(tensors);
+            free(kvs);
             fclose(f);
             return -1;
         }
@@ -272,22 +378,217 @@ int gguf_open(gguf* g, const char* path) {
 
     int64_t pos = _ftelli64(f);
     if (pos < 0) {
-        gguf_close(g);
+        free(tensors);
+        free(kvs);
         fclose(f);
         return -1;
     }
-    g->dataStart = ((pos + alignment - 1) / alignment) * alignment;
     fclose(f);
+    *kvsOut = kvs;
+    *kvCountOut = (int)kvCount;
+    *tensorsOut = tensors;
+    *tensorCountOut = (int)tensorCount;
+    *dataStartOut = ((pos + alignment - 1) / alignment) * alignment;
+    return 0;
+}
+
+int gguf_open(gguf* g, const char* path, char* err, size_t errCap) {
+    memset(g, 0, sizeof(*g));
+
+    char shards[GGUF_MAX_SHARDS][512];
+    int count = 0;
+    int canonical = 0;
+    if (groupShards(path, shards, GGUF_MAX_SHARDS, &count, &canonical, err, errCap) != 1) return -1;
+
+    g->shardCount = count;
+    for (int i = 0; i < count; i++) snprintf(g->shards[i], sizeof(g->shards[i]), "%s", shards[i]);
+
+    gguf_tensor** tensorLists = (gguf_tensor**)calloc((size_t)count, sizeof(gguf_tensor*));
+    int* tensorCounts = (int*)calloc((size_t)count, sizeof(int));
+    if (tensorLists == NULL || tensorCounts == NULL) {
+        free(tensorLists);
+        free(tensorCounts);
+        setErr(err, errCap, "out of memory");
+        return -1;
+    }
+
+    int total = 0;
+    for (int i = 0; i < count; i++) {
+        gguf_kv* kvs = NULL;
+        gguf_tensor* tensors = NULL;
+        int kvCount = 0;
+        int tensorCount = 0;
+        int64_t dataStart = 0;
+        if (parseShard(shards[i], &kvs, &kvCount, &tensors, &tensorCount, &dataStart) != 0) {
+            for (int j = 0; j < i; j++) free(tensorLists[j]);
+            free(tensorLists);
+            free(tensorCounts);
+            setErr(err, errCap, "cannot parse gguf shard");
+            return -1;
+        }
+        tensorLists[i] = tensors;
+        tensorCounts[i] = tensorCount;
+        g->shardDataStart[i] = dataStart;
+        total += tensorCount;
+        if (i == canonical) {
+            g->kvs = kvs;
+            g->kvCount = kvCount;
+            g->dataStart = dataStart;
+        } else {
+            free(kvs);
+        }
+    }
+    snprintf(g->path, sizeof(g->path), "%s", shards[canonical]);
+
+    g->tensors = (gguf_tensor*)calloc((size_t)total, sizeof(gguf_tensor));
+    g->shardOf = (int*)calloc((size_t)total, sizeof(int));
+    if (g->tensors == NULL || g->shardOf == NULL) {
+        for (int i = 0; i < count; i++) free(tensorLists[i]);
+        free(tensorLists);
+        free(tensorCounts);
+        gguf_close(g);
+        setErr(err, errCap, "out of memory");
+        return -1;
+    }
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < tensorCounts[i]; j++) {
+            g->tensors[n] = tensorLists[i][j];
+            g->shardOf[n] = i;
+            n++;
+        }
+        free(tensorLists[i]);
+    }
+    g->tensorCount = total;
+    free(tensorLists);
+    free(tensorCounts);
     return 0;
 }
 
 void gguf_close(gguf* g) {
     free(g->kvs);
     free(g->tensors);
+    free(g->shardOf);
     g->kvs = NULL;
     g->tensors = NULL;
+    g->shardOf = NULL;
     g->kvCount = 0;
     g->tensorCount = 0;
+}
+
+static void groupKey(const char* name, char* out, size_t cap) {    char prefix[256];
+    char totalStr[32];
+    int index = 0;
+    int total = 0;
+    if (shardPattern(name, prefix, sizeof(prefix), totalStr, sizeof(totalStr), &index, &total)) {
+        snprintf(out, cap, "%s", prefix);
+    } else {
+        snprintf(out, cap, "%s", name);
+    }
+}
+
+static void collectGroups(const char* dir, char firstFiles[][512], char keys[][512], int max, int* groupCount) {
+    char pattern[512];
+    snprintf(pattern, sizeof(pattern), "%s/*.gguf", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        char key[256];
+        groupKey(fd.cFileName, key, sizeof(key));
+        int seen = 0;
+        for (int i = 0; i < *groupCount; i++) {
+            if (strcmp(keys[i], key) == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen && *groupCount < max) {
+            snprintf(firstFiles[*groupCount], 512, "%s/%s", dir, fd.cFileName);
+            snprintf(keys[*groupCount], 512, "%s", key);
+            (*groupCount)++;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static void listSubdirs(const char* dir, char out[][512], int max, int* count) {
+    char pattern[512];
+    snprintf(pattern, sizeof(pattern), "%s/*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        if (*count >= max) break;
+        char cfg[512];
+        snprintf(cfg, sizeof(cfg), "%s/%s/config.json", dir, fd.cFileName);
+        if (GetFileAttributesA(cfg) != INVALID_FILE_ATTRIBUTES) continue;
+        snprintf(out[*count], 512, "%s/%s", dir, fd.cFileName);
+        (*count)++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+int gguf_resolve(const char* path, char* out, size_t cap, char* err, size_t errCap) {
+    if (gguf_path_is_file(path)) {
+        char shards[GGUF_MAX_SHARDS][512];
+        int count = 0;
+        int canonical = 0;
+        if (groupShards(path, shards, GGUF_MAX_SHARDS, &count, &canonical, err, errCap) != 1) return -1;
+        snprintf(out, cap, "%s", shards[canonical]);
+        return 1;
+    }
+
+    DWORD attr = GetFileAttributesA(path);
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return 0;
+
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/config.json", path);
+    if (GetFileAttributesA(cfg) != INVALID_FILE_ATTRIBUTES) return 0;
+
+    char firsts[GGUF_MAX_SHARDS][512];
+    char keys[GGUF_MAX_SHARDS][512];
+    int n = 0;
+    collectGroups(path, firsts, keys, GGUF_MAX_SHARDS, &n);
+
+    char subdirs[GGUF_MAX_SHARDS][512];
+    int subCount = 0;
+    listSubdirs(path, subdirs, GGUF_MAX_SHARDS, &subCount);
+    for (int s = 0; s < subCount; s++) {
+        char subFirst[GGUF_MAX_SHARDS][512];
+        char subKeys[GGUF_MAX_SHARDS][512];
+        int m = 0;
+        collectGroups(subdirs[s], subFirst, subKeys, GGUF_MAX_SHARDS, &m);
+        for (int i = 0; i < m && n < GGUF_MAX_SHARDS; i++) {
+            snprintf(firsts[n], 512, "%s", subFirst[i]);
+            snprintf(keys[n], 512, "%s/%s", subdirs[s], subKeys[i]);
+            n++;
+        }
+    }
+
+    if (n == 0) return 0;
+    if (n > 1) {
+        char list[512] = {0};
+        for (int i = 0; i < n; i++) {
+            const char* base = NULL;
+            baseName(keys[i], &base);
+            if (list[0]) strncat(list, ", ", sizeof(list) - strlen(list) - 1);
+            strncat(list, base, sizeof(list) - strlen(list) - 1);
+        }
+        char msg[768];
+        snprintf(msg, sizeof(msg), "multiple gguf models in %s: %s", path, list);
+        setErr(err, errCap, msg);
+        return -1;
+    }
+
+    char shards[GGUF_MAX_SHARDS][512];
+    int count = 0;
+    int canonical = 0;
+    if (groupShards(firsts[0], shards, GGUF_MAX_SHARDS, &count, &canonical, err, errCap) != 1) return -1;
+    snprintf(out, cap, "%s", shards[canonical]);
+    return 1;
 }
 
 const gguf_kv* gguf_kv_find(const gguf* g, const char* key) {
@@ -449,11 +750,15 @@ static const char* suffix_hf(const char* s) {
         {"ffn_gate.weight", "mlp.gate_proj.weight"},
         {"ffn_up.weight", "mlp.up_proj.weight"},
         {"ffn_down.weight", "mlp.down_proj.weight"},
+        {"ffn_gate_exps.weight", "mlp.experts.gate_proj.weight"},
+        {"ffn_up_exps.weight", "mlp.experts.up_proj.weight"},
+        {"ffn_down_exps.weight", "mlp.experts.down_proj"},
         {"ffn_gate_inp.weight", "mlp.gate.weight"},
         {"ffn_gate_shexp.weight", "mlp.shared_expert.gate_proj.weight"},
         {"ffn_up_shexp.weight", "mlp.shared_expert.up_proj.weight"},
         {"ffn_down_shexp.weight", "mlp.shared_expert.down_proj.weight"},
         {"ffn_gate_inp_s.weight", "mlp.shared_expert_gate.weight"},
+        {"ffn_gate_inp_shexp.weight", "mlp.shared_expert_gate.weight"},
         {NULL, NULL}
     };
     for (int i = 0; map[i].gguf != NULL; i++) {
@@ -501,9 +806,15 @@ static int sa_type_size(sa_dtype d) {
 
 int gguf_as_safetensors(const gguf* g, safetensors* sf) {
     memset(sf, 0, sizeof(*sf));
-    sf->files[0] = fopen(g->path, "rb");
-    if (sf->files[0] == NULL) return -1;
-    sf->fileCount = 1;
+    if (g->shardCount > SA_MAX_FILES) return -1;
+    for (int i = 0; i < g->shardCount; i++) {
+        sf->files[i] = fopen(g->shards[i], "rb");
+        if (sf->files[i] == NULL) {
+            safetensors_close(sf);
+            return -1;
+        }
+    }
+    sf->fileCount = g->shardCount;
     sf->tensors = (sa_tensor*)calloc((size_t)g->tensorCount, sizeof(sa_tensor));
     if (sf->tensors == NULL) {
         safetensors_close(sf);
@@ -526,10 +837,63 @@ int gguf_as_safetensors(const gguf* g, safetensors* sf) {
         int64_t elems = 1;
         for (int j = 0; j < gt->nDims; j++) elems *= gt->dims[j];
         for (int j = 0; j < gt->nDims; j++) st->shape[j] = gt->dims[gt->nDims - 1 - j];
-        st->offset = g->dataStart + gt->offset;
+        st->offset = g->shardDataStart[g->shardOf[i]] + gt->offset;
         st->length = elems * sa_type_size(dt);
-        st->fileIndex = 0;
+        st->fileIndex = g->shardOf[i];
         sf->tensorCount++;
     }
     return 0;
+}
+
+void ggufInfo(const char* path) {
+    char resolved[512] = {0};
+    char err[512] = {0};
+    int rc = gguf_resolve(path, resolved, sizeof(resolved), err, sizeof(err));
+    if (rc < 0) {
+        fprintf(stderr, "ggufinfo: %s\n", err);
+        return;
+    }
+    if (rc == 0) {
+        fprintf(stderr, "ggufinfo: not a gguf model: %s\n", path);
+        return;
+    }
+
+    gguf g;
+    if (gguf_open(&g, resolved, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ggufinfo: %s\n", err);
+        return;
+    }
+
+    printf("resolved: %s\n", resolved);
+    printf("arch: %s\n", gguf_arch(&g));
+    printf("shards: %d\n", g.shardCount);
+    for (int i = 0; i < g.shardCount; i++) {
+        printf("  shard %d: %s\n", i + 1, g.shards[i]);
+    }
+    printf("tensors: %d\n", g.tensorCount);
+    printf("tied: %s\n", gguf_find(&g, "output.weight") == NULL ? "yes" : "no");
+
+    const char* probes[] = {"token_embd.weight", "output.weight", "blk.0.attn_qkv.weight",
+                            "blk.40.ffn_gate_exps.weight", NULL};
+    for (int i = 0; probes[i] != NULL; i++) {
+        const gguf_tensor* t = gguf_find(&g, probes[i]);
+        if (t == NULL) {
+            printf("  %s: missing\n", probes[i]);
+            continue;
+        }
+        int index = (int)(t - g.tensors);
+        printf("  %s: shard %d\n", probes[i], g.shardOf[index] + 1);
+    }
+
+    safetensors sf;
+    if (gguf_as_safetensors(&g, &sf) == 0) {
+        printf("mapped tensors: %d across %d files\n", sf.tensorCount, sf.fileCount);
+        const sa_tensor* head = safetensors_find(&sf, "lm_head.weight");
+        if (head != NULL) {
+            printf("  lm_head.weight: file %d offset %lld length %lld\n", head->fileIndex, (long long)head->offset,
+                   (long long)head->length);
+        }
+        safetensors_close(&sf);
+    }
+    gguf_close(&g);
 }

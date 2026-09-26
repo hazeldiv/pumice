@@ -196,7 +196,7 @@ int pruneVocab(const char* modelPath, const model_config* spec) {
     safetensors sf;
     if (isGguf) {
         gguf g;
-        if (gguf_open(&g, modelPath) != 0) pfatal("cannot open gguf");
+        if (gguf_open(&g, modelPath, NULL, 0) != 0) pfatal("cannot open gguf");
         if (gguf_as_safetensors(&g, &sf) != 0) pfatal("cannot map gguf tensors");
         gguf_close(&g);
     } else {

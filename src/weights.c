@@ -53,6 +53,42 @@ static void fatal(const char* msg) {
     exit(1);
 }
 
+static void permuteValueHeads(float* data, int64_t headStride, int nQk, int group) {
+    if (group <= 1) return;
+    int nHeads = nQk * group;
+    size_t bytes = sizeof(float) * (size_t)headStride;
+    float* tmp = (float*)malloc(bytes * (size_t)nHeads);
+    if (tmp == NULL) return;
+    memcpy(tmp, data, bytes * (size_t)nHeads);
+    for (int k = 0; k < nQk; k++) {
+        for (int g = 0; g < group; g++) {
+            memcpy(data + (size_t)(k * group + g) * (size_t)headStride,
+                   tmp + (size_t)(g * nQk + k) * (size_t)headStride, bytes);
+        }
+    }
+    free(tmp);
+}
+
+static void permuteValueHeadColumns(float* mat, int rows, int cols, int colStart, int headDim, int nQk, int group) {
+    if (group <= 1) return;
+    int nHeads = nQk * group;
+    size_t span = (size_t)nHeads * (size_t)headDim;
+    float* tmp = (float*)malloc(sizeof(float) * span);
+    if (tmp == NULL) return;
+    for (int r = 0; r < rows; r++) {
+        float* row = mat + (size_t)r * (size_t)cols + (size_t)colStart;
+        memcpy(tmp, row, sizeof(float) * span);
+        for (int k = 0; k < nQk; k++) {
+            for (int g = 0; g < group; g++) {
+                memcpy(row + (size_t)(k * group + g) * (size_t)headDim,
+                       tmp + (size_t)(g * nQk + k) * (size_t)headDim,
+                       sizeof(float) * (size_t)headDim);
+            }
+        }
+    }
+    free(tmp);
+}
+
 #define MAX_WEIGHT_BUFS 2560
 #define WEIGHT_FLUSH_BATCH 12
 
@@ -315,15 +351,17 @@ static const sa_tensor* require(const safetensors* sf, const char* name) {
 static int findShards(const char* dir, char out[][512], int max);
 
 static char g_weightDir[512];
+static char g_ggufPath[512];
 static safetensors g_shards;
 static int g_shardState = 0;
 static int g_gguf = 0;
 
 static const safetensors* shardSource(void) {
     if (g_shardState != 0) return g_shardState == 1 ? &g_shards : NULL;
-    if (gguf_path_is_file(g_weightDir)) {
+    const char* ggufPath = g_ggufPath[0] ? g_ggufPath : (gguf_path_is_file(g_weightDir) ? g_weightDir : NULL);
+    if (ggufPath != NULL) {
         gguf g;
-        if (gguf_open(&g, g_weightDir) != 0) {
+        if (gguf_open(&g, ggufPath, NULL, 0) != 0) {
             g_shardState = -1;
             return NULL;
         }
@@ -367,7 +405,7 @@ static float* hqmReadVec(const char* name, int64_t* outLen) {
     return v;
 }
 
-static buffer loadVecBuffer(session s, const char* hfName, int len, const char* label, int layer, int addOne) {
+static buffer loadVecBuffer(session s, const char* hfName, int len, const char* label, int layer, int addOne, int nQk, int group) {
     char cacheName[80];
     snprintf(cacheName, sizeof(cacheName), "vec_%s_%d", label, layer);
     float* v = NULL;
@@ -387,6 +425,7 @@ static buffer loadVecBuffer(session s, const char* hfName, int len, const char* 
         if (g_gguf && strcmp(label, "aLog") == 0) {
             for (int i = 0; i < len; i++) v[i] = logf(-v[i]);
         }
+        if (g_gguf) permuteValueHeads(v, 1, nQk, group);
         if (g_hqmWriter != NULL) {
             int64_t dims[1] = {len};
             hqm_writer_tensor(g_hqmWriter, cacheName, HQM_T_F32, v, (int64_t)sizeof(float) * len, dims, 1);
@@ -537,7 +576,7 @@ static void loadEmbedLike(session s, const char* const* candPaths, int candCount
     cacheRelease(ct);
 }
 
-static buffer loadConv(session s, const char* name, int layer) {
+static buffer loadConv(session s, const char* name, int layer, const model_dims* d) {
     char cacheName[80];
     snprintf(cacheName, sizeof(cacheName), "conv_%d", layer);
     float* v = NULL;
@@ -549,6 +588,11 @@ static buffer loadConv(session s, const char* name, int layer) {
         const sa_tensor* t = require(sf, name);
         v = safetensors_load_f32(sf, t, &n);
         if (!v) fatal("conv read error");
+        if (g_gguf) {
+            int taps = d->convHist + 1;
+            permuteValueHeads(v + (size_t)(2 * d->nQk) * (size_t)d->dim * (size_t)taps,
+                              (int64_t)d->dim * taps, d->nQk, d->nV / d->nQk);
+        }
         if (g_hqmWriter != NULL) {
             int64_t dims[1] = {n};
             hqm_writer_tensor(g_hqmWriter, cacheName, HQM_T_F32, v, n * 4, dims, 1);
@@ -683,7 +727,16 @@ static cachedTensor* expertPoolAcquire(const char* cacheName, QuantType q, int r
     return NULL;
 }
 
-static void expertPoolBuildLayer(const safetensors* sf, const char* hfName, int rows, int cols, int experts, QuantType q,
+static void readBf16Row(const safetensors* sf, const sa_tensor* t, int64_t row, int64_t count, float* dst) {
+    FILE* f = sf->files[t->fileIndex];
+    _fseeki64(f, t->offset + row * count * 2, SEEK_SET);
+    uint16_t* raw = (uint16_t*)malloc((size_t)count * 2);
+    if (fread(raw, 2, (size_t)count, f) != (size_t)count) fatal("expert read error");
+    for (int64_t i = 0; i < count; i++) dst[i] = bf16_to_float(raw[i]);
+    free(raw);
+}
+
+static void expertPoolBuildLayer(const safetensors* sf, const char* hfName, const char* hfUpName, int rows, int cols, int experts, QuantType q,
                                  const int* hfSrcRows, int hfSrcCount, const char* sharedName, const char* sharedUpName,
                                  const char* cacheName, expert_pool_build* out) {
     int block = quant_block(q);
@@ -697,16 +750,22 @@ static void expertPoolBuildLayer(const safetensors* sf, const char* hfName, int 
     for (int e = 0; e < experts; e++) {
         float* eng = NULL;
         if (e < hfSrcCount) {
-            const sa_tensor* t = require(sf, hfName);
-            if (t->ndim != 3 || t->shape[0] != hfSrcCount || t->shape[1] != cols || t->shape[2] != rows) fatal("expert tensor shape mismatch");
-            FILE* f = sf->files[t->fileIndex];
-            _fseeki64(f, t->offset + (int64_t)hfSrcRows[e] * cols * rows * 2, SEEK_SET);
-            int64_t n = (int64_t)cols * rows;
-            uint16_t* raw = (uint16_t*)malloc((size_t)n * 2);
-            if (fread(raw, 2, (size_t)n, f) != (size_t)n) fatal("expert read error");
-            eng = (float*)malloc(sizeof(float) * (size_t)n);
-            for (int64_t i = 0; i < n; i++) eng[i] = bf16_to_float(raw[i]);
-            free(raw);
+            if (hfUpName != NULL) {
+                const sa_tensor* tg = require(sf, hfName);
+                const sa_tensor* tu = require(sf, hfUpName);
+                int halfCols = cols / 2;
+                if (tg->ndim != 3 || tg->shape[0] != hfSrcCount || tg->shape[1] != halfCols || tg->shape[2] != rows) fatal("expert gate shape mismatch");
+                if (tu->ndim != 3 || tu->shape[0] != hfSrcCount || tu->shape[1] != halfCols || tu->shape[2] != rows) fatal("expert up shape mismatch");
+                int64_t half = (int64_t)halfCols * rows;
+                eng = (float*)malloc(sizeof(float) * (size_t)cols * rows);
+                readBf16Row(sf, tg, hfSrcRows[e], half, eng);
+                readBf16Row(sf, tu, hfSrcRows[e], half, eng + half);
+            } else {
+                const sa_tensor* t = require(sf, hfName);
+                if (t->ndim != 3 || t->shape[0] != hfSrcCount || t->shape[1] != cols || t->shape[2] != rows) fatal("expert tensor shape mismatch");
+                eng = (float*)malloc(sizeof(float) * (size_t)cols * rows);
+                readBf16Row(sf, t, hfSrcRows[e], (int64_t)cols * rows, eng);
+            }
         } else if (sharedUpName != NULL) {
             const sa_tensor* tg = require(sf, sharedName);
             const sa_tensor* tu = require(sf, sharedUpName);
@@ -836,9 +895,10 @@ static void exportTokenizer(hqm_writer* w, const model_config* spec, const char*
         return;
     }
 
-    if (!gguf_path_is_file(weightDir)) return;
+    const char* ggufPath = g_ggufPath[0] ? g_ggufPath : (gguf_path_is_file(weightDir) ? weightDir : NULL);
+    if (ggufPath == NULL) return;
     gguf g;
-    if (gguf_open(&g, weightDir) != 0) return;
+    if (gguf_open(&g, ggufPath, NULL, 0) != 0) return;
     char** toks = NULL;
     char** merges = NULL;
     int32_t* ttypes = NULL;
@@ -867,7 +927,8 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     g_wbufSession = s;
     cacheClear();
     snprintf(g_weightDir, sizeof(g_weightDir), "%s", weightDir);
-    g_gguf = gguf_path_is_file(weightDir);
+    snprintf(g_ggufPath, sizeof(g_ggufPath), "%s", spec->ggufPath);
+    g_gguf = (spec->ggufPath[0] != '\0') || gguf_path_is_file(weightDir);
     char modelDir[512];
     snprintf(modelDir, sizeof(modelDir), "%s", weightDir);
     if (gguf_path_is_file(weightDir)) gguf_dir_of(weightDir, modelDir, sizeof(modelDir));
@@ -892,7 +953,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     if (!g_hqmOpen) {
         char shardProbe[SA_MAX_FILES][512];
         int shardCount = findShards(weightDir, shardProbe, SA_MAX_FILES);
-        if (!gguf_path_is_file(weightDir) && shardCount == 0) {
+        if (!g_gguf && shardCount == 0) {
             fatal("no model source found");
         }
     }
@@ -914,7 +975,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     registerWeightBuffer(&w.theta);
     free(theta);
 
-    w.gammaFinal = loadVecBuffer(s, "model.language_model.norm.weight", d->K, "gammaFinal", -1, 1);
+    w.gammaFinal = loadVecBuffer(s, "model.language_model.norm.weight", d->K, "gammaFinal", -1, 1, 0, 1);
     registerWeightBufferSmall(&w.gammaFinal);
 
     int V = d->vocab;
@@ -988,6 +1049,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
     }
 
     char n1[256], n2[256], n3[256], n4[256];
+    int vGroup = d->nQk > 0 ? d->nV / d->nQk : 1;
 
     for (int L = 0; L < spec->dims.layerCount; L++) {
         const layer* ly = &spec->layers[L];
@@ -995,10 +1057,10 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
         QuantType f = ly->ffn.q;
 
         lname(n1, sizeof(n1), L, "input_layernorm.weight");
-        w.gammaIn[L] = loadVecBuffer(s, n1, d->K, "gammaIn", L, 1);
+        w.gammaIn[L] = loadVecBuffer(s, n1, d->K, "gammaIn", L, 1, 0, 1);
         registerWeightBufferSmall(&w.gammaIn[L]);
         lname(n1, sizeof(n1), L, "post_attention_layernorm.weight");
-        w.gammaF[L] = loadVecBuffer(s, n1, d->K, "gammaF", L, 1);
+        w.gammaF[L] = loadVecBuffer(s, n1, d->K, "gammaF", L, 1, 0, 1);
         registerWeightBufferSmall(&w.gammaF[L]);
 
         char projName[64], outName[64];
@@ -1007,10 +1069,10 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
 
         if (ly->attn.type == ATTENTION_FULL) {
             lname(n1, sizeof(n1), L, "self_attn.q_norm.weight");
-            w.qNorm[L] = loadVecBuffer(s, n1, d->headDim, "qNorm", L, 1);
+            w.qNorm[L] = loadVecBuffer(s, n1, d->headDim, "qNorm", L, 1, 0, 1);
             registerWeightBufferSmall(&w.qNorm[L]);
             lname(n1, sizeof(n1), L, "self_attn.k_norm.weight");
-            w.kNorm[L] = loadVecBuffer(s, n1, d->headDim, "kNorm", L, 1);
+            w.kNorm[L] = loadVecBuffer(s, n1, d->headDim, "kNorm", L, 1, 0, 1);
             registerWeightBufferSmall(&w.kNorm[L]);
 
             lname(n1, sizeof(n1), L, "self_attn.q_proj.weight");
@@ -1036,16 +1098,16 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             free(mat);
         } else {
             lname(n1, sizeof(n1), L, "linear_attn.conv1d.weight");
-            w.conv[L] = loadConv(s, n1, L);
+            w.conv[L] = loadConv(s, n1, L, d);
             registerWeightBufferSmall(&w.conv[L]);
             lname(n1, sizeof(n1), L, "linear_attn.A_log");
-            w.aLog[L] = loadVecBuffer(s, n1, d->nV, "aLog", L, 0);
+            w.aLog[L] = loadVecBuffer(s, n1, d->nV, "aLog", L, 0, d->nQk, vGroup);
             registerWeightBufferSmall(&w.aLog[L]);
             lname(n1, sizeof(n1), L, "linear_attn.dt_bias");
-            w.dtBias[L] = loadVecBuffer(s, n1, d->nV, "dtBias", L, 0);
+            w.dtBias[L] = loadVecBuffer(s, n1, d->nV, "dtBias", L, 0, d->nQk, vGroup);
             registerWeightBufferSmall(&w.dtBias[L]);
             lname(n1, sizeof(n1), L, "linear_attn.norm.weight");
-            w.attnNorm[L] = loadVecBuffer(s, n1, d->dim, "attnNorm", L, 0);
+            w.attnNorm[L] = loadVecBuffer(s, n1, d->dim, "attnNorm", L, 0, 0, 1);
             registerWeightBufferSmall(&w.attnNorm[L]);
 
             lname(n1, sizeof(n1), L, "linear_attn.in_proj_qkv.weight");
@@ -1058,6 +1120,12 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             if (!tensorHave(projName, q, d->K, d->projN)) {
                 mat = buildEngineMatrix(shardSource(), pn, 4, d->K, &cols);
                 if (cols != d->projN) fatal("delta projection width mismatch");
+                if (g_gguf) {
+                    permuteValueHeadColumns(mat, d->K, d->projN, d->projVOff, d->dim, d->nQk, vGroup);
+                    permuteValueHeadColumns(mat, d->K, d->projN, d->projZOff, d->dim, d->nQk, vGroup);
+                    permuteValueHeadColumns(mat, d->K, d->projN, d->projAOff, 1, d->nQk, vGroup);
+                    permuteValueHeadColumns(mat, d->K, d->projN, d->projBOff, 1, d->nQk, vGroup);
+                }
             }
             loadTensorInto(s, &w.proj[L], projName, L, d->K, d->projN, q, 1.0f, mat);
             free(mat);
@@ -1069,6 +1137,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             if (!tensorHave(outName, q, deltaOutRows, d->K)) {
                 mat = buildEngineMatrix(shardSource(), on, 1, deltaOutRows, &cols);
                 if (cols != d->K) fatal("out_proj width mismatch");
+                if (g_gguf) permuteValueHeads(mat, (int64_t)d->dim * d->K, d->nQk, vGroup);
             }
             loadTensorInto(s, &w.out[L], outName, L, deltaOutRows, d->K, q, 1.0f, mat);
             free(mat);
@@ -1122,10 +1191,16 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             expert_pool_build gu, dn;
             gu.ct = expertPoolAcquire(guName, eq, d->K, 2 * d->moeI, poolExperts);
             if (gu.ct == NULL) {
+                char guGate[128], guUp[128];
                 lname(n1, sizeof(n1), L, "mlp.experts.gate_up_proj");
                 lname(n2, sizeof(n2), L, "mlp.shared_expert.gate_proj.weight");
                 lname(n3, sizeof(n3), L, "mlp.shared_expert.up_proj.weight");
-                expertPoolBuildLayer(shardSource(), n1, d->K, 2 * d->moeI, poolExperts, eq, srcRows, d->experts, n2, n3, guName, &gu);
+                lname(guGate, sizeof(guGate), L, "mlp.experts.gate_proj.weight");
+                lname(guUp, sizeof(guUp), L, "mlp.experts.up_proj.weight");
+                const safetensors* sf = shardSource();
+                int split = safetensors_find(sf, n1) == NULL;
+                expertPoolBuildLayer(sf, split ? guGate : n1, split ? guUp : NULL, d->K, 2 * d->moeI, poolExperts, eq, srcRows,
+                                     d->experts, n2, n3, guName, &gu);
             } else {
                 gu.rows = d->K;
                 gu.cols = 2 * d->moeI;
@@ -1136,7 +1211,7 @@ model_weights createWeights(session s, const model_config* spec, const char* wei
             if (dn.ct == NULL) {
                 lname(n1, sizeof(n1), L, "mlp.experts.down_proj");
                 lname(n2, sizeof(n2), L, "mlp.shared_expert.down_proj.weight");
-                expertPoolBuildLayer(shardSource(), n1, d->moeI, d->K, poolExperts, eq, srcRows, d->experts, n2, NULL, dnName, &dn);
+                expertPoolBuildLayer(shardSource(), n1, NULL, d->moeI, d->K, poolExperts, eq, srcRows, d->experts, n2, NULL, dnName, &dn);
             } else {
                 dn.rows = d->moeI;
                 dn.cols = d->K;

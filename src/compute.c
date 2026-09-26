@@ -45,10 +45,6 @@ static void emitToken(uint32_t token, void* ctx) {
 void serverMain(int argc, char** argv) {
     const char* weightDir = argval(argc, argv, "--weights", "../model/Qwen3.5-9B");
     int forceGguf = argflag(argc, argv, "--gguf");
-    if (forceGguf && !gguf_path_is_file(weightDir)) {
-        fprintf(stderr, "server: --gguf given but %s is not a gguf file\n", weightDir);
-        exit(1);
-    }
     int maxCtxOverride = atoi(argval(argc, argv, "--max-ctx", "0"));
     int maxNew = atoi(argval(argc, argv, "--max-new", "128"));
     const char* dumpDir = argval(argc, argv, "--dump", NULL);
@@ -68,18 +64,27 @@ void serverMain(int argc, char** argv) {
 
     hqm_set_export_dir(exportDir);
     static model_config spec;
-    loadModelConfig(&spec, weightDir, quantConfigPath, maxCtxOverride, doPrune);
+    char cfgErr[256] = {0};
+    if (loadModelConfig(&spec, weightDir, quantConfigPath, maxCtxOverride, doPrune, cfgErr, sizeof(cfgErr)) != 0) {
+        fprintf(stderr, "server: %s\n", cfgErr[0] ? cfgErr : "cannot load model config");
+        exit(1);
+    }
+    const char* weights = spec.ggufPath[0] ? spec.ggufPath : weightDir;
+    if (forceGguf && spec.ggufPath[0] == '\0') {
+        fprintf(stderr, "server: --gguf given but %s is not a gguf model\n", weightDir);
+        exit(1);
+    }
     char hqmPath[512];
-    int hqmSource = hqm_resolve(&spec, weightDir, hqmPath, sizeof(hqmPath));
-    if (doPrune && !hqmSource) pruneVocab(weightDir, &spec);
-    parseEos(&spec.dims, hqmSource ? hqmPath : weightDir, doPrune);
+    int hqmSource = hqm_resolve(&spec, weights, hqmPath, sizeof(hqmPath));
+    if (doPrune && !hqmSource) pruneVocab(weights, &spec);
+    parseEos(&spec.dims, hqmSource ? hqmPath : weights, doPrune);
     weightsSetExport(argflag(argc, argv, "--no-export") ? 0 : 1);
     int expertsVram = atoi(argval(argc, argv, "--experts-vram", "0"));
     if (expertsVram > 0) spec.expertsVram = expertsVram;
 
     if (timing) setTimingEnabled(1);
     session s = createSession();
-    generator* g = createGenerator(s, &spec, weightDir, verboseWeights);
+    generator* g = createGenerator(s, &spec, weights, verboseWeights);
     if (dumpTopPPath != NULL) generatorSetDumpTopP(g, dumpTopPPath);
     if (dumpDir != NULL) {
         generatorSetDumpDir(g, dumpDir);

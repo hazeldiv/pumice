@@ -96,7 +96,7 @@ pumice/
             server/models.ts         # scan-folder registry shared by /api/models and /v1
             server/paths.ts          # runtime/dist/models/export/pruned-vocab path resolution + chdir
             server/engine.ts         # EngineManager: addon wrapper, request queue, streaming, scoring
-            server/probe.ts          # model probe: safetensors shard/config checks, gguf+hqm meta
+            server/probe.ts          # model probe: safetensors shard/config checks, gguf+hqm meta, gguf shard groups (§4.8)
             server/types.ts          # shared API types
             src/App.tsx  src/api.ts  src/styles.css
                  components/ModelTab.tsx  SamplingTab.tsx  ChatTab.tsx  QuantEditor.tsx
@@ -115,7 +115,7 @@ pumice/
             engine.h                # engine lifecycle shared by the addon (engineOpen/Close/Generate)
             kvcache.h               # tiered KV block cache: chain hashes, index, RAM pool, snapshots
        src/
-            main.c                  # arg dispatch: default=server, `val`=harness, `meminfo`
+            main.c                  # arg dispatch: default=server, `val`=harness, `meminfo`, `ggufinfo`
             compute.c               # serverMain (server loop) + memInfo
             json.c                  # JSON parser used by model.c (configs) and vocab EOS lookup
             model.c                 # loadModelConfig: config.json + quant_config.json -> model_config/dims
@@ -380,6 +380,40 @@ out-projection GEMV/SplitK reduction dim are all `nV*dim`/`tensor.rows`-driven n
 immediately after each batch (`registerWeightBuffer` + `releaseStaging`) — the one-shot bulk copy
 kept every staging allocation alive until the end and blew the 16 GB host-visible heap when the RAM
 pools were also resident (gotcha 46).
+
+### 4.8 GGUF shard groups (src/gguf.c)
+
+A GGUF model can be split into `prefix-NNNNN-of-MMMMM.gguf` shards (llama.cpp convention). The loader
+treats a shard set as one model:
+
+- **`gguf_resolve(path, out, err)`** turns any entry point into the canonical **shard 00001** path: a
+  shard file resolves its siblings and verifies all `1..M` exist (else `missing shards: ...`); a
+  directory is scanned at its root and then one level into subdirectories for `.gguf` groups, with
+  exactly one group required (0 → not gguf, >1 → `multiple gguf models in ...`); a directory holding
+  `config.json` is left to the safetensors loader. `loadModelConfig` calls it first and stashes the
+  canonical path in `model_config.ggufPath`, so `engineOpen`/`serverMain` route weights, tokenizer and
+  EOS through it.
+- **`gguf_open`** parses **every** shard's header and merges the tensor tables, recording each tensor's
+  shard index and that shard's aligned `dataStart`; `g->path` stays the canonical file because the
+  metadata-array readers re-open it (only shard 1 carries the full KV set — Unsloth's split leaves 3
+  KVs in shard 2). Merging is mandatory: `output.weight` (the `tied` probe and lm-head source) lives in
+  the **last** shard.
+- **`gguf_as_safetensors`** opens all shards into the existing multi-file `safetensors` view and sets
+  each tensor's `fileIndex`/absolute offset, so the whole weight pipeline is unchanged. Shard count is
+  capped by `GGUF_MAX_SHARDS` = `SA_MAX_FILES` = 64.
+- `webui/server/probe.ts` mirrors the same resolution for the UI: the dropdown collapses a shard group
+  into one entry (root groups by prefix, subfolder groups by folder name), an incomplete group is listed
+  but probing reports `missing shards`, and giving a directory always lists what is inside so the model is
+  picked explicitly. `main.exe ggufinfo <path>` prints the resolved shards, merged tensor count, `tied`, and the
+  per-shard lookup for a few probe tensors.
+
+GGUF tensor types remain F32/F16/BF16 only (no quantized GGUF blocks).
+
+GGUF `block_count` includes the trailing MTP blocks declared by `nextn_predict_layers`, so
+`loadGgufConfig` (and `readGgufInfo`) subtract it: the 35B's GGUF reports `block_count=41` with
+`nextn_predict_layers=1`, and its 41st block is an MTP head (`blk.40.nextn.*`, full attention) that
+would otherwise be mis-derived as a delta layer and demand nonexistent `blk.40.attn_qkv`/`ssm_*`
+tensors. The main stack is 40 layers (30 delta + 10 full), matching the safetensors config.
 
 
 ---
@@ -1661,6 +1695,58 @@ A separate `--debug-sampling` flag (`generatorDumpSamplingDebug`) reads back the
     `layers=0`. Kill the process on the port (`Get-NetTCPConnection -LocalPort 8787` →
     `Stop-Process -Id <pid>`) before trusting a run.
 
+70. **GGUF shard metadata is not duplicated, and `output.weight` is in the last shard.** The Unsloth
+    `Nail-Qwen3.6-35B-A3B` split has 54 KVs in shard 1 but only 3 in shard 2, so metadata (and the
+    tokenizer arrays) must be read from **shard 00001** — which is why `gguf_resolve` canonicalizes to
+    it. Tensors are split with no duplicates (534 + 219 = 753, matching `split.tensors.count`), so the
+    tensor table must be merged across shards or `output.weight`/`tied` detection and the lm-head read
+    fail. The shard filename regex also had two traps while being written: the index-separator search
+    must skip the `-of-` hyphen (else `allDigits` spans `-of-`), and the prefix drops the trailing `-`
+    before the index (so reconstruction must re-add it).
+
+71. **GGUF groups the gated-delta-net value heads; HF interleaves them.** The 35B's delta tensors
+    (`in_proj_qkv` v-part, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`, `conv1d` v-channels,
+    `A_log`, `dt_bias`) are stored value-head-major (`[g][k]`) in GGUF, while HF — and therefore the
+    engine's shaders — expects the interleaved `[k][g]` order. The loader copies GGUF rows verbatim, so
+    the delta layers silently ran with scrambled value heads and produced gibberish (the full-attention
+    layers, all FFN/MoE, and the embeddings are identical). The mapping is `hfHead = group·(i % nQk) + i / nQk`
+    with `group = nV / nQk`; it only shows up when `nV = 2·nQk` (35B: `nV=32, nQk=16`), which is why the
+    2B/9B GGUFs (`nV = nQk = 16`, group 1) always worked. `weights.c` now applies a GGUF-only
+    `permuteValueHeads`/`permuteValueHeadColumns` (a no-op when group is 1, so the safetensors and HQM
+    paths are untouched). Proof: a same-model HQM pair (GGUF-exported vs safetensors-exported) had
+    `proj_*`/`out_*`/`conv_*`/`aLog`/`dtBias` as exact permutations before the fix and byte-identical
+    after. **Note: any HQM exported before this fix has the scramble baked in and must be re-exported.**
+    Separately, the GGUF source's routed-expert weights genuinely differ from the safetensors
+    checkpoint's (same attention, different experts), so the two are not interchangeable for expert
+    reference.
+
+    **Also note (crash):** a too-large VRAM footprint (this export sits at ~7.60 GB of the 7.936 GB
+    device-local heap) can make generation fail with `0xC0000409` under external VRAM pressure. Lower
+    `expertsVram` or `maxCtx` if that happens; it is not a determinism bug.
+
+72. **The GGUF tokenizer never matched its special tokens, so generation never hit EOS.** `bpeFromParts`
+    built the tokenizer with `byte_level_bpe_tokenizers_new_from_str(vocab, merges, added)` where
+    `added` was a `{"<|im_end|>":248046,…}` map. That map parses, and `token_to_id("<|im_end|>")`
+    returns the right id (it is in the model vocab), but the tokenizer's *added vocabulary* is not
+    populated, so **encoding ignores them**: `<|im_end|>` tokenizes to the plain text tokens
+    `27,91,316,6018,91,29`. The chat prompt was therefore sent as literal text, the model answered in
+    literal text, and the real eos id `248046` was never emitted — the model ran on, hallucinating
+    further `<|im_start|>user …` turns until `max_tokens`. (An HF-style `added_tokens` **array** makes
+    the Rust side panic with `Invalid added_tokens.json file.`, and an empty string panics with
+    `EOF while parsing a value` — only the map is accepted, and it is silently a no-op.)
+    Fix: `bpeFromParts` now assembles a **complete HF `tokenizer.json`** (added_tokens array with
+    `special:true`, NFC normalizer, the Qwen `Split`+`ByteLevel` pre-tokenizer, ByteLevel decoder,
+    BPE model) and loads it with `tokenizers_new_from_str` — the same path the safetensors models use.
+    The vocab must be the **type-1 tokens only** (ids `0..248043`) with the CONTROL/USER_DEFINED tokens
+    (types 3/4) as added tokens keeping their original ids: if the vocab has gaps the library
+    **re-assigns** the added-token ids sequentially (e.g. `248046 → 248289`), which silently corrupts
+    the eos id.     Verified by diffing the rebuilt tokenizer against the real HF `tokenizer.json` over
+    prose/code/CJK/emoji/special-token inputs: **0 mismatches**. This is GGUF-only (the safetensors and
+    HQM-with-`tokenizer.json` paths already used `tokenizers_new_from_str`), and **no re-export is
+    needed**: the HQM stores the raw `tokenizer.tokens`/`merges`/`token_type` parts and the engine
+    rebuilds the tokenizer at load time, so an existing GGUF-derived HQM is fixed by rebuilding the
+    engine alone.
+
 
 ---
 
@@ -1707,6 +1793,7 @@ make                # shaders -> bin/shader/*.spv, builds bin/main.exe + bin/pum
 
 cd bin && main.exe val       # validation harness (every validate* + max_err + timing)
 cd bin && main.exe meminfo   # dump memory heaps/types (device-local vs host-visible) and exit
+cd bin && main.exe ggufinfo <path>   # resolve a GGUF (file, shard, or dir) + merged tensor table (§4.8)
 ```
 
 Real weights are loaded by the **server** (`main.exe`, default). It reads a length-prefixed prompt from stdin and writes generated ids to stdout, so it is normally driven by the Python frontend:
@@ -1954,8 +2041,8 @@ dir, and exports from the launch cwd's `exported/`.
 |---|---|---|
 | `/api/status` | GET | `{ loaded, info, engine }` |
 | `/api/models` | GET | `{ models, dir }` — the last scan (empty until a folder is scanned) |
-| `/api/models` | POST | `{ dir }` → scan that folder one level for safetensors dirs + `.gguf`/`.hqm` files |
-| `/api/open` | POST | `{ path }` → `{kind:"folder", models, dir}` if it is a plain folder, else `{kind:"model", info}` (probe); 400 if the path does not exist |
+| `/api/models` | POST | `{ dir }` → scan that folder one level for safetensors dirs + `.gguf`/`.hqm` files (GGUF shard groups collapse to one entry, §4.8) |
+| `/api/open` | POST | `{ path }` → `{kind:"folder", models, dir}` for a directory (always scanned, single GGUF group included), else `{kind:"model", info}` (probe); 400 if the path does not exist |
 | `/api/probe` | POST | validate + summarize a model (see below) |
 | `/api/load` | POST | write the UI quant config to a temp file, `createEngine`, load |
 | `/api/unload` | POST | `destroyEngine` |
@@ -1969,7 +2056,7 @@ dir, and exports from the launch cwd's `exported/`.
 `model*.safetensors` glob, and verifies every shard (including the `%05d-of-%05d` sequence) exists;
 for **GGUF** it walks the KV metadata (tolerant `Reader` that streams from the file descriptor, so
 multi-GB files never load into memory) for `block_count`/`full_attention_interval`/`expert_count`/
-`context_length`; for **HQM** it parses the header (KV pairs + tensor directory) and reads the
+`context_length`, subtracting `nextn_predict_layers` (the trailing MTP blocks are not inference layers); for **HQM** it parses the header (KV pairs + tensor directory) and reads the
 `config.layer_type`/`layer_attn_quant`/`layer_ffn_quant` int32 tensors. An existing
 `quant_config.json` next to the model pre-fills the per-layer quant table.
 

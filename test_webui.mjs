@@ -111,9 +111,11 @@ async function main() {
   const openMissing = await post("/api/open", { path: path.join(root, "missing-model") });
   check("open missing path rejected", openMissing.status === 400, `status=${openMissing.status}`);
 
+  const st35Dir = "J:\\model\\Qwen3.6-35B-A3B";
+  const stDir = fs.existsSync(st35Dir) ? st35Dir : "model/Qwen3.5-2B";
   for (const [name, target, kind] of [
     ["probe hqm", "model/Qwen3.5-2B-1.6gb.hqm", "hqm"],
-    ["probe safetensors", "model/Qwen3.6-35B-A3B", "safetensors"],
+    ["probe safetensors", stDir, "safetensors"],
   ]) {
     const { data } = await post("/api/probe", { path: target });
     check(name, data?.ok === true && data?.kind === kind,
@@ -122,6 +124,36 @@ async function main() {
 
   const bad = await post("/api/probe", { path: "model/Qwen3.5-9B" });
   check("probe missing shards rejected", bad.data?.ok === false && bad.data.errors.length > 0);
+
+  const ggufDir = process.env.PUMICE_GGUF_TEST_DIR ?? "J:\\model\\Nail-Qwen3.6-35B-A3B";
+  if (fs.existsSync(ggufDir)) {
+    const shard2 = path.join(ggufDir, "Nail-Qwen3.6-35B-A3B-MTP-BF16-00002-of-00002.gguf");
+    const ggufProbe = await post("/api/probe", { path: fs.existsSync(shard2) ? shard2 : ggufDir });
+    check("probe sharded gguf", ggufProbe.data?.ok === true && ggufProbe.data?.layers === 40 &&
+      ggufProbe.data?.experts === 256,
+      `layers=${ggufProbe.data?.layers} experts=${ggufProbe.data?.experts} tied=${ggufProbe.data?.tied}`);
+
+    const openGguf = await post("/api/open", { path: ggufDir });
+    check("open gguf shard dir lists models",
+      openGguf.data?.kind === "folder" && openGguf.data?.models?.length === 1 &&
+      openGguf.data.models[0].kind === "gguf",
+      `kind=${openGguf.data?.kind} models=${openGguf.data?.models?.length}`);
+
+    const linkDir = path.join(path.dirname(ggufDir), "_pumice_incomplete");
+    try {
+      fs.rmSync(linkDir, { recursive: true, force: true });
+      fs.mkdirSync(linkDir, { recursive: true });
+      const first = fs.readdirSync(ggufDir).filter((f) => f.endsWith(".gguf")).sort()[0];
+      fs.linkSync(path.join(ggufDir, first), path.join(linkDir, first));
+      const incomplete = await post("/api/probe", { path: linkDir });
+      check("incomplete gguf errors", /missing shards/.test(incomplete.data?.errors?.join(" ") ?? ""),
+        JSON.stringify(incomplete.data?.errors));
+    } finally {
+      fs.rmSync(linkDir, { recursive: true, force: true });
+    }
+  } else {
+    console.log(`SKIP  gguf shard checks (${ggufDir} not found)`);
+  }
 
   const load = await post("/api/load", {
     path: "model/Qwen3.5-2B-1.6gb.hqm",

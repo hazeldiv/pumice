@@ -22,7 +22,7 @@ typedef struct {
     int fileIndex;
 } sa_tensor;
 
-#define SA_MAX_FILES 32
+#define SA_MAX_FILES 64
 
 typedef struct {
     FILE* files[SA_MAX_FILES];

@@ -137,63 +137,65 @@ static void freeStrArray(char** arr, int64_t count) {
     free(arr);
 }
 
-static char* bpeVocabJson(char** toks, int64_t n) {
-    strbuf b = {0};
-    sbPutc(&b, '{');
-    for (int64_t i = 0; i < n; i++) {
-        if (i > 0) sbPutc(&b, ',');
-        sbPutc(&b, '"');
-        sbEscape(&b, toks[i], strlen(toks[i]));
-        sbPuts(&b, "\":");
-        sbPrintf(&b, "%lld", (long long)i);
-    }
-    sbPutc(&b, '}');
-    return b.p;
-}
+#define BPE_SPLIT_REGEX                                                                                        \
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}|"                               \
+    " ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
 
-static char* bpeMergesText(char** merges, int64_t n) {
+static char* bpeTokenizerJson(char** toks, int64_t nTok, char** merges, int64_t nMerge,
+                              const int32_t* types, int64_t nType) {
+    int hasTypes = (types != NULL && nType > 0);
     strbuf b = {0};
-    for (int64_t i = 0; i < n; i++) {
-        if (i > 0) sbPutc(&b, '\n');
-        sbPuts(&b, merges[i]);
-    }
-    return b.p;
-}
-
-static char* bpeAddedJson(char** toks, int64_t n, const int32_t* types, int64_t typeCount) {
-    strbuf b = {0};
-    sbPutc(&b, '{');
+    sbPuts(&b, "{\"version\":\"1.0\",\"truncation\":null,\"padding\":null,\"added_tokens\":[");
     int first = 1;
-    for (int64_t i = 0; i < n && i < typeCount; i++) {
-        if (types[i] != 2 && types[i] != 3 && types[i] != 4) continue;
+    for (int64_t i = 0; hasTypes && i < nTok && i < nType; i++) {
+        if (types[i] != 3 && types[i] != 4) continue;
+        if (!first) sbPutc(&b, ',');
+        first = 0;
+        sbPrintf(&b, "{\"id\":%lld,\"content\":\"", (long long)i);
+        sbEscape(&b, toks[i], strlen(toks[i]));
+        sbPuts(&b, "\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":true}");
+    }
+    sbPuts(&b, "],\"normalizer\":{\"type\":\"NFC\"},\"pre_tokenizer\":{\"type\":\"Sequence\",\"pretokenizers\":["
+               "{\"type\":\"Split\",\"pattern\":{\"Regex\":\"");
+    sbEscape(&b, BPE_SPLIT_REGEX, strlen(BPE_SPLIT_REGEX));
+    sbPuts(&b, "\"},\"behavior\":\"Isolated\",\"invert\":false},"
+               "{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":false,\"use_regex\":false}]},"
+               "\"post_processor\":{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":false,\"use_regex\":false},"
+               "\"decoder\":{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":false,\"use_regex\":false},"
+               "\"model\":{\"type\":\"BPE\",\"dropout\":null,\"unk_token\":null,\"continuing_subword_prefix\":\"\","
+               "\"end_of_word_suffix\":\"\",\"fuse_unk\":false,\"byte_fallback\":false,\"ignore_merges\":false,\"vocab\":{");
+    first = 1;
+    for (int64_t i = 0; i < nTok; i++) {
+        if (hasTypes && types[i] != 1) continue;
         if (!first) sbPutc(&b, ',');
         first = 0;
         sbPutc(&b, '"');
         sbEscape(&b, toks[i], strlen(toks[i]));
-        sbPuts(&b, "\":");
-        sbPrintf(&b, "%lld", (long long)i);
+        sbPrintf(&b, "\":%lld", (long long)i);
     }
-    sbPutc(&b, '}');
+    sbPuts(&b, "},\"merges\":[");
+    for (int64_t i = 0; i < nMerge; i++) {
+        if (i > 0) sbPutc(&b, ',');
+        sbPutc(&b, '"');
+        sbEscape(&b, merges[i], strlen(merges[i]));
+        sbPutc(&b, '"');
+    }
+    sbPuts(&b, "]}}");
     return b.p;
 }
 
 static TokenizerHandle bpeFromParts(char** toks, int64_t nTok, char** merges, int64_t nMerge,
                                     const int32_t* types, int64_t nType) {
     if (toks == NULL || nTok <= 0) return NULL;
-    char* vocab = bpeVocabJson(toks, nTok);
-    char* mergesText = bpeMergesText(merges, nMerge);
-    char* added = bpeAddedJson(toks, nTok, types, nType);
-    TokenizerHandle h = byte_level_bpe_tokenizers_new_from_str(vocab, strlen(vocab), mergesText,
-                                                               strlen(mergesText), added, strlen(added));
-    free(vocab);
-    free(mergesText);
-    free(added);
+    char* json = bpeTokenizerJson(toks, nTok, merges, nMerge, types, nType);
+    TokenizerHandle h = tokenizers_new_from_str(json, strlen(json));
+    free(json);
     return h;
 }
 
 static TokenizerHandle tokenizerFromGguf(const char* path) {
     gguf g;
-    if (gguf_open(&g, path) != 0) return NULL;
+    if (gguf_open(&g, path, NULL, 0) != 0) return NULL;
     char** toks = NULL;
     char** merges = NULL;
     int32_t* types = NULL;
@@ -300,19 +302,26 @@ engine* engineOpen(const engine_options* opts, char* err, size_t errCap) {
     }
 
     hqm_set_export_dir(opts->exportDir);
-    loadModelConfig(&e->spec, opts->weights, opts->quantConfig, opts->maxCtx, opts->prune);
+    char cfgErr[256] = {0};
+    if (loadModelConfig(&e->spec, opts->weights, opts->quantConfig, opts->maxCtx, opts->prune, cfgErr,
+                        sizeof(cfgErr)) != 0) {
+        free(e);
+        setError(err, errCap, cfgErr[0] ? cfgErr : "cannot load model config");
+        return NULL;
+    }
+    const char* weights = e->spec.ggufPath[0] ? e->spec.ggufPath : opts->weights;
 
     char hqmPath[512];
-    int hqmSource = hqm_resolve(&e->spec, opts->weights, hqmPath, sizeof(hqmPath));
-    if (opts->prune && !hqmSource) pruneVocab(opts->weights, &e->spec);
-    parseEos(&e->spec.dims, hqmSource ? hqmPath : opts->weights, opts->prune);
+    int hqmSource = hqm_resolve(&e->spec, weights, hqmPath, sizeof(hqmPath));
+    if (opts->prune && !hqmSource) pruneVocab(weights, &e->spec);
+    parseEos(&e->spec.dims, hqmSource ? hqmPath : weights, opts->prune);
 
     weightsSetExport(opts->exportModel ? 1 : 0);
     if (opts->expertsVram > 0) e->spec.expertsVram = opts->expertsVram;
 
     bufferAllocClear();
     e->s = createSession();
-    e->g = createGenerator(e->s, &e->spec, opts->weights, 0);
+    e->g = createGenerator(e->s, &e->spec, weights, 0);
     if (e->g == NULL) {
         char msg[256];
         snprintf(msg, sizeof(msg), "%s", bufferAllocError());
@@ -321,7 +330,7 @@ engine* engineOpen(const engine_options* opts, char* err, size_t errCap) {
         setError(err, errCap, msg[0] ? msg : "failed to allocate model memory");
         return NULL;
     }
-    e->tok = loadTokenizer(opts->weights, opts->prune);
+    e->tok = loadTokenizer(weights, opts->prune);
     if (e->tok == NULL) {
         destroyGenerator(e->g);
         destroySession(e->s);

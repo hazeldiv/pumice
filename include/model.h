@@ -78,6 +78,7 @@ typedef struct model_dims {
 typedef struct model_config {
     char name[128];
     char shaderDir[160];
+    char ggufPath[512];
     model_dims dims;
     layer layers[MODEL_MAX_LAYERS];
     QuantType embedQ;
@@ -86,7 +87,7 @@ typedef struct model_config {
     int pruned;
 } model_config;
 
-int loadModelConfig(model_config* cfg, const char* modelDir, const char* quantConfigPath, int maxCtxOverride, int pruned);
+int loadModelConfig(model_config* cfg, const char* modelDir, const char* quantConfigPath, int maxCtxOverride, int pruned, char* err, size_t errCap);
 int parseEos(model_dims* d, const char* modelDir, int pruned);
 const char* model_shader(const char* base, QuantType q);
 

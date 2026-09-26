@@ -6,6 +6,7 @@
 #include "safetensors.h"
 
 #define GGUF_MAX_DIMS 8
+#define GGUF_MAX_SHARDS 64
 
 typedef struct {
     char key[128];
@@ -33,9 +34,14 @@ typedef struct {
     gguf_tensor* tensors;
     int tensorCount;
     int64_t dataStart;
+    char shards[GGUF_MAX_SHARDS][512];
+    int64_t shardDataStart[GGUF_MAX_SHARDS];
+    int shardCount;
+    int* shardOf;
 } gguf;
 
-int gguf_open(gguf* g, const char* path);
+int gguf_open(gguf* g, const char* path, char* err, size_t errCap);
+int gguf_resolve(const char* path, char* out, size_t cap, char* err, size_t errCap);
 void gguf_close(gguf* g);
 int gguf_path_is_file(const char* path);
 void gguf_dir_of(const char* path, char* out, size_t cap);
